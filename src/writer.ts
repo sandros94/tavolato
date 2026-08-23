@@ -5,6 +5,7 @@ import {
   encodeDataPageHeader,
   encodeFileMetadata,
   MAGIC,
+  MAX_DEFINITION_LEVEL_BIT_WIDTH,
   type RowGroupMeta,
 } from "./internal/format.ts";
 import { TavolatoError } from "./error.ts";
@@ -26,13 +27,6 @@ const MAX_PAGE_BYTES = 0x7f_ff_00_00;
 
 /** `DataPageHeader.num_values` is an i32, so a row group cannot hold more rows. */
 const MAX_ROWS_PER_GROUP = 0x7f_ff_ff_ff;
-
-/**
- * A flat schema has exactly one optional level per column, so nullable columns
- * always use definition levels of width 1 and non-nullable columns write none
- * at all.
- */
-const MAX_DEFINITION_LEVEL_BIT_WIDTH = 1;
 
 /** A validated value on its way into a column buffer; `null` means "no value". */
 type StagedValue =

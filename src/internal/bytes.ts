@@ -1,3 +1,5 @@
+import { malformed } from "../error.ts";
+
 /**
  * A growable little-endian byte sink.
  *
@@ -116,5 +118,140 @@ export class ByteWriter {
   }
 }
 
+/**
+ * A bounds-checked little-endian byte source: the mirror of {@link ByteWriter}.
+ *
+ * Every read is validated against the end of the buffer, so a truncated or
+ * otherwise malformed file raises a typed error at the exact byte that ran out
+ * instead of quietly producing `NaN`s, empty strings or an endless loop.
+ */
+export class ByteReader {
+  readonly #bytes: Uint8Array;
+  readonly #view: DataView;
+  #offset: number;
+
+  constructor(bytes: Uint8Array, offset = 0) {
+    this.#bytes = bytes;
+    this.#view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    this.#offset = offset;
+  }
+
+  /** Current read position. */
+  get offset(): number {
+    return this.#offset;
+  }
+
+  /** Total number of bytes in the buffer. */
+  get length(): number {
+    return this.#bytes.length;
+  }
+
+  /** Moves the read position; the target must lie inside the buffer. */
+  seek(offset: number): void {
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > this.#bytes.length) {
+      throw malformed(`Offset ${offset} lies outside the ${this.#bytes.length} byte file`);
+    }
+    this.#offset = offset;
+  }
+
+  /** Claims `size` bytes and returns where they start, or throws if they are not there. */
+  #take(size: number): number {
+    const offset = this.#offset;
+    if (!Number.isSafeInteger(size) || size < 0 || offset + size > this.#bytes.length) {
+      throw malformed(
+        `Truncated input: ${size} bytes were needed at offset ${offset}, ${
+          this.#bytes.length - offset
+        } are left`,
+      );
+    }
+    this.#offset = offset + size;
+    return offset;
+  }
+
+  /** Reads a single byte. */
+  u8(): number {
+    return this.#bytes[this.#take(1)];
+  }
+
+  /** Reads an unsigned 32-bit integer, little-endian. */
+  u32(): number {
+    return this.#view.getUint32(this.#take(4), true);
+  }
+
+  /** Reads a signed 64-bit integer, little-endian. */
+  i64(): bigint {
+    return this.#view.getBigInt64(this.#take(8), true);
+  }
+
+  /** Reads an IEEE-754 double, little-endian. */
+  f64(): number {
+    return this.#view.getFloat64(this.#take(8), true);
+  }
+
+  /** Returns a view — not a copy — over the next `size` bytes. */
+  raw(size: number): Uint8Array {
+    const offset = this.#take(size);
+    return this.#bytes.subarray(offset, offset + size);
+  }
+
+  /** Advances past `size` bytes. */
+  skip(size: number): void {
+    this.#take(size);
+  }
+
+  /**
+   * Reads an unsigned LEB128 (varint) encoded integer.
+   *
+   * Accumulates by multiplication rather than shifting, mirroring
+   * {@link ByteWriter.varint}: bitwise operators coerce to int32 and would
+   * corrupt values above 2^31. Anything past ten bytes, or past the safe
+   * integer range, is a malformed file rather than a silently rounded number.
+   */
+  varint(): number {
+    let result = 0;
+    let scale = 1;
+    for (let index = 0; index < 10; index++) {
+      const byte = this.u8();
+      result += (byte % 128) * scale;
+      if (byte < 0x80) {
+        if (!Number.isSafeInteger(result)) {
+          throw malformed(`Varint ending at offset ${this.#offset} is too large to be a length`);
+        }
+        return result;
+      }
+      scale *= 128;
+    }
+    throw malformed(`Varint ending at offset ${this.#offset} is longer than ten bytes`);
+  }
+
+  /** Reads an unsigned LEB128 (varint) encoded integer of arbitrary width. */
+  varintBig(): bigint {
+    let result = 0n;
+    let shift = 0n;
+    for (let index = 0; index < 10; index++) {
+      const byte = this.u8();
+      result |= BigInt(byte % 128) << shift;
+      if (byte < 0x80) return result;
+      shift += 7n;
+    }
+    throw malformed(`Varint ending at offset ${this.#offset} is longer than ten bytes`);
+  }
+}
+
 /** Shared UTF-8 encoder; `TextEncoder` is a web standard available everywhere. */
 export const utf8: TextEncoder = /* @__PURE__ */ new TextEncoder();
+
+/**
+ * Shared UTF-8 decoder, the mirror of {@link utf8}. `fatal` so that garbage
+ * bytes surface as a malformed file instead of replacement characters.
+ */
+const utf8Decoder: TextDecoder = /* @__PURE__ */ new TextDecoder("utf-8", { fatal: true });
+
+/** Decodes UTF-8 bytes, turning a decoding failure into a typed error. */
+export function decodeUtf8(bytes: Uint8Array): string {
+  try {
+    return utf8Decoder.decode(bytes);
+  } catch (cause) {
+    throw malformed(`Invalid UTF-8 in a ${bytes.length} byte string`, undefined, cause);
+  }
+}

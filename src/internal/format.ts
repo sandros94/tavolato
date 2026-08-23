@@ -1,4 +1,6 @@
-import { CompactWriter, ThriftType } from "./thrift.ts";
+import { ByteReader } from "./bytes.ts";
+import { CompactReader, CompactWriter, type ThriftField, ThriftType } from "./thrift.ts";
+import { malformed } from "../error.ts";
 import type { ColumnType } from "../types.ts";
 
 /**
@@ -13,15 +15,22 @@ export const PhysicalType: {
   readonly BYTE_ARRAY: 6;
 } = { BOOLEAN: 0, INT64: 2, DOUBLE: 5, BYTE_ARRAY: 6 } as const;
 
-export const ConvertedType: { readonly UTF8: 0; readonly TIMESTAMP_MILLIS: 9 } = {
-  UTF8: 0,
-  TIMESTAMP_MILLIS: 9,
-} as const;
+/**
+ * `INT_64` is not written by tavolato but is accepted on the way in: it
+ * annotates an `INT64` with exactly the domain an unannotated one already has,
+ * so it carries no information the reader would have to drop.
+ */
+export const ConvertedType: {
+  readonly UTF8: 0;
+  readonly TIMESTAMP_MILLIS: 9;
+  readonly INT_64: 18;
+} = { UTF8: 0, TIMESTAMP_MILLIS: 9, INT_64: 18 } as const;
 
-export const FieldRepetitionType: { readonly REQUIRED: 0; readonly OPTIONAL: 1 } = {
-  REQUIRED: 0,
-  OPTIONAL: 1,
-} as const;
+export const FieldRepetitionType: {
+  readonly REQUIRED: 0;
+  readonly OPTIONAL: 1;
+  readonly REPEATED: 2;
+} = { REQUIRED: 0, OPTIONAL: 1, REPEATED: 2 } as const;
 
 export const Encoding: { readonly PLAIN: 0; readonly RLE: 3 } = { PLAIN: 0, RLE: 3 } as const;
 
@@ -29,8 +38,24 @@ export const CompressionCodec: { readonly UNCOMPRESSED: 0 } = { UNCOMPRESSED: 0 
 
 export const PageType: { readonly DATA_PAGE: 0 } = { DATA_PAGE: 0 } as const;
 
+/** The `LogicalType` union field ids tavolato recognises by name. */
+export const LogicalTypeId: { readonly STRING: 1; readonly TIMESTAMP: 8 } = {
+  STRING: 1,
+  TIMESTAMP: 8,
+} as const;
+
+/** `TimeUnit` union field ids. */
+export const TimeUnit: { readonly MILLIS: 1 } = { MILLIS: 1 } as const;
+
 /** `PAR1`, the four magic bytes that open and close every Parquet file. */
 export const MAGIC: Uint8Array = /* @__PURE__ */ new Uint8Array([0x50, 0x41, 0x52, 0x31]);
+
+/**
+ * A flat schema has exactly one optional level per column, so nullable columns
+ * always use definition levels of width 1 and non-nullable columns write none
+ * at all.
+ */
+export const MAX_DEFINITION_LEVEL_BIT_WIDTH: number = 1;
 
 /** How each supported column type maps onto Parquet's physical/logical types. */
 export interface PhysicalMapping {
@@ -193,4 +218,445 @@ export function encodeFileMetadata(
   writer.fieldString(6, createdBy);
   writer.structEnd();
   return writer.toBytes();
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Decoding
+ *
+ * The reader only pulls out the fields it needs; every other field is skipped
+ * through the Thrift protocol, so a footer written by a newer Parquet release
+ * (or by another implementation with more to say) still reads.
+ * ---------------------------------------------------------------------------
+ */
+
+/** Names for the enum values the reader may have to reject, so errors can say what it found. */
+const PHYSICAL_TYPE_NAMES = [
+  "BOOLEAN",
+  "INT32",
+  "INT64",
+  "INT96",
+  "FLOAT",
+  "DOUBLE",
+  "BYTE_ARRAY",
+  "FIXED_LEN_BYTE_ARRAY",
+];
+
+const CONVERTED_TYPE_NAMES = [
+  "UTF8",
+  "MAP",
+  "MAP_KEY_VALUE",
+  "LIST",
+  "ENUM",
+  "DECIMAL",
+  "DATE",
+  "TIME_MILLIS",
+  "TIME_MICROS",
+  "TIMESTAMP_MILLIS",
+  "TIMESTAMP_MICROS",
+  "UINT_8",
+  "UINT_16",
+  "UINT_32",
+  "UINT_64",
+  "INT_8",
+  "INT_16",
+  "INT_32",
+  "INT_64",
+  "JSON",
+  "BSON",
+  "INTERVAL",
+];
+
+const LOGICAL_TYPE_NAMES = [
+  "",
+  "STRING",
+  "MAP",
+  "LIST",
+  "ENUM",
+  "DECIMAL",
+  "DATE",
+  "TIME",
+  "TIMESTAMP",
+  "",
+  "INTEGER",
+  "UNKNOWN",
+  "JSON",
+  "BSON",
+  "UUID",
+  "FLOAT16",
+  "VARIANT",
+  "GEOMETRY",
+  "GEOGRAPHY",
+];
+
+const TIME_UNIT_NAMES = ["", "MILLIS", "MICROS", "NANOS"];
+
+const ENCODING_NAMES = [
+  "PLAIN",
+  "",
+  "PLAIN_DICTIONARY",
+  "RLE",
+  "BIT_PACKED",
+  "DELTA_BINARY_PACKED",
+  "DELTA_LENGTH_BYTE_ARRAY",
+  "DELTA_BYTE_ARRAY",
+  "RLE_DICTIONARY",
+  "BYTE_STREAM_SPLIT",
+];
+
+const CODEC_NAMES = ["UNCOMPRESSED", "SNAPPY", "GZIP", "LZO", "BROTLI", "LZ4", "ZSTD", "LZ4_RAW"];
+
+const PAGE_TYPE_NAMES = ["DATA_PAGE", "INDEX_PAGE", "DICTIONARY_PAGE", "DATA_PAGE_V2"];
+
+function nameOf(names: readonly string[], id: number | undefined, kind: string): string {
+  const name = id === undefined ? undefined : names[id];
+  return name === undefined || name === "" ? `${kind} ${id}` : name;
+}
+
+export function physicalTypeName(id: number | undefined): string {
+  return nameOf(PHYSICAL_TYPE_NAMES, id, "physical type");
+}
+
+export function convertedTypeName(id: number | undefined): string {
+  return nameOf(CONVERTED_TYPE_NAMES, id, "converted type");
+}
+
+export function logicalTypeName(id: number | undefined): string {
+  return nameOf(LOGICAL_TYPE_NAMES, id, "logical type");
+}
+
+export function timeUnitName(id: number | undefined): string {
+  return nameOf(TIME_UNIT_NAMES, id, "time unit");
+}
+
+export function encodingName(id: number | undefined): string {
+  return nameOf(ENCODING_NAMES, id, "encoding");
+}
+
+export function codecName(id: number | undefined): string {
+  return nameOf(CODEC_NAMES, id, "codec");
+}
+
+export function pageTypeName(id: number | undefined): string {
+  return nameOf(PAGE_TYPE_NAMES, id, "page type");
+}
+
+/** A `LogicalType` union, reduced to the two facts the reader acts on. */
+export interface LogicalType {
+  /** The union's field id; see {@link LogicalTypeId}. */
+  readonly id: number;
+  /** For `TIMESTAMP`, the `TimeUnit` union field id; see {@link TimeUnit}. */
+  readonly unit?: number;
+}
+
+/** One `SchemaElement`, as far as the reader inspects it. */
+export interface SchemaElement {
+  readonly name: string;
+  readonly physical?: number;
+  readonly repetition?: number;
+  readonly numChildren: number;
+  readonly convertedType?: number;
+  readonly logical?: LogicalType;
+}
+
+/** One `ColumnChunk` plus its inlined `ColumnMetaData`. */
+export interface ColumnChunkInfo {
+  readonly path: readonly string[];
+  readonly physical?: number;
+  readonly codec: number;
+  readonly numValues: number;
+  readonly dataPageOffset: number;
+  readonly dictionaryPageOffset?: number;
+}
+
+export interface RowGroupInfo {
+  readonly columns: readonly ColumnChunkInfo[];
+  readonly numRows: number;
+}
+
+export interface FileMetadata {
+  readonly schema: readonly SchemaElement[];
+  readonly numRows: number;
+  readonly rowGroups: readonly RowGroupInfo[];
+  readonly createdBy?: string;
+}
+
+/** A v1 `PageHeader`, reduced to what the reader checks and needs. */
+export interface PageHeaderInfo {
+  readonly pageType: number;
+  readonly compressedSize: number;
+  readonly numValues: number;
+  readonly encoding: number;
+  readonly definitionLevelEncoding: number;
+}
+
+/** Narrows a 64-bit file field to a usable offset or count. */
+function toCount(value: bigint, what: string): number {
+  if (value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw malformed(`${what} is ${value}, which cannot be a valid file position or count`);
+  }
+  return Number(value);
+}
+
+/**
+ * Runs `read` for each field of a struct and skips every field it does not
+ * claim, which is the Thrift rule for unrecognised fields and the reason a
+ * richer footer from another writer still parses.
+ */
+function eachField(reader: CompactReader, read: (field: ThriftField) => boolean): void {
+  reader.structBegin();
+  for (let field = reader.fieldBegin(); field !== null; field = reader.fieldBegin()) {
+    if (!read(field)) reader.skip(field.type);
+  }
+  reader.structEnd();
+}
+
+function decodeTimeUnit(reader: CompactReader): number | undefined {
+  let unit: number | undefined;
+  eachField(reader, (field) => {
+    unit = field.id;
+    return false; // the union's payload is an empty struct; skipping it reads the stop byte
+  });
+  return unit;
+}
+
+function decodeLogicalType(reader: CompactReader): LogicalType {
+  let id = 0;
+  let unit: number | undefined;
+  eachField(reader, (field) => {
+    id = field.id;
+    if (field.id !== LogicalTypeId.TIMESTAMP || field.type !== ThriftType.STRUCT) return false;
+    // TimestampType { 1: isAdjustedToUTC, 2: unit }. The UTC flag is advisory
+    // here: the value is epoch milliseconds either way, and that is what a
+    // `Date` holds.
+    eachField(reader, (inner) => {
+      if (inner.id !== 2 || inner.type !== ThriftType.STRUCT) return false;
+      unit = decodeTimeUnit(reader);
+      return true;
+    });
+    return true;
+  });
+  return { id, unit };
+}
+
+function decodeSchemaElement(reader: CompactReader): SchemaElement {
+  let name = "";
+  let physical: number | undefined;
+  let repetition: number | undefined;
+  let numChildren = 0;
+  let convertedType: number | undefined;
+  let logical: LogicalType | undefined;
+  eachField(reader, (field) => {
+    switch (field.id) {
+      case 1: {
+        physical = reader.i32();
+        return true;
+      }
+      case 3: {
+        repetition = reader.i32();
+        return true;
+      }
+      case 4: {
+        name = reader.string();
+        return true;
+      }
+      case 5: {
+        numChildren = reader.i32();
+        return true;
+      }
+      case 6: {
+        convertedType = reader.i32();
+        return true;
+      }
+      case 10: {
+        if (field.type !== ThriftType.STRUCT) return false;
+        logical = decodeLogicalType(reader);
+        return true;
+      }
+      default: {
+        return false;
+      }
+    }
+  });
+  return { name, physical, repetition, numChildren, convertedType, logical };
+}
+
+function decodeColumnMetaData(reader: CompactReader, chunk: MutableChunk): void {
+  eachField(reader, (field) => {
+    switch (field.id) {
+      case 1: {
+        chunk.physical = reader.i32();
+        return true;
+      }
+      case 3: {
+        const { size } = reader.listBegin();
+        const path: string[] = [];
+        for (let index = 0; index < size; index++) path.push(reader.string());
+        chunk.path = path;
+        return true;
+      }
+      case 4: {
+        chunk.codec = reader.i32();
+        return true;
+      }
+      case 5: {
+        chunk.numValues = toCount(reader.i64(), "A column chunk's num_values");
+        return true;
+      }
+      case 9: {
+        chunk.dataPageOffset = toCount(reader.i64(), "A column chunk's data_page_offset");
+        return true;
+      }
+      case 11: {
+        chunk.dictionaryPageOffset = toCount(
+          reader.i64(),
+          "A column chunk's dictionary_page_offset",
+        );
+        return true;
+      }
+      default: {
+        return false;
+      }
+    }
+  });
+}
+
+interface MutableChunk {
+  path: string[];
+  physical?: number;
+  codec: number;
+  numValues: number;
+  dataPageOffset: number;
+  dictionaryPageOffset?: number;
+}
+
+function decodeColumnChunk(reader: CompactReader): ColumnChunkInfo {
+  const chunk: MutableChunk = {
+    path: [],
+    codec: CompressionCodec.UNCOMPRESSED,
+    numValues: 0,
+    dataPageOffset: 0,
+  };
+  eachField(reader, (field) => {
+    if (field.id !== 3 || field.type !== ThriftType.STRUCT) return false;
+    decodeColumnMetaData(reader, chunk);
+    return true;
+  });
+  return chunk;
+}
+
+function decodeRowGroup(reader: CompactReader): RowGroupInfo {
+  const columns: ColumnChunkInfo[] = [];
+  let numRows = 0;
+  eachField(reader, (field) => {
+    switch (field.id) {
+      case 1: {
+        const { size } = reader.listBegin();
+        for (let index = 0; index < size; index++) columns.push(decodeColumnChunk(reader));
+        return true;
+      }
+      case 3: {
+        numRows = toCount(reader.i64(), "A row group's num_rows");
+        return true;
+      }
+      default: {
+        return false;
+      }
+    }
+  });
+  return { columns, numRows };
+}
+
+/** Parses the `FileMetaData` footer struct. */
+export function decodeFileMetadata(bytes: Uint8Array): FileMetadata {
+  const reader = new CompactReader(new ByteReader(bytes));
+  const schema: SchemaElement[] = [];
+  const rowGroups: RowGroupInfo[] = [];
+  let numRows = 0;
+  let createdBy: string | undefined;
+
+  eachField(reader, (field) => {
+    switch (field.id) {
+      case 2: {
+        const { size } = reader.listBegin();
+        for (let index = 0; index < size; index++) schema.push(decodeSchemaElement(reader));
+        return true;
+      }
+      case 3: {
+        numRows = toCount(reader.i64(), "The footer's num_rows");
+        return true;
+      }
+      case 4: {
+        const { size } = reader.listBegin();
+        for (let index = 0; index < size; index++) rowGroups.push(decodeRowGroup(reader));
+        return true;
+      }
+      case 6: {
+        createdBy = reader.string();
+        return true;
+      }
+      default: {
+        return false;
+      }
+    }
+  });
+
+  return { schema, numRows, rowGroups, createdBy };
+}
+
+/**
+ * Parses a `PageHeader` in place, leaving the reader positioned on the first
+ * byte of the page body.
+ */
+export function decodePageHeader(input: ByteReader): PageHeaderInfo {
+  const reader = new CompactReader(input);
+  let pageType: number = PageType.DATA_PAGE;
+  let compressedSize = -1;
+  let numValues = 0;
+  let encoding: number = Encoding.PLAIN;
+  let definitionLevelEncoding: number = Encoding.RLE;
+
+  eachField(reader, (field) => {
+    switch (field.id) {
+      case 1: {
+        pageType = reader.i32();
+        return true;
+      }
+      case 3: {
+        compressedSize = reader.i32();
+        return true;
+      }
+      case 5: {
+        if (field.type !== ThriftType.STRUCT) return false;
+        eachField(reader, (inner) => {
+          switch (inner.id) {
+            case 1: {
+              numValues = reader.i32();
+              return true;
+            }
+            case 2: {
+              encoding = reader.i32();
+              return true;
+            }
+            case 3: {
+              definitionLevelEncoding = reader.i32();
+              return true;
+            }
+            default: {
+              return false;
+            }
+          }
+        });
+        return true;
+      }
+      default: {
+        return false;
+      }
+    }
+  });
+
+  if (compressedSize < 0) {
+    throw malformed(`A page header at offset ${input.offset} declares no page size`);
+  }
+  return { pageType, compressedSize, numValues, encoding, definitionLevelEncoding };
 }

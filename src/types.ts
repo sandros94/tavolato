@@ -72,6 +72,58 @@ export type Row<TDefinition extends SchemaDefinition> = {
   [K in OptionalColumns<TDefinition>]?: ColumnInput<TDefinition[K]["type"]> | null;
 };
 
+/**
+ * The JavaScript values the reader produces for a given column type. The
+ * mapping is the narrow half of {@link ColumnInput}: where the writer accepts
+ * either of two inputs, the reader always returns the same one.
+ *
+ * | tavolato    | read back as |
+ * | ----------- | ------------ |
+ * | `string`    | `string`     |
+ * | `f64`       | `number`     |
+ * | `i64`       | `bigint`     |
+ * | `bool`      | `boolean`    |
+ * | `timestamp` | `Date`       |
+ */
+export type ColumnOutput<TType extends ColumnType> = TType extends "string"
+  ? string
+  : TType extends "f64"
+    ? number
+    : TType extends "i64"
+      ? bigint
+      : TType extends "bool"
+        ? boolean
+        : TType extends "timestamp"
+          ? Date
+          : never;
+
+/** Any value the reader can produce; `null` for a null in an optional column. */
+export type ReadValue = string | number | bigint | boolean | Date | null;
+
+/** One row produced by the reader, keyed by column name in file order. */
+export type ReadRow = Record<string, ReadValue>;
+
+/**
+ * The read-side twin of {@link Row}: what a row of a file written from
+ * `TDefinition` holds. `readParquet` cannot know a file's schema at compile
+ * time, so this is the type to assert onto its rows when you do.
+ *
+ * Every column is present as a key; optional ones may be `null`.
+ */
+export type ReadRowOf<TDefinition extends SchemaDefinition> = {
+  [K in RequiredColumns<TDefinition>]: ColumnOutput<TDefinition[K]["type"]>;
+} & {
+  [K in OptionalColumns<TDefinition>]: ColumnOutput<TDefinition[K]["type"]> | null;
+};
+
+/** What `readParquet` returns: the file's schema and every row it holds. */
+export interface ParquetFile {
+  /** Derived from the file, in the same shape `defineSchema` produces. */
+  readonly schema: ParquetSchema;
+  /** Every row, in row group order and, within a group, in file order. */
+  readonly rows: ReadRow[];
+}
+
 /** Options accepted by `createWriter`. */
 export interface WriterOptions {
   /**

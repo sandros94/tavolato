@@ -100,6 +100,8 @@ describe("export map", () => {
       "createWriter",
       "defineSchema",
       "isTavolatoError",
+      "readParquet",
+      "readSchema",
     ]);
   });
 });

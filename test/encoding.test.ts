@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { ByteWriter } from "../src/internal/bytes.ts";
+import { ByteReader, ByteWriter } from "../src/internal/bytes.ts";
 import {
   bitWidthForMaxLevel,
+  type ColumnValues,
+  decodeRleBitPackedHybrid,
   encodeRleBitPackedHybrid,
+  readPlain,
   writePlain,
 } from "../src/internal/encoding.ts";
+import { expectError } from "./_errors.ts";
 
 /**
  * Expectations derived by hand from Encodings.md.
@@ -147,5 +151,138 @@ describe("PLAIN encoding", () => {
 
   it("writes nothing for an empty column", () => {
     expect(plain({ kind: "bool", items: [] })).toBe("");
+  });
+});
+
+function unhex(text: string): Uint8Array {
+  return text === ""
+    ? new Uint8Array()
+    : new Uint8Array(text.split(" ").map((byte) => Number.parseInt(byte, 16)));
+}
+
+/** Encodes, then decodes, and returns what came back. */
+function levelRoundtrip(levels: readonly number[], bitWidth: number): number[] {
+  return decodeRleBitPackedHybrid(
+    encodeRleBitPackedHybrid(levels, bitWidth),
+    bitWidth,
+    levels.length,
+  );
+}
+
+describe("RLE / bit-packing hybrid decoding", () => {
+  it("decodes the hand-written fixtures the encoder produces", () => {
+    expect(decodeRleBitPackedHybrid(unhex("10 01"), 1, 8)).toEqual(
+      Array.from({ length: 8 }, () => 1),
+    );
+    expect(decodeRleBitPackedHybrid(unhex("d0 0f 00"), 1, 1000)).toEqual(
+      Array.from({ length: 1000 }, () => 0),
+    );
+    expect(decodeRleBitPackedHybrid(unhex("03 55"), 1, 8)).toEqual([1, 0, 1, 0, 1, 0, 1, 0]);
+    expect(decodeRleBitPackedHybrid(unhex("03 88 c6 fa"), 3, 8)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+    expect(decodeRleBitPackedHybrid(unhex("10 2c 01"), 9, 8)).toEqual(
+      Array.from({ length: 8 }, () => 300),
+    );
+  });
+
+  it("stops at count, discarding a final group's padding", () => {
+    // "03 05" holds three real values and five zeroes of padding.
+    expect(decodeRleBitPackedHybrid(unhex("03 05"), 1, 3)).toEqual([1, 0, 1]);
+  });
+
+  it("decodes a mix of bit-packed and RLE runs", () => {
+    expect(decodeRleBitPackedHybrid(unhex("03 aa 10 01 03 00"), 1, 17)).toEqual([
+      0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0,
+    ]);
+  });
+
+  it("inverts the encoder for every shape it can produce", () => {
+    const shapes: readonly (readonly number[])[] = [
+      [],
+      [1],
+      [0],
+      [1, 0, 1],
+      Array.from({ length: 8 }, () => 1),
+      Array.from({ length: 1000 }, (_, index) => (index % 2 === 0 ? 1 : 0)),
+      Array.from({ length: 1003 }, (_, index) => (index % 5 === 0 ? 0 : 1)),
+      Array.from({ length: 600 }, (_, index) => (index < 300 ? 0 : 1)),
+    ];
+    for (const levels of shapes) expect(levelRoundtrip(levels, 1)).toEqual([...levels]);
+    // Wider levels are never written by tavolato, but the codec is general.
+    expect(levelRoundtrip([0, 1, 2, 3, 4, 5, 6, 7], 3)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+    expect(
+      levelRoundtrip(
+        Array.from({ length: 20 }, () => 300),
+        9,
+      ),
+    ).toEqual(Array.from({ length: 20 }, () => 300));
+  });
+
+  it("reads nothing when no levels are asked for", () => {
+    expect(decodeRleBitPackedHybrid(new Uint8Array(), 1, 0)).toEqual([]);
+  });
+
+  it("refuses a run that would yield no values, rather than spinning", () => {
+    expectError("ERR_READ_MALFORMED", () => decodeRleBitPackedHybrid(unhex("00 00"), 1, 4));
+    expectError("ERR_READ_MALFORMED", () => decodeRleBitPackedHybrid(unhex("01 00"), 1, 4));
+  });
+
+  it("refuses to run off the end of the level stream", () => {
+    expectError("ERR_READ_MALFORMED", () => decodeRleBitPackedHybrid(unhex("03"), 1, 8));
+  });
+});
+
+describe("PLAIN decoding", () => {
+  /** Writes `values`, reads them back, and returns the result. */
+  function plainRoundtrip(values: ColumnValues): ColumnValues {
+    const out = new ByteWriter();
+    writePlain(out, values);
+    return readPlain(new ByteReader(out.toBytes()), values.kind, values.items.length);
+  }
+
+  it("inverts BYTE_ARRAY, length prefix included", () => {
+    const items = [
+      new Uint8Array(),
+      new Uint8Array([0x61]),
+      new Uint8Array([0xf0, 0x9f, 0x8e, 0x89]),
+    ];
+    expect(plainRoundtrip({ kind: "bytes", items })).toEqual({ kind: "bytes", items });
+  });
+
+  it("inverts INT64 at the signed extremes", () => {
+    const items = [0n, 1n, -1n, 2n ** 63n - 1n, -(2n ** 63n)];
+    expect(plainRoundtrip({ kind: "i64", items })).toEqual({ kind: "i64", items });
+  });
+
+  it("inverts DOUBLE, negative zero included", () => {
+    const items = [1, -0, Number.NaN, Number.POSITIVE_INFINITY, 5e-324];
+    const read = plainRoundtrip({ kind: "f64", items });
+    expect(read.items).toEqual(items);
+    expect(Object.is(read.items[1], -0)).toBe(true);
+  });
+
+  it("inverts BOOLEAN across byte boundaries", () => {
+    const items = Array.from({ length: 19 }, (_, index) => index % 3 === 0);
+    expect(plainRoundtrip({ kind: "bool", items })).toEqual({ kind: "bool", items });
+  });
+
+  it("ignores the padding bits of a boolean's final byte", () => {
+    // "ff 01" holds nine set bits followed by seven bits of padding.
+    expect(readPlain(new ByteReader(unhex("ff 01")), "bool", 9).items).toEqual(
+      Array.from({ length: 9 }, () => true),
+    );
+  });
+
+  it("reads nothing for an empty column", () => {
+    for (const kind of ["bytes", "f64", "i64", "bool"] as const) {
+      expect(readPlain(new ByteReader(new Uint8Array()), kind, 0).items).toEqual([]);
+    }
+  });
+
+  it("refuses to read past the end of a page", () => {
+    expectError("ERR_READ_MALFORMED", () => readPlain(new ByteReader(unhex("01 00")), "i64", 1));
+    // A BYTE_ARRAY whose length prefix promises more than the page holds.
+    expectError("ERR_READ_MALFORMED", () =>
+      readPlain(new ByteReader(unhex("ff 00 00 00 61")), "bytes", 1),
+    );
   });
 });

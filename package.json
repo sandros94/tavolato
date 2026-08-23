@@ -1,10 +1,11 @@
 {
   "name": "tavolato",
   "version": "0.0.0",
-  "description": "A small Parquet writer that works anywhere.",
+  "description": "A small Parquet writer, and a reader for the files it writes, that works anywhere.",
   "keywords": [
     "columnar",
     "parquet",
+    "reader",
     "runtime-agnostic",
     "thrift",
     "writer"

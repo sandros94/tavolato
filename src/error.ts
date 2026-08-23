@@ -4,6 +4,7 @@
  *   ERR_SCHEMA_* — problems with the schema handed to `defineSchema`
  *   ERR_ROW_*    — problems with a row handed to `append` / `appendAll`
  *   ERR_WRITER_* — problems with how the writer itself is being driven
+ *   ERR_READ_*   — problems with the bytes handed to `readParquet` / `readSchema`
  */
 export type TavolatoErrorCode =
   // Schema definition
@@ -17,6 +18,9 @@ export type TavolatoErrorCode =
   // Writer lifecycle / options
   | "ERR_WRITER_FINISHED" // `append` / `finish` called after `finish`
   | "ERR_WRITER_OPTION_INVALID" // bad `createWriter` option
+  // File reading
+  | "ERR_READ_MALFORMED" // the bytes are not a well-formed Parquet file
+  | "ERR_READ_UNSUPPORTED" // well-formed Parquet, but outside the subset tavolato writes
   | (string & {}); // forward-compatible escape hatch
 
 /**
@@ -49,6 +53,31 @@ export class TavolatoError<TCode extends TavolatoErrorCode = TavolatoErrorCode> 
     this.column = column;
     this.cause = cause;
   }
+}
+
+/**
+ * The bytes are not a well-formed Parquet file: wrong magic, a truncated
+ * stream, a length that does not fit, a structure that contradicts itself.
+ *
+ * @internal
+ */
+export function malformed(message: string, column?: string, cause?: unknown): TavolatoError {
+  return new TavolatoError(message, "ERR_READ_MALFORMED", column, cause);
+}
+
+/**
+ * The file is valid Parquet, but uses something tavolato never writes and
+ * therefore refuses to read. `found` names the offending feature; the rest of
+ * the sentence — the scope promise — is worded here, once.
+ *
+ * @internal
+ */
+export function unsupported(found: string, column?: string): TavolatoError {
+  return new TavolatoError(
+    `Cannot read ${found}: tavolato only reads the files it writes — flat schemas of string, f64, i64, bool and timestamp columns, PLAIN encoded, UNCOMPRESSED, in v1 data pages`,
+    "ERR_READ_UNSUPPORTED",
+    column,
+  );
 }
 
 /**

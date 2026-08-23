@@ -1,4 +1,5 @@
-import { ByteWriter } from "./bytes.ts";
+import { ByteReader, ByteWriter } from "./bytes.ts";
+import { malformed } from "../error.ts";
 
 /**
  * Non-null column values, kept in the shape the PLAIN encoder wants so no
@@ -45,6 +46,47 @@ export function writePlain(out: ByteWriter, values: ColumnValues): void {
         out.u8(byte);
       }
       break;
+    }
+  }
+}
+
+/**
+ * Reads `count` values written by {@link writePlain}.
+ *
+ * `count` is the number of *present* values, which for a nullable column is
+ * fewer than the page's `num_values`: nulls occupy a definition level but no
+ * bytes in the value stream.
+ */
+export function readPlain(
+  input: ByteReader,
+  kind: ColumnValues["kind"],
+  count: number,
+): ColumnValues {
+  switch (kind) {
+    case "bytes": {
+      const items: Uint8Array[] = [];
+      for (let index = 0; index < count; index++) items.push(input.raw(input.u32()));
+      return { kind, items };
+    }
+    case "f64": {
+      const items: number[] = [];
+      for (let index = 0; index < count; index++) items.push(input.f64());
+      return { kind, items };
+    }
+    case "i64": {
+      const items: bigint[] = [];
+      for (let index = 0; index < count; index++) items.push(input.i64());
+      return { kind, items };
+    }
+    case "bool": {
+      const items: boolean[] = [];
+      for (let index = 0; index < count; index += 8) {
+        const byte = input.u8();
+        for (let bit = 0; bit < 8 && index + bit < count; bit++) {
+          items.push((byte & (1 << bit)) !== 0);
+        }
+      }
+      return { kind, items };
     }
   }
 }
@@ -142,4 +184,55 @@ export function encodeRleBitPackedHybrid(levels: readonly number[], bitWidth: nu
   endBitPackedRun();
 
   return out.toBytes();
+}
+
+/**
+ * Decodes exactly `count` levels written by {@link encodeRleBitPackedHybrid}.
+ *
+ * Runs are consumed until `count` levels have been produced; the trailing
+ * padding of a final bit-packed group is read and discarded, which is what
+ * makes the encoder's "pad the last group" strategy invisible here.
+ *
+ * A run that would yield no values at all is rejected rather than retried:
+ * that is the only shape of input that could otherwise loop forever.
+ */
+export function decodeRleBitPackedHybrid(
+  bytes: Uint8Array,
+  bitWidth: number,
+  count: number,
+): number[] {
+  const input = new ByteReader(bytes);
+  const byteWidth = Math.ceil(bitWidth / 8);
+  const levels: number[] = [];
+
+  while (levels.length < count) {
+    // As in the encoder, `%` and `Math.floor` stand in for bitwise operators so
+    // run lengths above 2^31 survive.
+    const header = input.varint();
+    if (header % 2 === 1) {
+      const groups = Math.floor(header / 2);
+      if (groups === 0) throw malformed("A bit-packed run declares zero groups");
+      for (let group = 0; group < groups && levels.length < count; group++) {
+        let accumulator = 0;
+        let accumulatedBits = 0;
+        for (let index = 0; index < 8; index++) {
+          while (accumulatedBits < bitWidth) {
+            accumulator += input.u8() * 2 ** accumulatedBits;
+            accumulatedBits += 8;
+          }
+          if (levels.length < count) levels.push(accumulator % 2 ** bitWidth);
+          accumulator = Math.floor(accumulator / 2 ** bitWidth);
+          accumulatedBits -= bitWidth;
+        }
+      }
+    } else {
+      const runLength = header / 2;
+      if (runLength === 0) throw malformed("An RLE run declares zero values");
+      let value = 0;
+      for (let index = 0; index < byteWidth; index++) value += input.u8() * 2 ** (8 * index);
+      for (let index = 0; index < runLength && levels.length < count; index++) levels.push(value);
+    }
+  }
+
+  return levels;
 }
