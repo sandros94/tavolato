@@ -1,7 +1,11 @@
 import { ByteWriter, utf8 } from "./internal/bytes.ts";
+import { chain, chainEach, isThenable } from "./internal/chain.ts";
 import { type ColumnValues, encodeRleBitPackedHybrid, writePlain } from "./internal/encoding.ts";
 import {
+  CODEC_IDS,
+  codecId,
   type ColumnChunkMeta,
+  CompressionCodec,
   encodeDataPageHeader,
   encodeFileMetadata,
   MAGIC,
@@ -9,7 +13,14 @@ import {
   type RowGroupMeta,
 } from "./internal/format.ts";
 import { TavolatoError } from "./error.ts";
-import type { ParquetSchema, Row, SchemaColumn, SchemaDefinition, WriterOptions } from "./types.ts";
+import type {
+  ParquetSchema,
+  Row,
+  SchemaColumn,
+  SchemaDefinition,
+  WriterCodec,
+  WriterOptions,
+} from "./types.ts";
 
 const DEFAULT_ROW_GROUP_SIZE = 10_000;
 const DEFAULT_CREATED_BY = "tavolato";
@@ -49,7 +60,8 @@ interface ColumnState {
 function createColumnState(column: SchemaColumn): ColumnState {
   let values: ColumnValues;
   switch (column.type) {
-    case "string": {
+    case "string":
+    case "json": {
       values = { kind: "bytes", items: [] };
       break;
     }
@@ -160,7 +172,11 @@ function stage(column: SchemaColumn, value: unknown, present: boolean): StagedVa
     return null;
   }
   switch (column.type) {
-    case "string": {
+    case "string":
+    case "json": {
+      // A `json` value is a string end to end: tavolato never parses it, never
+      // re-serializes it, and stores exactly the bytes it was handed. The JSON
+      // annotation is metadata for whoever reads the file next.
       if (typeof value !== "string") throw invalid(column, value, "a string");
       return { kind: "bytes", value: utf8.encode(value) };
     }
@@ -229,12 +245,26 @@ function projectedPageSize(state: ColumnState, staged: StagedValue): number {
 }
 
 /**
+ * One column's page body, detached from the column buffer and waiting to be
+ * compressed and written.
+ */
+interface PendingPage {
+  readonly column: SchemaColumn;
+  readonly body: Uint8Array;
+  readonly nullCount: number;
+}
+
+/**
  * Buffers rows and emits a complete Parquet file.
  *
  * Rows accumulate in memory until `rowGroupSize` is reached, at which point a
  * row group is serialized into the output buffer and the column buffers are
  * released. `finish()` flushes whatever is left, appends the footer, and
  * returns the file; the writer is unusable afterwards.
+ *
+ * With a `codec`, `append` and `finish` return a promise exactly when the codec
+ * hands them one — never otherwise. See {@link ParquetWriter.append} for the
+ * one rule that comes with it.
  *
  * Instances are created through {@link createWriter}.
  */
@@ -247,12 +277,18 @@ export class ParquetWriter<TDefinition extends SchemaDefinition = SchemaDefiniti
   readonly #names: ReadonlySet<string>;
   readonly #rowGroupSize: number;
   readonly #createdBy: string;
+  readonly #codec: WriterCodec | undefined;
+  readonly #codecId: number;
 
   #out: ByteWriter;
   #rowGroups: RowGroupMeta[] = [];
   #bufferedRows = 0;
   #rowCount = 0;
   #finished = false;
+  /** Set for the whole of an in-progress `append` / `finish`; see `#guard`. */
+  #busy = false;
+  /** Set once a codec failure has left the output mid-row-group and unrecoverable. */
+  #failure: TavolatoError | undefined;
 
   constructor(schema: ParquetSchema<TDefinition>, options: WriterOptions = {}) {
     const rowGroupSize = options.rowGroupSize ?? DEFAULT_ROW_GROUP_SIZE;
@@ -269,10 +305,36 @@ export class ParquetWriter<TDefinition extends SchemaDefinition = SchemaDefiniti
         "ERR_WRITER_OPTION_INVALID",
       );
     }
+    const codec = options.codec;
+    let codecStamp: number = CompressionCodec.UNCOMPRESSED;
+    if (codec !== undefined) {
+      if (typeof codec !== "object" || codec === null || typeof codec.compress !== "function") {
+        throw new TavolatoError(
+          `codec must be an object such as { name: "GZIP", compress }, received ${describe(
+            options.codec,
+          )}`,
+          "ERR_WRITER_OPTION_INVALID",
+        );
+      }
+      // Resolved once, in the constructor: a name that stands for no codec
+      // would otherwise only surface as a nonsense id in the finished file.
+      const id = typeof codec.name === "string" ? codecId(codec.name) : undefined;
+      if (id === undefined) {
+        throw new TavolatoError(
+          `codec.name must be one of ${Object.keys(CODEC_IDS).join(", ")}, received ${describe(
+            codec.name,
+          )}`,
+          "ERR_WRITER_OPTION_INVALID",
+        );
+      }
+      codecStamp = id;
+    }
 
     this.schema = schema;
     this.#rowGroupSize = Math.min(rowGroupSize, MAX_ROWS_PER_GROUP);
     this.#createdBy = createdBy;
+    this.#codec = codec;
+    this.#codecId = codecStamp;
     this.#states = schema.columns.map((column) => createColumnState(column));
     this.#staged = Array.from<StagedValue>({ length: schema.columns.length }).fill(null);
     this.#names = new Set(schema.columns.map((column) => column.name));
@@ -296,13 +358,21 @@ export class ParquetWriter<TDefinition extends SchemaDefinition = SchemaDefiniti
    * The row is validated in full before anything is buffered, so a rejected
    * row leaves the writer exactly as it was.
    *
-   * @throws {TavolatoError} `ERR_WRITER_FINISHED`, `ERR_ROW_NOT_AN_OBJECT`,
+   * Returns nothing on the ordinary path. It returns a **promise** only when
+   * appending this row closed a row group *and* the configured codec compressed
+   * it asynchronously; that promise must be awaited before the writer is
+   * touched again, or the next call throws `ERR_WRITER_BUSY`. Without a codec,
+   * or with a synchronous one, nothing here ever defers.
+   *
+   * @throws {TavolatoError} `ERR_WRITER_FINISHED`, `ERR_WRITER_BUSY`,
+   * `ERR_WRITER_CODEC_FAILED`, `ERR_ROW_NOT_AN_OBJECT`,
    * `ERR_ROW_UNKNOWN_COLUMN`, `ERR_ROW_VALUE_MISSING` or `ERR_ROW_VALUE_INVALID`.
    */
-  append(row: Row<TDefinition>): void {
-    if (this.#finished) {
-      throw new TavolatoError("Writer has already been finished", "ERR_WRITER_FINISHED");
-    }
+  append(row: Row<TDefinition>): void | Promise<void> {
+    return this.#guard(() => this.#appendRow(row));
+  }
+
+  #appendRow(row: Row<TDefinition>): void | Promise<void> {
     if (typeof row !== "object" || row === null || Array.isArray(row)) {
       throw new TavolatoError(
         `A row must be a plain object, received ${describe(row)}`,
@@ -347,7 +417,11 @@ export class ParquetWriter<TDefinition extends SchemaDefinition = SchemaDefiniti
       }
       if (projectedPageSize(state, value) > MAX_PAGE_BYTES) mustFlush = true;
     }
-    if (mustFlush) this.#flushRowGroup();
+
+    // The flush below detaches the buffered rows synchronously even when the
+    // codec defers, so committing this row on top of the freshly emptied
+    // buffers is safe while the previous group is still being compressed.
+    let pending = mustFlush ? this.#flushRowGroup() : undefined;
 
     for (let index = 0; index < this.#states.length; index++) {
       commit(this.#states[index], staged[index]);
@@ -355,12 +429,30 @@ export class ParquetWriter<TDefinition extends SchemaDefinition = SchemaDefiniti
 
     this.#bufferedRows++;
     this.#rowCount++;
-    if (this.#bufferedRows >= this.#rowGroupSize) this.#flushRowGroup();
+    if (this.#bufferedRows >= this.#rowGroupSize) {
+      // Row groups are written in order, so a second flush in the same call
+      // (only possible at `rowGroupSize: 1`) waits for the first.
+      pending = chain(pending, () => this.#flushRowGroup());
+    }
+    return pending;
   }
 
-  /** Appends every row of an iterable, in order. */
-  appendAll(rows: Iterable<Row<TDefinition>>): void {
-    for (const row of rows) this.append(row);
+  /**
+   * Appends every row of an iterable, in order.
+   *
+   * Returns a promise under the same rule as {@link ParquetWriter.append}: only
+   * when a codec deferred, and from then on the remaining rows are appended in
+   * its continuation. The iterable is pulled lazily either way.
+   */
+  appendAll(rows: Iterable<Row<TDefinition>>): void | Promise<void> {
+    const iterator = rows[Symbol.iterator]();
+    const run = (): void | Promise<void> => {
+      for (let next = iterator.next(); next.done !== true; next = iterator.next()) {
+        const pending = this.append(next.value);
+        if (isThenable(pending)) return chain(pending, run);
+      }
+    };
+    return run();
   }
 
   /**
@@ -370,14 +462,72 @@ export class ParquetWriter<TDefinition extends SchemaDefinition = SchemaDefiniti
    * A writer that never saw a row still produces a valid file: schema present,
    * zero row groups, `num_rows = 0`.
    *
-   * @throws {TavolatoError} `ERR_WRITER_FINISHED` when called twice.
+   * Returns a promise only when the codec compresses the final row group
+   * asynchronously.
+   *
+   * @throws {TavolatoError} `ERR_WRITER_FINISHED` when called twice,
+   * `ERR_WRITER_BUSY` while an earlier call is still in flight.
    */
-  finish(): Uint8Array {
+  finish(): Uint8Array | Promise<Uint8Array> {
+    // The footer is written inside the guard, not after it: a writer that has
+    // flushed its last page but not yet stamped `num_rows` is still torn, and
+    // `#complete` must be unable to run twice.
+    return this.#guard(() => chain(this.#flushRowGroup(), () => this.#complete()));
+  }
+
+  /**
+   * Runs one public operation with the writer held against re-entry for the
+   * operation's *whole* lifetime — the synchronous stretch on the stack
+   * included, so a codec that calls back in is refused rather than allowed to
+   * rewrite offsets that have already been handed out.
+   *
+   * Nothing is marked before {@link ParquetWriter.append} has decided the call
+   * is legal, so a refused call leaves the writer exactly as it found it; and
+   * the mark is only cleared once the operation has fully settled, which is
+   * what closes the gap between a last page landing and a footer being written.
+   */
+  #guard<T>(run: () => T | Promise<T>): T | Promise<T> {
+    this.#assertUsable();
+    this.#busy = true;
+    let pending: T | Promise<T>;
+    try {
+      pending = run();
+    } catch (error) {
+      this.#busy = false;
+      throw error;
+    }
+    if (!isThenable(pending)) {
+      this.#busy = false;
+      return pending;
+    }
+    return pending.then(
+      (value) => {
+        this.#busy = false;
+        return value;
+      },
+      (error: unknown) => {
+        this.#busy = false;
+        throw error;
+      },
+    );
+  }
+
+  /** Refuses a writer that is finished, mid-operation, or wrecked by a codec. */
+  #assertUsable(): void {
     if (this.#finished) {
       throw new TavolatoError("Writer has already been finished", "ERR_WRITER_FINISHED");
     }
-    this.#flushRowGroup();
+    if (this.#failure !== undefined) throw this.#failure;
+    if (this.#busy) {
+      throw new TavolatoError(
+        "The writer is in the middle of an operation: await the promise the previous call returned, and do not call back into the writer from a codec",
+        "ERR_WRITER_BUSY",
+      );
+    }
+  }
 
+  /** Writes the footer and hands over the file. */
+  #complete(): Uint8Array {
     const footer = encodeFileMetadata(
       this.schema.columns,
       this.#rowGroups,
@@ -396,15 +546,16 @@ export class ParquetWriter<TDefinition extends SchemaDefinition = SchemaDefiniti
     return bytes;
   }
 
-  #flushRowGroup(): void {
+  #flushRowGroup(): void | Promise<void> {
     if (this.#bufferedRows === 0) return;
     const numRows = this.#bufferedRows;
-    const fileOffset = this.#out.length;
-    const columns: ColumnChunkMeta[] = [];
-    let totalByteSize = 0;
+    this.#bufferedRows = 0;
 
+    // Every page body is built, and every column buffer released, before a
+    // single byte is compressed: whatever the codec does with its time, it
+    // holds no rows hostage.
+    const pages: PendingPage[] = [];
     for (const state of this.#states) {
-      const dataPageOffset = this.#out.length;
       const page = new ByteWriter(1024);
       if (state.column.optional) {
         // Data page v1 prefixes RLE level data with its length as 4 bytes LE.
@@ -413,43 +564,177 @@ export class ParquetWriter<TDefinition extends SchemaDefinition = SchemaDefiniti
         page.raw(levels);
       }
       writePlain(page, state.values);
-      const body = page.toBytes();
-      const header = encodeDataPageHeader(body.length, numRows);
-
-      this.#out.raw(header);
-      this.#out.raw(body);
-
-      const totalSize = header.length + body.length;
-      totalByteSize += totalSize;
-      columns.push({
-        name: state.column.name,
-        type: state.column.type,
-        optional: state.column.optional,
-        numValues: numRows,
-        nullCount: state.nullCount,
-        dataPageOffset,
-        totalSize,
-      });
+      pages.push({ column: state.column, body: page.toBytes(), nullCount: state.nullCount });
       resetColumnState(state);
     }
 
-    this.#rowGroups.push({ columns, numRows, totalByteSize, fileOffset });
-    this.#bufferedRows = 0;
+    const fileOffset = this.#out.length;
+    const columns: ColumnChunkMeta[] = [];
+    let totalByteSize = 0;
+    let totalCompressedSize = 0;
+
+    // Compressed one page at a time, in order: a chunk's offset is only known
+    // once the chunk before it has landed, which is why there is no second pass
+    // and no offset to patch afterwards.
+    return chain(
+      chainEach(pages.length, (index) => {
+        const page = pages[index];
+        const dataPageOffset = this.#out.length;
+        return chain(this.#compress(page.body), (body) => {
+          const header = encodeDataPageHeader(page.body.length, body.length, numRows);
+          this.#out.raw(header);
+          this.#out.raw(body);
+
+          totalByteSize += header.length + page.body.length;
+          totalCompressedSize += header.length + body.length;
+          columns.push({
+            name: page.column.name,
+            type: page.column.type,
+            optional: page.column.optional,
+            codec: this.#codecId,
+            numValues: numRows,
+            nullCount: page.nullCount,
+            dataPageOffset,
+            totalUncompressedSize: header.length + page.body.length,
+            totalCompressedSize: header.length + body.length,
+          });
+        });
+      }),
+      () => {
+        this.#rowGroups.push({
+          columns,
+          numRows,
+          totalByteSize,
+          totalCompressedSize,
+          fileOffset,
+        });
+      },
+    );
+  }
+
+  /** Hands one page body to the codec, or returns it untouched when there is none. */
+  #compress(body: Uint8Array): Uint8Array | PromiseLike<Uint8Array> {
+    const codec = this.#codec;
+    if (codec === undefined) return body;
+
+    let compressed: Uint8Array | Promise<Uint8Array>;
+    try {
+      compressed = codec.compress(body);
+    } catch (cause) {
+      throw this.#codecFailed(`The ${codec.name} codec threw while compressing a page`, cause);
+    }
+    if (!isThenable(compressed)) return this.#accept(codec.name, compressed);
+
+    // `chain` only forwards fulfilment, so a rejection is turned into a typed
+    // error here, at the one place that knows which codec was asked.
+    const settled = compressed.then(
+      (result) => this.#accept(codec.name, result),
+      (cause: unknown) => {
+        throw this.#codecFailed(`The ${codec.name} codec rejected while compressing a page`, cause);
+      },
+    );
+    // A thenable is only a thenable by duck typing. One whose `then` returns
+    // nothing to chain on — the callback style that predates promises — would
+    // otherwise smuggle that `undefined` onward in place of the page bytes.
+    if (!isThenable(settled)) {
+      throw this.#codecFailed(
+        `The ${codec.name} codec returned a thenable whose then() produced ${describe(
+          settled,
+        )} rather than a promise`,
+      );
+    }
+    return settled;
+  }
+
+  /**
+   * Checks that what the codec handed back can actually be written as a page.
+   * `unknown` rather than `Uint8Array`: the hook is a caller's function, and the
+   * type it promises is not the type it delivers.
+   */
+  #accept(name: string, result: unknown): Uint8Array {
+    if (!(result instanceof Uint8Array)) {
+      throw this.#codecFailed(
+        `The ${name} codec returned ${describe(result)} instead of a Uint8Array`,
+      );
+    }
+    if (result.length > MAX_PAGE_BYTES) {
+      throw this.#codecFailed(
+        `The ${name} codec returned a ${result.length} byte page, which cannot fit a Parquet data page`,
+      );
+    }
+    return result;
+  }
+
+  /**
+   * Records a codec failure and returns the error to throw. The rows of the
+   * row group being flushed are already gone and the output sits mid-group, so
+   * the writer is poisoned rather than left to produce a file missing rows it
+   * accepted.
+   */
+  #codecFailed(what: string, cause?: unknown): TavolatoError {
+    const error = new TavolatoError(
+      `${what}; the writer cannot recover and is now unusable`,
+      "ERR_WRITER_CODEC_FAILED",
+      undefined,
+      cause,
+    );
+    this.#failure = error;
+    return error;
   }
 }
 
 /**
+ * A {@link ParquetWriter} built without a codec, and typed for it.
+ *
+ * Only a codec can make this writer defer, so one that was never given a codec
+ * never does — and its callers should not have to pretend otherwise. This is
+ * the same surface, with the maybe-promises resolved to what they can actually
+ * be. `createWriter` hands it back whenever no `codec` option is passed.
+ */
+export interface SyncParquetWriter<TDefinition extends SchemaDefinition = SchemaDefinition> {
+  /** The schema this writer was built from. */
+  readonly schema: ParquetSchema<TDefinition>;
+  /** Number of rows appended so far. */
+  readonly rowCount: number;
+  /** Whether `finish()` has already been called. */
+  readonly finished: boolean;
+  /** See {@link ParquetWriter.append}. */
+  append(row: Row<TDefinition>): void;
+  /** See {@link ParquetWriter.appendAll}. */
+  appendAll(rows: Iterable<Row<TDefinition>>): void;
+  /** See {@link ParquetWriter.finish}. */
+  finish(): Uint8Array;
+}
+
+/**
  * Creates a writer for a schema produced by `defineSchema`.
+ *
+ * Without a `codec` the result is a {@link SyncParquetWriter}, whose `append`
+ * and `finish` return outright; with one it is a {@link ParquetWriter}, whose
+ * do so only when the codec itself is synchronous.
  *
  * @example
  * const schema = defineSchema({ at: { type: "timestamp" }, n: { type: "i64" } });
  * const writer = createWriter(schema, { rowGroupSize: 50_000 });
  * writer.append({ at: Date.now(), n: 42n });
  * const bytes = writer.finish();
+ *
+ * @example
+ * // Compressed, with whatever the runtime already has:
+ * import { gzipSync } from "node:zlib";
+ * const writer = createWriter(schema, { codec: { name: "GZIP", compress: gzipSync } });
  */
 export function createWriter<TDefinition extends SchemaDefinition>(
   schema: ParquetSchema<TDefinition>,
+  options?: WriterOptions & { codec?: undefined },
+): SyncParquetWriter<TDefinition>;
+export function createWriter<TDefinition extends SchemaDefinition>(
+  schema: ParquetSchema<TDefinition>,
+  options: WriterOptions,
+): ParquetWriter<TDefinition>;
+export function createWriter<TDefinition extends SchemaDefinition>(
+  schema: ParquetSchema<TDefinition>,
   options?: WriterOptions,
-): ParquetWriter<TDefinition> {
+): SyncParquetWriter<TDefinition> | ParquetWriter<TDefinition> {
   return new ParquetWriter(schema, options);
 }

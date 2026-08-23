@@ -3,6 +3,7 @@ import type { ColumnType, ParquetSchema, SchemaColumn, SchemaDefinition } from "
 
 const COLUMN_TYPES: ReadonlySet<string> = new Set<ColumnType>([
   "string",
+  "json",
   "f64",
   "i64",
   "bool",

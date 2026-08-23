@@ -18,6 +18,8 @@ export type TavolatoErrorCode =
   // Writer lifecycle / options
   | "ERR_WRITER_FINISHED" // `append` / `finish` called after `finish`
   | "ERR_WRITER_OPTION_INVALID" // bad `createWriter` option
+  | "ERR_WRITER_BUSY" // used again before the promise a previous call returned settled
+  | "ERR_WRITER_CODEC_FAILED" // the compression hook threw, rejected, or returned something unusable
   // File reading
   | "ERR_READ_MALFORMED" // the bytes are not a well-formed Parquet file
   | "ERR_READ_UNSUPPORTED" // well-formed Parquet, but outside the subset tavolato writes
@@ -70,11 +72,17 @@ export function malformed(message: string, column?: string, cause?: unknown): Ta
  * therefore refuses to read. `found` names the offending feature; the rest of
  * the sentence — the scope promise — is worded here, once.
  *
+ * `remedy` is appended where the refusal is one the caller can lift, which
+ * today means registering a decompressor for a codec tavolato knows by name but
+ * cannot implement.
+ *
  * @internal
  */
-export function unsupported(found: string, column?: string): TavolatoError {
+export function unsupported(found: string, column?: string, remedy?: string): TavolatoError {
   return new TavolatoError(
-    `Cannot read ${found}: tavolato only reads the files it writes — flat schemas of string, f64, i64, bool and timestamp columns, PLAIN encoded, UNCOMPRESSED, in v1 data pages`,
+    `Cannot read ${found}: tavolato only reads the files it writes — flat schemas of string, json, f64, i64, bool and timestamp columns, PLAIN encoded, UNCOMPRESSED, in v1 data pages${
+      remedy === undefined ? "" : ` — ${remedy}`
+    }`,
     "ERR_READ_UNSUPPORTED",
     column,
   );

@@ -1,7 +1,7 @@
 import { ByteReader } from "./bytes.ts";
 import { CompactReader, CompactWriter, type ThriftField, ThriftType } from "./thrift.ts";
 import { malformed } from "../error.ts";
-import type { ColumnType } from "../types.ts";
+import type { CodecName, ColumnType } from "../types.ts";
 
 /**
  * The subset of `parquet.thrift` enums this writer emits.
@@ -24,7 +24,8 @@ export const ConvertedType: {
   readonly UTF8: 0;
   readonly TIMESTAMP_MILLIS: 9;
   readonly INT_64: 18;
-} = { UTF8: 0, TIMESTAMP_MILLIS: 9, INT_64: 18 } as const;
+  readonly JSON: 19;
+} = { UTF8: 0, TIMESTAMP_MILLIS: 9, INT_64: 18, JSON: 19 } as const;
 
 export const FieldRepetitionType: {
   readonly REQUIRED: 0;
@@ -34,14 +35,66 @@ export const FieldRepetitionType: {
 
 export const Encoding: { readonly PLAIN: 0; readonly RLE: 3 } = { PLAIN: 0, RLE: 3 } as const;
 
-export const CompressionCodec: { readonly UNCOMPRESSED: 0 } = { UNCOMPRESSED: 0 } as const;
+/**
+ * The whole `CompressionCodec` enum. tavolato compresses nothing itself, but it
+ * has to name every codec: to stamp the one a caller's hook produced, and to
+ * look one up when a file it did not write asks for it.
+ */
+export const CompressionCodec: {
+  readonly UNCOMPRESSED: 0;
+  readonly SNAPPY: 1;
+  readonly GZIP: 2;
+  readonly LZO: 3;
+  readonly BROTLI: 4;
+  readonly LZ4: 5;
+  readonly ZSTD: 6;
+  readonly LZ4_RAW: 7;
+} = {
+  UNCOMPRESSED: 0,
+  SNAPPY: 1,
+  GZIP: 2,
+  LZO: 3,
+  BROTLI: 4,
+  LZ4: 5,
+  ZSTD: 6,
+  LZ4_RAW: 7,
+} as const;
+
+/** Every codec a caller may register, by name — `UNCOMPRESSED` deliberately absent. */
+export const CODEC_IDS: Readonly<Record<CodecName, number>> = {
+  SNAPPY: CompressionCodec.SNAPPY,
+  GZIP: CompressionCodec.GZIP,
+  LZO: CompressionCodec.LZO,
+  BROTLI: CompressionCodec.BROTLI,
+  LZ4: CompressionCodec.LZ4,
+  ZSTD: CompressionCodec.ZSTD,
+  LZ4_RAW: CompressionCodec.LZ4_RAW,
+};
+
+/** The `CompressionCodec` id `name` stands for, or `undefined` if it stands for none. */
+export function codecId(name: string): number | undefined {
+  return Object.hasOwn(CODEC_IDS, name) ? CODEC_IDS[name as CodecName] : undefined;
+}
+
+/**
+ * The name a caller would have registered `id` under, or `undefined` for
+ * `UNCOMPRESSED` and for an id no released Parquet version defines.
+ */
+export function registrableCodec(id: number): CodecName | undefined {
+  // CODEC_NAMES is the reject-message table below; every entry past index 0 is
+  // a name `CodecName` also holds, which is what makes the cast sound.
+  return id === CompressionCodec.UNCOMPRESSED
+    ? undefined
+    : (CODEC_NAMES[id] as CodecName | undefined);
+}
 
 export const PageType: { readonly DATA_PAGE: 0 } = { DATA_PAGE: 0 } as const;
 
 /** The `LogicalType` union field ids tavolato recognises by name. */
-export const LogicalTypeId: { readonly STRING: 1; readonly TIMESTAMP: 8 } = {
+export const LogicalTypeId: { readonly STRING: 1; readonly TIMESTAMP: 8; readonly JSON: 12 } = {
   STRING: 1,
   TIMESTAMP: 8,
+  JSON: 12,
 } as const;
 
 /** `TimeUnit` union field ids. */
@@ -65,6 +118,7 @@ export interface PhysicalMapping {
 
 const MAPPINGS: Record<ColumnType, PhysicalMapping> = {
   string: { physical: PhysicalType.BYTE_ARRAY, convertedType: ConvertedType.UTF8 },
+  json: { physical: PhysicalType.BYTE_ARRAY, convertedType: ConvertedType.JSON },
   f64: { physical: PhysicalType.DOUBLE },
   i64: { physical: PhysicalType.INT64 },
   bool: { physical: PhysicalType.BOOLEAN },
@@ -80,35 +134,48 @@ export interface ColumnChunkMeta {
   readonly name: string;
   readonly type: ColumnType;
   readonly optional: boolean;
+  /** `CompressionCodec` id the page bodies were written with. */
+  readonly codec: number;
   readonly numValues: number;
   readonly nullCount: number;
   /** Absolute file offset of the column chunk's first (and only) page header. */
   readonly dataPageOffset: number;
-  /** Page header plus page body, in bytes. */
-  readonly totalSize: number;
+  /** Page headers plus page bodies as they would be uncompressed, in bytes. */
+  readonly totalUncompressedSize: number;
+  /** Page headers plus page bodies as they sit in the file, in bytes. */
+  readonly totalCompressedSize: number;
 }
 
 /** Everything the footer needs to know about one row group. */
 export interface RowGroupMeta {
   readonly columns: readonly ColumnChunkMeta[];
   readonly numRows: number;
+  /** `total_byte_size`, which the format defines as the *uncompressed* size. */
   readonly totalByteSize: number;
+  readonly totalCompressedSize: number;
   readonly fileOffset: number;
 }
 
 /**
  * Serializes a v1 `PageHeader` wrapping a `DataPageHeader`.
  *
+ * Both sizes are the body's, header excluded, and they are equal for every page
+ * written without a codec.
+ *
  * The optional `crc` field is deliberately not written: page checksums are
  * optional in the format, and omitting them keeps the core free of any
  * hashing dependency.
  */
-export function encodeDataPageHeader(pageSize: number, numValues: number): Uint8Array {
+export function encodeDataPageHeader(
+  uncompressedSize: number,
+  compressedSize: number,
+  numValues: number,
+): Uint8Array {
   const writer = new CompactWriter();
   writer.structBegin();
   writer.fieldI32(1, PageType.DATA_PAGE);
-  writer.fieldI32(2, pageSize); // uncompressed_page_size
-  writer.fieldI32(3, pageSize); // compressed_page_size — UNCOMPRESSED, so identical
+  writer.fieldI32(2, uncompressedSize);
+  writer.fieldI32(3, compressedSize);
   writer.fieldStructBegin(5); // data_page_header
   writer.fieldI32(1, numValues);
   writer.fieldI32(2, Encoding.PLAIN);
@@ -129,23 +196,38 @@ function writeSchemaElement(writer: CompactWriter, column: SchemaColumnLike): vo
 
   // logicalType (field 10) — the modern annotation; ConvertedType above stays
   // for readers that predate it.
-  if (column.type === "string") {
-    writer.fieldStructBegin(10);
-    writer.fieldStructBegin(1); // STRING
-    writer.structEnd();
-    writer.structEnd();
-  } else if (column.type === "timestamp") {
-    writer.fieldStructBegin(10);
-    writer.fieldStructBegin(8); // TIMESTAMP
-    // ConvertedType TIMESTAMP_MILLIS is defined as UTC-normalised, so the
-    // logical annotation must say so too (LogicalTypes.md, backward compat).
-    writer.fieldBool(1, true); // isAdjustedToUTC
-    writer.fieldStructBegin(2); // unit
-    writer.fieldStructBegin(1); // MILLIS
-    writer.structEnd();
-    writer.structEnd();
-    writer.structEnd();
-    writer.structEnd();
+  switch (column.type) {
+    case "string": {
+      writer.fieldStructBegin(10);
+      writer.fieldStructBegin(LogicalTypeId.STRING);
+      writer.structEnd();
+      writer.structEnd();
+      break;
+    }
+    case "json": {
+      // JsonType is an empty struct, exactly like StringType: the annotation
+      // says the bytes are JSON text, nothing more.
+      writer.fieldStructBegin(10);
+      writer.fieldStructBegin(LogicalTypeId.JSON);
+      writer.structEnd();
+      writer.structEnd();
+      break;
+    }
+    case "timestamp": {
+      writer.fieldStructBegin(10);
+      writer.fieldStructBegin(LogicalTypeId.TIMESTAMP);
+      // ConvertedType TIMESTAMP_MILLIS is defined as UTC-normalised, so the
+      // logical annotation must say so too (LogicalTypes.md, backward compat).
+      writer.fieldBool(1, true); // isAdjustedToUTC
+      writer.fieldStructBegin(2); // unit
+      writer.fieldStructBegin(TimeUnit.MILLIS);
+      writer.structEnd();
+      writer.structEnd();
+      writer.structEnd();
+      writer.structEnd();
+      break;
+    }
+    // No default: the remaining types carry no logical annotation at all.
   }
   writer.structEnd();
 }
@@ -169,10 +251,10 @@ function writeColumnChunk(writer: CompactWriter, chunk: ColumnChunkMeta): void {
   for (const encoding of encodings) writer.elementI32(encoding);
   writer.fieldListBegin(3, ThriftType.BINARY, 1); // path_in_schema
   writer.elementString(chunk.name);
-  writer.fieldI32(4, CompressionCodec.UNCOMPRESSED);
+  writer.fieldI32(4, chunk.codec);
   writer.fieldI64(5, BigInt(chunk.numValues));
-  writer.fieldI64(6, BigInt(chunk.totalSize)); // total_uncompressed_size
-  writer.fieldI64(7, BigInt(chunk.totalSize)); // total_compressed_size
+  writer.fieldI64(6, BigInt(chunk.totalUncompressedSize));
+  writer.fieldI64(7, BigInt(chunk.totalCompressedSize));
   writer.fieldI64(9, BigInt(chunk.dataPageOffset));
   writer.fieldStructBegin(12); // statistics
   writer.fieldI64(3, BigInt(chunk.nullCount));
@@ -188,7 +270,7 @@ function writeRowGroup(writer: CompactWriter, group: RowGroupMeta): void {
   writer.fieldI64(2, BigInt(group.totalByteSize));
   writer.fieldI64(3, BigInt(group.numRows));
   writer.fieldI64(5, BigInt(group.fileOffset));
-  writer.fieldI64(6, BigInt(group.totalByteSize)); // total_compressed_size
+  writer.fieldI64(6, BigInt(group.totalCompressedSize));
   writer.structEnd();
 }
 
@@ -384,7 +466,10 @@ export interface FileMetadata {
 /** A v1 `PageHeader`, reduced to what the reader checks and needs. */
 export interface PageHeaderInfo {
   readonly pageType: number;
+  /** Bytes the body occupies in the file. */
   readonly compressedSize: number;
+  /** Bytes the body must decompress back to; equal to `compressedSize` when it was never compressed. */
+  readonly uncompressedSize: number;
   readonly numValues: number;
   readonly encoding: number;
   readonly definitionLevelEncoding: number;
@@ -611,6 +696,7 @@ export function decodeFileMetadata(bytes: Uint8Array): FileMetadata {
 export function decodePageHeader(input: ByteReader): PageHeaderInfo {
   const reader = new CompactReader(input);
   let pageType: number = PageType.DATA_PAGE;
+  let uncompressedSize = -1;
   let compressedSize = -1;
   let numValues = 0;
   let encoding: number = Encoding.PLAIN;
@@ -620,6 +706,10 @@ export function decodePageHeader(input: ByteReader): PageHeaderInfo {
     switch (field.id) {
       case 1: {
         pageType = reader.i32();
+        return true;
+      }
+      case 2: {
+        uncompressedSize = reader.i32();
         return true;
       }
       case 3: {
@@ -655,8 +745,18 @@ export function decodePageHeader(input: ByteReader): PageHeaderInfo {
     }
   });
 
-  if (compressedSize < 0) {
+  // Both sizes are mandatory in the format, and a compressed page is unreadable
+  // without the second one: refuse a header that leaves either out rather than
+  // guess a length.
+  if (compressedSize < 0 || uncompressedSize < 0) {
     throw malformed(`A page header at offset ${input.offset} declares no page size`);
   }
-  return { pageType, compressedSize, numValues, encoding, definitionLevelEncoding };
+  return {
+    pageType,
+    compressedSize,
+    uncompressedSize,
+    numValues,
+    encoding,
+    definitionLevelEncoding,
+  };
 }

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createWriter, defineSchema } from "../src/index.ts";
 import { expectError } from "./_errors.ts";
+import { sync } from "./_sync.ts";
 
 const MAGIC = "PAR1";
 
@@ -21,7 +22,7 @@ describe("file envelope", () => {
   it("opens and closes with the PAR1 magic", () => {
     const writer = createWriter(schema);
     writer.append({ n: 1n });
-    const bytes = writer.finish();
+    const bytes = sync(writer.finish());
     expect(ascii(bytes, 0, 4)).toBe(MAGIC);
     expect(ascii(bytes, bytes.length - 4, bytes.length)).toBe(MAGIC);
   });
@@ -29,7 +30,7 @@ describe("file envelope", () => {
   it("stores the footer length in the last four bytes before the trailing magic", () => {
     const writer = createWriter(schema);
     writer.append({ n: 1n });
-    const bytes = writer.finish();
+    const bytes = sync(writer.finish());
     const length = footerLength(bytes);
     expect(length).toBeGreaterThan(0);
     expect(length).toBeLessThan(bytes.length - 12);
@@ -37,7 +38,7 @@ describe("file envelope", () => {
 
   it("produces a file that is nothing but magic and footer when empty", () => {
     // Leading magic (4) + footer + footer length (4) + trailing magic (4).
-    const bytes = createWriter(schema).finish();
+    const bytes = sync(createWriter(schema).finish());
     expect(footerLength(bytes)).toBe(bytes.length - 12);
   });
 });
@@ -89,6 +90,6 @@ describe("row groups", () => {
     }
     // One page (and one chunk of metadata) per row group makes the
     // row-group-per-row file strictly larger.
-    expect(small.finish().length).toBeGreaterThan(large.finish().length);
+    expect(sync(small.finish()).length).toBeGreaterThan(sync(large.finish()).length);
   });
 });

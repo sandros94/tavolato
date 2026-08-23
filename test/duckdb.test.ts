@@ -1,6 +1,9 @@
+import { gzipSync, zstdCompressSync } from "node:zlib";
 import { afterAll, describe, expect, it } from "vitest";
 import { createWriter, defineSchema, TavolatoError } from "../src/index.ts";
+import type { WriterCodec } from "../src/index.ts";
 import { cleanupTempDir, duckdb, duckdbRow, sqlPath, writeParquet } from "./_duckdb.ts";
+import { sync } from "./_sync.ts";
 
 /**
  * DuckDB is the specification for this library: everything the writer emits is
@@ -11,8 +14,8 @@ import { cleanupTempDir, duckdb, duckdbRow, sqlPath, writeParquet } from "./_duc
 afterAll(() => cleanupTempDir());
 
 /** Writes a file and returns its SQL-quoted path. */
-function emit(name: string, bytes: Uint8Array): string {
-  return sqlPath(writeParquet(name, bytes));
+function emit(name: string, bytes: Uint8Array | Promise<Uint8Array>): string {
+  return sqlPath(writeParquet(name, sync(bytes)));
 }
 
 describe("value round-trips", () => {
@@ -209,6 +212,136 @@ describe("value round-trips", () => {
       FROM read_parquet(${path});
     `),
     ).toEqual({ rows: 1003, required_mismatch: 0, nullable_mismatch: 0 });
+  });
+});
+
+describe("compression", () => {
+  const codecs: readonly WriterCodec[] = [
+    { name: "GZIP", compress: gzipSync },
+    { name: "ZSTD", compress: zstdCompressSync },
+  ];
+
+  it.each(codecs)("hands DuckDB a readable $name file", (codec) => {
+    const schema = defineSchema({
+      k: { type: "i64" },
+      s: { type: "string" },
+      o: { type: "string", optional: true },
+      f: { type: "f64" },
+      b: { type: "bool", optional: true },
+      t: { type: "timestamp" },
+    });
+    // Several row groups, so every chunk of every column goes through the hook.
+    const writer = createWriter(schema, { codec, rowGroupSize: 7 });
+    for (let index = 0; index < 30; index++) {
+      // Synchronous codec, so every flush lands before the next row is staged.
+      sync(
+        writer.append({
+          k: BigInt(index),
+          s: `row-${index}`,
+          o: index % 3 === 0 ? null : `opt-${index}`,
+          f: index + 0.5,
+          b: index % 5 === 0 ? null : index % 2 === 0,
+          t: 1_700_000_000_000 + index,
+        }),
+      );
+    }
+    const path = emit(`compressed-${codec.name}.parquet`, writer.finish());
+
+    expect(
+      duckdbRow(`
+      SELECT
+        count(*) AS rows,
+        sum(k)::BIGINT AS k_sum,
+        count(o) AS present,
+        count(*) FILTER (WHERE s <> 'row-' || k) AS s_mismatch,
+        count(*) FILTER (WHERE f <> k + 0.5) AS f_mismatch,
+        count(*) FILTER (WHERE b IS DISTINCT FROM CASE WHEN k % 5 = 0 THEN NULL ELSE k % 2 = 0 END) AS b_mismatch,
+        count(*) FILTER (WHERE epoch_ms(t) <> 1700000000000 + k) AS t_mismatch
+      FROM read_parquet(${path});
+    `),
+    ).toEqual({
+      rows: 30,
+      k_sum: (29 * 30) / 2,
+      present: 20,
+      s_mismatch: 0,
+      f_mismatch: 0,
+      b_mismatch: 0,
+      t_mismatch: 0,
+    });
+
+    // The codec is stamped on every chunk, and the declared sizes differ, which
+    // is what says the bodies really were compressed.
+    expect(duckdb(`SELECT DISTINCT compression FROM parquet_metadata(${path});`)).toEqual([
+      { compression: codec.name },
+    ]);
+    expect(
+      duckdbRow(`
+      SELECT count(*) AS shrunk FROM parquet_metadata(${path})
+      WHERE total_compressed_size < total_uncompressed_size;
+    `).shrunk,
+    ).toBeGreaterThan(0);
+  });
+
+  it("leaves an uncompressed file saying so", () => {
+    const schema = defineSchema({ n: { type: "i64" } });
+    const writer = createWriter(schema);
+    writer.append({ n: 1n });
+    const path = emit("uncompressed.parquet", writer.finish());
+    expect(duckdb(`SELECT DISTINCT compression FROM parquet_metadata(${path});`)).toEqual([
+      { compression: "UNCOMPRESSED" },
+    ]);
+  });
+});
+
+describe("json columns", () => {
+  const schema = defineSchema({
+    k: { type: "i64" },
+    doc: { type: "json" },
+    maybe: { type: "json", optional: true },
+  });
+
+  function path(): string {
+    const writer = createWriter(schema);
+    for (let index = 0; index < 5; index++) {
+      writer.append({
+        k: BigInt(index),
+        doc: `{"id":${index},"tag":"t${index}","tags":[${index},${index + 1}]}`,
+        maybe: index % 2 === 0 ? null : `{"odd":${index}}`,
+      });
+    }
+    return emit("json.parquet", writer.finish());
+  }
+
+  it("is annotated so DuckDB gives it back as JSON, not as text", () => {
+    const declared = duckdbRow(
+      `SELECT type, converted_type, logical_type FROM parquet_schema(${path()}) WHERE name = 'doc';`,
+    );
+    expect(declared).toEqual({
+      type: "BYTE_ARRAY",
+      converted_type: "JSON",
+      logical_type: "JsonType()",
+    });
+    expect(
+      duckdb(`DESCRIBE SELECT doc FROM read_parquet(${path()});`).map((row) => row.column_type),
+    ).toEqual(["JSON"]);
+  });
+
+  it("is queryable with DuckDB's JSON operators", () => {
+    expect(
+      duckdb(`
+      SELECT doc->>'$.tag' AS tag, (doc->>'$.id')::BIGINT AS id, doc->>'$.tags[1]' AS second
+      FROM read_parquet(${path()}) ORDER BY k;
+    `),
+    ).toEqual(
+      Array.from({ length: 5 }, (_, index) => ({
+        tag: `t${index}`,
+        id: index,
+        second: String(index + 1),
+      })),
+    );
+    expect(duckdbRow(`SELECT count(maybe) AS present FROM read_parquet(${path()});`)).toEqual({
+      present: 2,
+    });
   });
 });
 

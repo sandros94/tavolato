@@ -7,9 +7,12 @@ import type { PutObjectParams, S3Client } from "uns3";
  */
 export const PARQUET_CONTENT_TYPE = "application/vnd.apache.parquet";
 
-/** Anything that can hand over a finished Parquet file. */
+/**
+ * Anything that can hand over a finished Parquet file. `finish` may defer,
+ * which is what a `ParquetWriter` with an asynchronous codec does.
+ */
 export interface ParquetSource {
-  finish(): Uint8Array;
+  finish(): Uint8Array | Promise<Uint8Array>;
 }
 
 /**
@@ -47,7 +50,7 @@ export async function putParquet(
   params: PutParquetParams,
   source: Uint8Array | ParquetSource,
 ): Promise<Response> {
-  const body = source instanceof Uint8Array ? source : source.finish();
+  const body = source instanceof Uint8Array ? source : await source.finish();
   return await client.put({
     contentType: PARQUET_CONTENT_TYPE,
     ...params,

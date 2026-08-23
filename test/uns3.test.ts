@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { PutObjectParams, S3Client } from "uns3";
 import { createWriter, defineSchema } from "../src/index.ts";
 import { PARQUET_CONTENT_TYPE, putParquet } from "../src/uns3.ts";
+import { sync } from "./_sync.ts";
 import * as root from "../src/index.ts";
 
 /**
@@ -26,7 +27,7 @@ describe("putParquet", () => {
     const { client, calls } = stubClient();
     const writer = createWriter(schema);
     writer.append({ n: 1n });
-    const bytes = writer.finish();
+    const bytes = sync(writer.finish());
 
     const response = await putParquet(client, { bucket: "b", key: "a.parquet" }, bytes);
 

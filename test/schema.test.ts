@@ -17,6 +17,7 @@ describe("defineSchema", () => {
   it("accepts every supported column type", () => {
     const schema = defineSchema({
       s: { type: "string" },
+      j: { type: "json" },
       f: { type: "f64" },
       i: { type: "i64" },
       b: { type: "bool" },
@@ -24,6 +25,7 @@ describe("defineSchema", () => {
     });
     expect(schema.columns.map((column) => column.type)).toEqual([
       "string",
+      "json",
       "f64",
       "i64",
       "bool",
@@ -70,6 +72,7 @@ describe("defineSchema", () => {
 describe("row validation", () => {
   const schema = defineSchema({
     s: { type: "string" },
+    j: { type: "json" },
     f: { type: "f64" },
     i: { type: "i64" },
     b: { type: "bool" },
@@ -77,7 +80,7 @@ describe("row validation", () => {
     opt: { type: "string", optional: true },
   });
 
-  const valid = { s: "x", f: 1, i: 1n, b: true, t: 0 } as const;
+  const valid = { s: "x", j: "{}", f: 1, i: 1n, b: true, t: 0 } as const;
 
   it("accepts a well-formed row", () => {
     const writer = createWriter(schema);
@@ -116,6 +119,10 @@ describe("row validation", () => {
 
   it.each([
     ["s", 1],
+    // A json column takes a string, and only a string: tavolato stores the text
+    // it is handed and never serializes an object for you.
+    ["j", { a: 1 }],
+    ["j", 1],
     ["f", "1"],
     ["f", 1n],
     ["i", "1"],

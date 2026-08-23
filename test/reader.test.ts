@@ -8,6 +8,7 @@ import {
   TavolatoError,
 } from "../src/index.ts";
 import { expectError } from "./_errors.ts";
+import { sync } from "./_sync.ts";
 
 /**
  * The reader's failure surface: a malformed file must fail with a typed error
@@ -31,14 +32,14 @@ function sample(): Uint8Array {
   writer.append({ s: "alpha", f: 1.5, i: 1n, b: true, t: 0 });
   writer.append({ s: null, f: -0.25, i: 2n, b: null, t: 1000 });
   writer.append({ s: "gamma", f: 0, i: 3n, b: false, t: 2000 });
-  return writer.finish();
+  return sync(writer.finish());
 }
 
 /** The smallest file the writer emits: one i64 column, one row. */
 function minimal(): Uint8Array {
   const writer = createWriter(defineSchema({ n: { type: "i64" } }));
   writer.append({ n: 1n });
-  return writer.finish();
+  return sync(writer.finish());
 }
 
 /**
@@ -154,7 +155,7 @@ describe("unsupported features", () => {
     // Same layout, with the level stream adding its 4 byte length prefix and
     // two bytes of RLE: the page is 14 bytes, zigzag(14) = 28, still one byte,
     // so definition_level_encoding is still the value at offset 16.
-    const bytes = patch(writer.finish(), 7, 0x1c, 0x1c);
+    const bytes = patch(sync(writer.finish()), 7, 0x1c, 0x1c);
     const error = expectError(
       "ERR_READ_UNSUPPORTED",
       () => readParquet(patch(bytes, 16, 0x06, 0x08)), // zigzag(4) = 8 → BIT_PACKED

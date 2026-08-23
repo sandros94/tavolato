@@ -1,9 +1,12 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { gunzipSync, zstdDecompressSync } from "node:zlib";
 import { afterAll, describe, expect, it } from "vitest";
 import { readParquet } from "../src/index.ts";
+import type { CodecName, ReaderCodec } from "../src/index.ts";
 import { cleanupTempDir, duckdb, duckdbRow, sqlPath, tempDir } from "./_duckdb.ts";
 import { expectError } from "./_errors.ts";
+import { sync } from "./_sync.ts";
 
 /**
  * The other direction: DuckDB writes, tavolato reads.
@@ -13,10 +16,14 @@ import { expectError } from "./_errors.ts";
  * and those files are read and compared value by value.
  *
  * DuckDB leaves that subset as soon as it has a reason to: a repetitive column
- * gets a dictionary, a compressed file gets a codec, a `TIMESTAMPTZ` gets
- * microseconds, a list gets a nested schema. Those files must not be read at
- * all; the typed error naming the feature *is* the assertion, and it is what
- * proves the scope promise is enforced rather than merely documented.
+ * gets a dictionary, a `TIMESTAMPTZ` gets microseconds, a list gets a nested
+ * schema. Those files must not be read at all; the typed error naming the
+ * feature *is* the assertion, and it is what proves the scope promise is
+ * enforced rather than merely documented.
+ *
+ * A codec is the one refusal that lifts. A compressed file is refused with that
+ * same error until a decompressor is registered, and read value for value once
+ * one is — both halves are checked below.
  */
 
 afterAll(() => cleanupTempDir());
@@ -105,6 +112,80 @@ describe("files DuckDB writes inside the subset", () => {
     expect(schema.columns.map((column) => column.name)).toEqual(["n"]);
     expect(rows).toEqual([]);
   });
+
+  it("reads a JSON-annotated column as a json column of strings", () => {
+    const bytes = copyTo(
+      "cross-json.parquet",
+      `SELECT ('{"id":' || i || ',"tag":"t' || i || '"}')::JSON AS j FROM range(5) tbl(i)`,
+    );
+    const { schema, rows } = readParquet(bytes);
+    expect(schema.columns).toEqual([{ name: "j", type: "json", optional: true }]);
+    // DuckDB stores the document as text and tavolato hands the text back; the
+    // annotation is the only thing that says what the text means.
+    expect(rows.map((row) => row.j)).toEqual(
+      Array.from({ length: 5 }, (_, i) => `{"id":${i},"tag":"t${i}"}`),
+    );
+  });
+});
+
+/**
+ * Compression is the one place the scope opens up on request. A DuckDB file
+ * that was refused a moment ago is read value for value once a decompressor is
+ * handed over — and the same file is still refused without one.
+ */
+describe("files DuckDB compresses, read with a registered decompressor", () => {
+  const legs: readonly { readonly name: CodecName; readonly codec: ReaderCodec }[] = [
+    { name: "GZIP", codec: { decompress: (page) => gunzipSync(page) } },
+    { name: "ZSTD", codec: { decompress: (page) => zstdDecompressSync(page) } },
+  ];
+
+  for (const { name, codec } of legs) {
+    it(`reads a ${name} file once a decompressor is registered`, () => {
+      // 200 distinct values per column: DuckDB reaches for a dictionary as soon
+      // as repetition pays, and dictionary pages are still out of scope.
+      const bytes = copyTo(
+        `cross-codec-${name}.parquet`,
+        `SELECT i::BIGINT AS n, 'v' || i AS s, (i + 0.5)::DOUBLE AS f,
+                CASE WHEN i % 4 = 0 THEN NULL ELSE 'o' || i END AS o
+         FROM range(200) tbl(i)`,
+        `COMPRESSION ${name}, ROW_GROUP_SIZE 64`,
+      );
+      const path = sqlPath(join(tempDir(), `cross-codec-${name}.parquet`));
+      const encodings = duckdb<{ encodings: string }>(
+        `SELECT DISTINCT encodings FROM parquet_metadata(${path});`,
+      ).map((row) => row.encodings);
+      expect(encodings.length).toBeGreaterThan(0);
+      expect(encodings.some((encoding) => encoding.includes("DICTIONARY"))).toBe(false);
+
+      const refusal = expectError("ERR_READ_UNSUPPORTED", () => readParquet(bytes));
+      expect(refusal.message).toContain(`compressed with ${name}`);
+      expect(refusal.message).toContain(`register a decompressor for ${name}`);
+
+      const { rows } = sync(readParquet(bytes, { codecs: { [name]: codec } }));
+      expect(rows).toHaveLength(200);
+      expect(rows).toEqual(
+        Array.from({ length: 200 }, (_, i) => ({
+          n: BigInt(i),
+          s: `v${i}`,
+          f: i + 0.5,
+          o: i % 4 === 0 ? null : `o${i}`,
+        })),
+      );
+    });
+  }
+
+  it("reads a compressed JSON column too", () => {
+    const bytes = copyTo(
+      "cross-json-gzip.parquet",
+      `SELECT ('{"id":' || i || '}')::JSON AS j FROM range(50) tbl(i)`,
+      "COMPRESSION GZIP",
+    );
+    const { schema, rows } = sync(
+      readParquet(bytes, { codecs: { GZIP: { decompress: (page) => gunzipSync(page) } } }),
+    );
+    expect(schema.columns[0].type).toBe("json");
+    expect(rows.map((row) => row.j)).toEqual(Array.from({ length: 50 }, (_, i) => `{"id":${i}}`));
+  });
 });
 
 describe("files DuckDB writes outside the subset", () => {
@@ -149,7 +230,7 @@ describe("files DuckDB writes outside the subset", () => {
       names: "nested",
     },
     {
-      what: "INT32, which is not one of the five types",
+      what: "INT32, which is not one of the column types",
       file: "cross-int32.parquet",
       select: `SELECT i::INTEGER AS n FROM range(5) tbl(i)`,
       names: "INT_32",
@@ -161,13 +242,13 @@ describe("files DuckDB writes outside the subset", () => {
       names: "MICROS",
     },
     {
-      what: "DATE, which is not one of the five types",
+      what: "DATE, which is not one of the column types",
       file: "cross-date.parquet",
       select: `SELECT (DATE '2026-08-23' + i::INTEGER) AS d FROM range(5) tbl(i)`,
       names: "DATE",
     },
     {
-      what: "DECIMAL, which is not one of the five types",
+      what: "DECIMAL, which is not one of the column types",
       file: "cross-decimal.parquet",
       select: `SELECT (i / 100)::DECIMAL(10, 4) AS d FROM range(5) tbl(i)`,
       names: "DECIMAL",
