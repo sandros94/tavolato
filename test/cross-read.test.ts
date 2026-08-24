@@ -54,7 +54,6 @@ describe("files DuckDB writes inside the subset", () => {
          (i + 0.5)::DOUBLE AS f,
          i::BIGINT AS n,
          (i % 2 = 0) AS b,
-         epoch_ms(1700000000000 + i)::TIMESTAMP_MS AS t,
          CASE WHEN i % 3 = 0 THEN NULL ELSE 'opt-' || i END AS o
        FROM range(5) tbl(i)`,
     );
@@ -66,7 +65,6 @@ describe("files DuckDB writes inside the subset", () => {
       { name: "f", type: "f64", optional: true },
       { name: "n", type: "i64", optional: true },
       { name: "b", type: "bool", optional: true },
-      { name: "t", type: "timestamp", optional: true },
       { name: "o", type: "string", optional: true },
     ]);
     expect(rows).toEqual(
@@ -75,7 +73,6 @@ describe("files DuckDB writes inside the subset", () => {
         f: i + 0.5,
         n: BigInt(i),
         b: i % 2 === 0,
-        t: new Date(1_700_000_000_000 + i),
         o: i % 3 === 0 ? null : `opt-${i}`,
       })),
     );
@@ -481,7 +478,13 @@ describe("files DuckDB annotates, read with a matching column type", () => {
          ('b3f2c1a0-1111-4222-8333-44445555666' || i)::UUID AS u
        FROM range(3) tbl(i)`,
     );
-    const types = [date(), time({ unit: "micros" }), timestamp({ unit: "micros" }), uuid()];
+    const types = [
+      date(),
+      time({ unit: "micros", isAdjustedToUTC: false }),
+      timestamp({ unit: "micros", isAdjustedToUTC: false }),
+      timestamp({ unit: "micros", isAdjustedToUTC: true }),
+      uuid(),
+    ];
 
     const refusal = expectError("ERR_READ_UNSUPPORTED", () => readParquet(bytes));
     expect(refusal.message).toContain("pass a matching type in ReadOptions.types");
@@ -494,8 +497,8 @@ describe("files DuckDB annotates, read with a matching column type", () => {
       "timestamp(micros)",
       "uuid",
     ]);
-    // The naive TIMESTAMP and the TIMESTAMPTZ differ only in a flag neither
-    // the count nor this reading depends on.
+    // The naive TIMESTAMP and TIMESTAMPTZ are claimed by distinct adapters so
+    // the schema returned by the reader preserves their different meanings.
     expect(rows).toEqual(
       Array.from({ length: 3 }, (_, i) => ({
         d: new Date(Date.UTC(2026, 7, 24 + i)),

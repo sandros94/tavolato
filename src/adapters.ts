@@ -383,6 +383,8 @@ export function uuid(): LogicalAdapter<string, string> {
 export interface TimeOptions<TUnit extends TimeUnitName = TimeUnitName> {
   /** Resolution of the stored count. */
   unit: TUnit;
+  /** Whether the value is adjusted to UTC, exactly as declared by Parquet. */
+  isAdjustedToUTC: boolean;
 }
 
 /**
@@ -404,6 +406,14 @@ function assertUnit(unit: TimeUnitName, what: string): void {
   }
 }
 
+function assertUTCFlag(isAdjustedToUTC: boolean, what: string): void {
+  if (typeof isAdjustedToUTC !== "boolean") {
+    throw invalid(
+      `${what} isAdjustedToUTC must be true or false, received ${describe(isAdjustedToUTC)}`,
+    );
+  }
+}
+
 /**
  * `TIME` ⇄ a count since midnight: a `number` of milliseconds in an `INT32`,
  * or a `bigint` of microseconds or nanoseconds in an `INT64`.
@@ -416,20 +426,21 @@ function assertUnit(unit: TimeUnitName, what: string): void {
  * parquet-mr read it. A full day's worth of units is not a time of day but the
  * next midnight; DuckDB renders it as `24:00:00`, which is nobody's clock.
  *
- * The annotation is written as a wall-clock time (`isAdjustedToUTC=false`,
- * which is what DuckDB writes for `TIME`), and read whichever way the flag
- * points: the count is the same number either way, exactly as it is for the
- * built-in `timestamp` type.
+ * `isAdjustedToUTC` is preserved exactly: `false` is a local time and `true`
+ * is normalized to UTC. An adapter claims only the annotation it declares.
  */
 export function time<TUnit extends TimeUnitName>(
   options: TimeOptions<TUnit>,
 ): LogicalAdapter<TimeValue<TUnit>, TimeValue<TUnit>> {
-  const { unit } = options;
+  const { unit, isAdjustedToUTC } = options;
   assertUnit(unit, "time");
+  assertUTCFlag(isAdjustedToUTC, "time");
   const perDay = UNITS_PER_DAY[unit];
-  const annotate = (): Annotation => ({ kind: "time", unit, isAdjustedToUTC: false });
+  const annotate = (): Annotation => ({ kind: "time", unit, isAdjustedToUTC });
   const matches = (annotation: Annotation): boolean =>
-    annotation.kind === "time" && annotation.unit === unit;
+    annotation.kind === "time" &&
+    annotation.unit === unit &&
+    annotation.isAdjustedToUTC === isAdjustedToUTC;
 
   // One cast, at the one place the unit stops being a type and becomes a value:
   // which of the two shapes is built is exactly what `TimeValue` computes.
@@ -472,7 +483,7 @@ const INT64_MIN = -(2n ** 63n);
 const INT64_MAX = 2n ** 63n - 1n;
 
 /**
- * `TIMESTAMP` ⇄ `bigint`, a count since the Unix epoch in an `INT64`.
+ * `TIMESTAMP` ⇄ `bigint`, a count from the 1970-01-01 reference in an `INT64`.
  *
  * The built-in `timestamp` column type is milliseconds as a `Date`, which is
  * exactly what a `Date` holds. Microseconds and nanoseconds are not: a `Date`
@@ -480,18 +491,22 @@ const INT64_MAX = 2n ** 63n - 1n;
  * Milliseconds are offered here too, for the same reason in reverse — a
  * `bigint` when you want the raw count rather than a `Date`.
  *
- * Written as an instant (`isAdjustedToUTC=true`), and read whichever way the
- * flag points, since the count does not move: that is what lets it read both
- * DuckDB's `TIMESTAMP` and its `TIMESTAMPTZ`, which differ only in the flag.
+ * `isAdjustedToUTC` is preserved exactly: `false` is a local date-time and
+ * `true` is an instant normalized to UTC. An adapter claims only the annotation
+ * it declares.
  */
 export function timestamp(options: TimeOptions): LogicalAdapter<bigint, bigint> {
-  const { unit } = options;
+  const { unit, isAdjustedToUTC } = options;
   assertUnit(unit, "timestamp");
+  assertUTCFlag(isAdjustedToUTC, "timestamp");
   return defineColumnType<bigint, bigint>({
     name: `timestamp(${unit})`,
     physical: "i64",
-    matches: (annotation) => annotation.kind === "timestamp" && annotation.unit === unit,
-    annotate: () => ({ kind: "timestamp", unit, isAdjustedToUTC: true }),
+    matches: (annotation) =>
+      annotation.kind === "timestamp" &&
+      annotation.unit === unit &&
+      annotation.isAdjustedToUTC === isAdjustedToUTC,
+    annotate: () => ({ kind: "timestamp", unit, isAdjustedToUTC }),
     read: (raw) => raw as bigint,
     write: (value) => {
       if (typeof value !== "bigint" || value < INT64_MIN || value > INT64_MAX) {

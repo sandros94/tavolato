@@ -253,6 +253,10 @@ void [notANumber, notMillis, notNullable, notNull];
  * `ParquetSchema`, `Row` or the writer.
  */
 const money = decimal({ precision: 12, scale: 2 });
+// @ts-expect-error TIME requires the upstream UTC-adjustment parameter
+time({ unit: "millis" });
+// @ts-expect-error TIMESTAMP requires the upstream UTC-adjustment parameter
+timestamp({ unit: "micros" });
 const ratio = defineColumnType({
   name: "ratio",
   physical: "i64",
@@ -266,9 +270,9 @@ const logical = defineSchema({
   when: { type: date() },
   price: { type: money },
   id: { type: uuid() },
-  clock: { type: time({ unit: "millis" }) },
-  precise: { type: time({ unit: "micros" }) },
-  at: { type: timestamp({ unit: "micros" }) },
+  clock: { type: time({ unit: "millis", isAdjustedToUTC: false }) },
+  precise: { type: time({ unit: "micros", isAdjustedToUTC: false }) },
+  at: { type: timestamp({ unit: "micros", isAdjustedToUTC: true }) },
   half: { type: float16() },
   small: { type: integer({ bitWidth: 8 }) },
   big: { type: integer({ bitWidth: 64, signed: false }) },

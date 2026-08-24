@@ -250,7 +250,7 @@ describe("types the reader refuses outright", () => {
     // Written through the adapter, which stamps exactly the annotation the
     // built-in `timestamp` column type carries — so the count comes back to a
     // reader that would have to hand it over as an Invalid Date.
-    const millis = timestamp({ unit: "millis" });
+    const millis = timestamp({ unit: "millis", isAdjustedToUTC: true });
     const writer = createWriter(defineSchema({ t: { type: millis } }));
     writer.append({ t: 9_000_000_000_000_000n });
     const bytes = sync(writer.finish());

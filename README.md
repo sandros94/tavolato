@@ -79,31 +79,33 @@ Parquet stores a column twice over: a **physical type**, which says how the byte
 
 Each in-box factory maps by one rule: the value must survive the round trip unchanged.
 
-| factory                                        | JavaScript  | Parquet                                    |
-| ---------------------------------------------- | ----------- | ------------------------------------------ |
-| `date()`                                       | `Date`      | `INT32` / `DATE`                           |
-| `decimal({ precision, scale })`                | `string`    | `INT32`, `INT64` or `FLBA(16)` / `DECIMAL` |
-| `uuid()`                                       | `string`    | `FLBA(16)` / `UUID`                        |
-| `time({ unit: "millis" })`                     | `number`    | `INT32` / `TIME(MILLIS)`                   |
-| `time({ unit: "micros" \| "nanos" })`          | `bigint`    | `INT64` / `TIME(…)`                        |
-| `timestamp({ unit })`                          | `bigint`    | `INT64` / `TIMESTAMP(UTC, …)`              |
-| `float16()`                                    | `number`    | `FLBA(2)` / `FLOAT16`                      |
-| `integer({ bitWidth: 8 \| 16 \| 32, signed })` | `number`    | `INT32` / `INTEGER(…)`                     |
-| `integer({ bitWidth: 64, signed })`            | `bigint`    | `INT64` / `INTEGER(64, …)`                 |
-| `json({ reviver, replacer })`                  | `JsonValue` | `BYTE_ARRAY` / `JSON`                      |
+| factory                                                | JavaScript  | Parquet                                    |
+| ------------------------------------------------------ | ----------- | ------------------------------------------ |
+| `date()`                                               | `Date`      | `INT32` / `DATE`                           |
+| `decimal({ precision, scale })`                        | `string`    | `INT32`, `INT64` or `FLBA(16)` / `DECIMAL` |
+| `uuid()`                                               | `string`    | `FLBA(16)` / `UUID`                        |
+| `time({ unit: "millis", isAdjustedToUTC })`            | `number`    | `INT32` / `TIME(MILLIS, …)`                |
+| `time({ unit: "micros" \| "nanos", isAdjustedToUTC })` | `bigint`    | `INT64` / `TIME(…, …)`                     |
+| `timestamp({ unit, isAdjustedToUTC })`                 | `bigint`    | `INT64` / `TIMESTAMP(…, …)`                |
+| `float16()`                                            | `number`    | `FLBA(2)` / `FLOAT16`                      |
+| `integer({ bitWidth: 8 \| 16 \| 32, signed })`         | `number`    | `INT32` / `INTEGER(…)`                     |
+| `integer({ bitWidth: 64, signed })`                    | `bigint`    | `INT64` / `INTEGER(64, …)`                 |
+| `json({ reviver, replacer })`                          | `JsonValue` | `BYTE_ARRAY` / `JSON`                      |
 
 ```ts
 date(); // new Date(Date.UTC(2026, 7, 24)) — exactly UTC midnight, never a truncated instant
 decimal({ precision: 12, scale: 2 }); // "19.99" — canonical, exactly `scale` digits, one spelling per value
 uuid(); // crypto.randomUUID() — canonical lowercase 8-4-4-4-12, and only that
-time({ unit: "millis" }); // 43_200_000 — a count since midnight in [0, one day), not a Date
-timestamp({ unit: "micros" }); // 1_756_000_000_000_000n — the raw count, where a Date would round
+time({ unit: "millis", isAdjustedToUTC: false }); // 43_200_000 — local time since midnight
+timestamp({ unit: "micros", isAdjustedToUTC: true }); // 1_756_000_000_000_000n — an instant
 float16(); // 1.5 — rounded to half precision once, on write
 integer({ bitWidth: 8, signed: false }); // 255 — a domain, range-checked on the way in
 json<Payload>(); // your document type, with the reviver and replacer opened up
 ```
 
 The same object serves both sides: in a schema it decides how a column is written, and in `ReadOptions.types` it claims the columns it recognises.
+
+`TIME` and `TIMESTAMP` carry `unit` and `isAdjustedToUTC` as separate required Parquet parameters. Adapters match and re-emit both exactly. The built-in `timestamp` type maps only `TIMESTAMP(MILLIS, true)` to `Date`; use `timestamp({ unit: "millis", isAdjustedToUTC: false })` to preserve a local timestamp as its raw `bigint` count.
 
 ```ts
 import { createWriter, decimal, defineSchema, readParquet, uuid } from "tavolato";

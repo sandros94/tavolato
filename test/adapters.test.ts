@@ -127,10 +127,24 @@ describe("defineColumnType", () => {
     expectError("ERR_SCHEMA_COLUMN_INVALID", () => decimal({ precision: 39 }));
     expectError("ERR_SCHEMA_COLUMN_INVALID", () => decimal({ precision: 4, scale: 5 }));
     expectError("ERR_SCHEMA_COLUMN_INVALID", () => decimal({ precision: 4, scale: -1 }));
-    // @ts-expect-error deliberately wrong input
-    expectError("ERR_SCHEMA_COLUMN_INVALID", () => time({ unit: "seconds" }));
-    // @ts-expect-error deliberately wrong input
-    expectError("ERR_SCHEMA_COLUMN_INVALID", () => timestamp({ unit: "seconds" }));
+    expectError("ERR_SCHEMA_COLUMN_INVALID", () =>
+      time({
+        // @ts-expect-error deliberately wrong input
+        unit: "seconds",
+        isAdjustedToUTC: false,
+      }),
+    );
+    expectError("ERR_SCHEMA_COLUMN_INVALID", () =>
+      timestamp({
+        // @ts-expect-error deliberately wrong input
+        unit: "seconds",
+        isAdjustedToUTC: true,
+      }),
+    );
+    // @ts-expect-error deliberately missing the required Parquet parameter
+    expectError("ERR_SCHEMA_COLUMN_INVALID", () => time({ unit: "millis" }));
+    // @ts-expect-error deliberately missing the required Parquet parameter
+    expectError("ERR_SCHEMA_COLUMN_INVALID", () => timestamp({ unit: "millis" }));
     // @ts-expect-error deliberately wrong input
     expectError("ERR_SCHEMA_COLUMN_INVALID", () => integer({ bitWidth: 24 }));
   });
@@ -603,47 +617,127 @@ describe("uuid", () => {
 });
 
 describe("time and timestamp", () => {
+  it("preserves the UTC flag and claims only the exact TIME annotation", () => {
+    const local = time({ unit: "micros", isAdjustedToUTC: false });
+    const utc = time({ unit: "micros", isAdjustedToUTC: true });
+
+    expect(local.annotate()).toEqual({
+      kind: "time",
+      unit: "micros",
+      isAdjustedToUTC: false,
+    });
+    expect(utc.annotate()).toEqual({ kind: "time", unit: "micros", isAdjustedToUTC: true });
+
+    const bytes = write(local, [45_296_789_012n]);
+    expect(readParquet(bytes, { types: [local] }).rows[0].v).toBe(45_296_789_012n);
+    expectError("ERR_READ_UNSUPPORTED", () => readParquet(bytes, { types: [utc] }));
+  });
+
+  it("preserves the UTC flag and claims only the exact TIMESTAMP annotation", () => {
+    const local = timestamp({ unit: "micros", isAdjustedToUTC: false });
+    const utc = timestamp({ unit: "micros", isAdjustedToUTC: true });
+
+    expect(local.annotate()).toEqual({
+      kind: "timestamp",
+      unit: "micros",
+      isAdjustedToUTC: false,
+    });
+    expect(utc.annotate()).toEqual({
+      kind: "timestamp",
+      unit: "micros",
+      isAdjustedToUTC: true,
+    });
+
+    const bytes = write(local, [1_767_225_845_123_456n]);
+    const first = readParquet(bytes, { types: [local] });
+    expect(first.rows[0].v).toBe(1_767_225_845_123_456n);
+    expectError("ERR_READ_UNSUPPORTED", () => readParquet(bytes, { types: [utc] }));
+
+    const writer = createWriter(first.schema);
+    writer.append(first.rows[0]);
+    const rewritten = sync(writer.finish());
+    expect(readParquet(rewritten, { types: [local] }).rows[0].v).toBe(1_767_225_845_123_456n);
+    expectError("ERR_READ_UNSUPPORTED", () => readParquet(rewritten, { types: [utc] }));
+  });
+
+  it("does not read a local millisecond timestamp as a Date", () => {
+    const local = timestamp({ unit: "millis", isAdjustedToUTC: false });
+    const bytes = write(local, [1_700_000_000_000n]);
+
+    expectError("ERR_READ_UNSUPPORTED", () => readParquet(bytes));
+    expect(readParquet(bytes, { types: [local] }).rows[0].v).toBe(1_700_000_000_000n);
+  });
+
   it("carries milliseconds as a number and the finer units as bigints", () => {
     // The domain is `[0, one day)`, as Arrow and parquet-mr read it: the last
     // count of the day is the largest there is, and a full day is tomorrow.
-    expect(roundtrip(time({ unit: "millis" }), [0, 45_296_789, 86_399_999])).toEqual([
-      0, 45_296_789, 86_399_999,
-    ]);
-    expect(roundtrip(time({ unit: "micros" }), [0n, 86_399_999_999n])).toEqual([
-      0n,
-      86_399_999_999n,
-    ]);
-    expect(roundtrip(time({ unit: "nanos" }), [0n, 86_399_999_999_999n])).toEqual([
-      0n,
-      86_399_999_999_999n,
-    ]);
+    expect(
+      roundtrip(time({ unit: "millis", isAdjustedToUTC: false }), [0, 45_296_789, 86_399_999]),
+    ).toEqual([0, 45_296_789, 86_399_999]);
+    expect(
+      roundtrip(time({ unit: "micros", isAdjustedToUTC: false }), [0n, 86_399_999_999n]),
+    ).toEqual([0n, 86_399_999_999n]);
+    expect(
+      roundtrip(time({ unit: "nanos", isAdjustedToUTC: false }), [0n, 86_399_999_999_999n]),
+    ).toEqual([0n, 86_399_999_999_999n]);
   });
 
   it("refuses a count that is not a time of day", () => {
-    expectError("ERR_ROW_VALUE_INVALID", appendOne(time({ unit: "millis" }), -1));
-    expectError("ERR_ROW_VALUE_INVALID", appendOne(time({ unit: "millis" }), 86_400_001));
+    expectError(
+      "ERR_ROW_VALUE_INVALID",
+      appendOne(time({ unit: "millis", isAdjustedToUTC: false }), -1),
+    );
+    expectError(
+      "ERR_ROW_VALUE_INVALID",
+      appendOne(time({ unit: "millis", isAdjustedToUTC: false }), 86_400_001),
+    );
     // A whole day is not a time of day: DuckDB renders that count as 24:00:00.
-    expectError("ERR_ROW_VALUE_INVALID", appendOne(time({ unit: "millis" }), 86_400_000));
-    expectError("ERR_ROW_VALUE_INVALID", appendOne(time({ unit: "micros" }), 86_400_000_000n));
-    expectError("ERR_ROW_VALUE_INVALID", appendOne(time({ unit: "nanos" }), 86_400_000_000_000n));
-    expectError("ERR_ROW_VALUE_INVALID", appendOne(time({ unit: "millis" }), 1.5));
-    expectError("ERR_ROW_VALUE_INVALID", appendOne(time({ unit: "millis" }), 1n));
-    expectError("ERR_ROW_VALUE_INVALID", appendOne(time({ unit: "micros" }), -1n));
-    expectError("ERR_ROW_VALUE_INVALID", appendOne(time({ unit: "micros" }), 1));
+    expectError(
+      "ERR_ROW_VALUE_INVALID",
+      appendOne(time({ unit: "millis", isAdjustedToUTC: false }), 86_400_000),
+    );
+    expectError(
+      "ERR_ROW_VALUE_INVALID",
+      appendOne(time({ unit: "micros", isAdjustedToUTC: false }), 86_400_000_000n),
+    );
+    expectError(
+      "ERR_ROW_VALUE_INVALID",
+      appendOne(time({ unit: "nanos", isAdjustedToUTC: false }), 86_400_000_000_000n),
+    );
+    expectError(
+      "ERR_ROW_VALUE_INVALID",
+      appendOne(time({ unit: "millis", isAdjustedToUTC: false }), 1.5),
+    );
+    expectError(
+      "ERR_ROW_VALUE_INVALID",
+      appendOne(time({ unit: "millis", isAdjustedToUTC: false }), 1n),
+    );
+    expectError(
+      "ERR_ROW_VALUE_INVALID",
+      appendOne(time({ unit: "micros", isAdjustedToUTC: false }), -1n),
+    );
+    expectError(
+      "ERR_ROW_VALUE_INVALID",
+      appendOne(time({ unit: "micros", isAdjustedToUTC: false }), 1),
+    );
   });
 
   it("round-trips instants as bigints, at every resolution", () => {
     for (const unit of ["millis", "micros", "nanos"] as const) {
       const values = [0n, -1n, 1_767_225_845_123_456n, -(2n ** 63n), 2n ** 63n - 1n];
-      expect(roundtrip(timestamp({ unit }), values)).toEqual(values);
+      expect(roundtrip(timestamp({ unit, isAdjustedToUTC: true }), values)).toEqual(values);
     }
-    expectError("ERR_ROW_VALUE_INVALID", appendOne(timestamp({ unit: "micros" }), 2n ** 63n));
-    expectError("ERR_ROW_VALUE_INVALID", appendOne(timestamp({ unit: "micros" }), 0));
+    expectError(
+      "ERR_ROW_VALUE_INVALID",
+      appendOne(timestamp({ unit: "micros", isAdjustedToUTC: true }), 2n ** 63n),
+    );
+    expectError(
+      "ERR_ROW_VALUE_INVALID",
+      appendOne(timestamp({ unit: "micros", isAdjustedToUTC: true }), 0),
+    );
   });
 
-  it("reads an instant whichever way its UTC flag points", () => {
-    // The built-in `timestamp` column type is milliseconds as a Date; this one
-    // is the raw count, and both ignore the flag because the count is the same.
+  it("does not claim a timestamp with a different UTC flag", () => {
     const naive = defineColumnType({
       name: "naive",
       physical: "i64",
@@ -653,12 +747,16 @@ describe("time and timestamp", () => {
       write: (value: bigint) => value,
     });
     const bytes = write(naive, [1_767_225_845_123_456n]);
-    expect(readParquet(bytes, { types: [timestamp({ unit: "micros" })] }).rows[0].v).toBe(
-      1_767_225_845_123_456n,
+    expectError("ERR_READ_UNSUPPORTED", () =>
+      readParquet(bytes, {
+        types: [timestamp({ unit: "micros", isAdjustedToUTC: true })],
+      }),
     );
     // A different unit is a different column, and stays unclaimed.
     expectError("ERR_READ_UNSUPPORTED", () =>
-      readParquet(bytes, { types: [timestamp({ unit: "millis" })] }),
+      readParquet(bytes, {
+        types: [timestamp({ unit: "millis", isAdjustedToUTC: false })],
+      }),
     );
   });
 
@@ -668,9 +766,11 @@ describe("time and timestamp", () => {
     writer.append({ t: 1_700_000_000_000 });
     const bytes = sync(writer.finish());
     expect(readParquet(bytes).rows[0].t).toEqual(new Date(1_700_000_000_000));
-    expect(readParquet(bytes, { types: [timestamp({ unit: "millis" })] }).rows[0].t).toBe(
-      1_700_000_000_000n,
-    );
+    expect(
+      readParquet(bytes, {
+        types: [timestamp({ unit: "millis", isAdjustedToUTC: true })],
+      }).rows[0].t,
+    ).toBe(1_700_000_000_000n);
   });
 });
 

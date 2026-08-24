@@ -191,12 +191,11 @@ function locateFooter(bytes: Uint8Array): Uint8Array {
  * The built-in column type for a bare physical type, or `undefined` where the
  * annotation means something tavolato has no built-in reading for.
  *
- * Two leniencies live here, and neither moves a value. `INT_32` / `INT_64`
+ * One leniency lives here, and it does not move a value. `INT_32` / `INT_64`
  * (however they are spelled) say exactly what the bare physical type already
- * says, so they read as `i32` and `i64`; and a `TIMESTAMP(MILLIS)` reads as a
- * `Date` whichever way its UTC flag points, because a `Date` is an instant and
- * the milliseconds are the same number either way. Together they are what lets
- * DuckDB's own `COPY … (FORMAT PARQUET)` output be read directly.
+ * says, so they read as `i32` and `i64`. A `TIMESTAMP(MILLIS)` maps to `Date`
+ * only when it is adjusted to UTC: a local timestamp does not identify an
+ * instant and needs an adapter that preserves that distinction.
  */
 function builtinTypeOf(physical: PhysicalKind, annotation: Annotation): ColumnType | undefined {
   const bare = annotation.kind === "none";
@@ -215,7 +214,9 @@ function builtinTypeOf(physical: PhysicalKind, annotation: Annotation): ColumnTy
     }
     case "i64": {
       if (bare || isPlainInteger(annotation, 64)) return "i64";
-      return annotation.kind === "timestamp" && annotation.unit === "millis"
+      return annotation.kind === "timestamp" &&
+        annotation.unit === "millis" &&
+        annotation.isAdjustedToUTC
         ? "timestamp"
         : undefined;
     }
@@ -476,7 +477,7 @@ function toValue(column: ReadColumn, values: ColumnValues, index: number): ReadV
         throw unsupported(
           `column "${column.name}", a TIMESTAMP(MILLIS) holding ${value} milliseconds — past the range a JavaScript Date can represent`,
           column.name,
-          `register timestamp({ unit: "millis" }) in ReadOptions.types to read the count itself`,
+          `register timestamp({ unit: "millis", isAdjustedToUTC: true }) in ReadOptions.types to read the count itself`,
         );
       }
       return new Date(Number(value));
