@@ -1,6 +1,7 @@
 import { ByteReader, decodeUtf8 } from "./internal/bytes.ts";
 import { chain, chainEach, isThenable } from "./internal/chain.ts";
 import { type ColumnValues, decodeRleBitPackedHybrid, readPlain } from "./internal/encoding.ts";
+import { logicalTypePhysicalProblem } from "./internal/logical.ts";
 import {
   annotationName,
   annotationOf,
@@ -315,6 +316,10 @@ function columnOf(
 
   const optional = element.repetition === FieldRepetitionType.OPTIONAL;
   const annotation = annotationOf(element);
+  const physicalProblem = logicalTypePhysicalProblem(annotation, kind, typeLength);
+  if (physicalProblem !== undefined) {
+    throw malformed(`Column "${name}" ${physicalProblem}`, name);
+  }
   const adapter = claimedBy(element, kind, typeLength, annotation, types);
   if (adapter !== undefined) {
     return { name, type: adapter, optional, typeLength, physical: kind, index };

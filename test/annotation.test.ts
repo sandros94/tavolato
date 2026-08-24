@@ -32,11 +32,47 @@ function element(fields: Partial<SchemaElement>): SchemaElement {
   return { name: "c", numChildren: 0, ...fields };
 }
 
+/** A legal storage layout for `annotation`; only used to test footer spelling. */
+function storageOf(annotation: Annotation): {
+  readonly physical: "i32" | "i64" | "bytes" | "fixed";
+  readonly typeLength?: number;
+} {
+  switch (annotation.kind) {
+    case "string":
+    case "json":
+    case "bson":
+    case "enum": {
+      return { physical: "bytes" };
+    }
+    case "uuid": {
+      return { physical: "fixed", typeLength: 16 };
+    }
+    case "float16": {
+      return { physical: "fixed", typeLength: 2 };
+    }
+    case "decimal": {
+      return { physical: "fixed", typeLength: 16 };
+    }
+    case "timestamp": {
+      return { physical: "i64" };
+    }
+    case "time": {
+      return { physical: annotation.unit === "millis" ? "i32" : "i64" };
+    }
+    case "integer": {
+      return { physical: annotation.bitWidth === 64 ? "i64" : "i32" };
+    }
+    default: {
+      return { physical: "i32" };
+    }
+  }
+}
+
 /** A column type that stamps `annotation` and claims nothing. */
 function stamping(annotation: Annotation): LogicalAdapter<number, number> {
   return defineColumnType<number, number>({
     name: `stamps ${annotation.kind}`,
-    physical: "i32",
+    ...storageOf(annotation),
     matches: () => false,
     annotate: () => annotation,
     read: (raw) => raw as number,
@@ -160,7 +196,14 @@ describe("the annotations a column type stamps", () => {
  * None of them may throw. An annotation that cannot be read is `unknown`, and
  * `unknown` is refused one layer up, where the column has a name.
  */
-function footerWithLogicalType(write: (writer: CompactWriter) => void): Uint8Array {
+function footerWithLogicalType(
+  write: ((writer: CompactWriter) => void) | undefined,
+  options: {
+    readonly physical?: number;
+    readonly typeLength?: number;
+    readonly convertedType?: number;
+  } = {},
+): Uint8Array {
   const writer = new CompactWriter();
   writer.structBegin(); // FileMetaData
   writer.fieldI32(1, 1); // version
@@ -170,12 +213,16 @@ function footerWithLogicalType(write: (writer: CompactWriter) => void): Uint8Arr
   writer.fieldI32(5, 1);
   writer.structEnd();
   writer.structBegin(); // the one leaf
-  writer.fieldI32(1, PhysicalType.INT64);
+  writer.fieldI32(1, options.physical ?? PhysicalType.INT64);
+  if (options.typeLength !== undefined) writer.fieldI32(2, options.typeLength);
   writer.fieldI32(3, 0);
   writer.fieldString(4, "c");
-  writer.fieldStructBegin(10);
-  write(writer);
-  writer.structEnd();
+  if (options.convertedType !== undefined) writer.fieldI32(6, options.convertedType);
+  if (write !== undefined) {
+    writer.fieldStructBegin(10);
+    write(writer);
+    writer.structEnd();
+  }
   writer.structEnd();
   writer.fieldI64(3, 0n);
   writer.fieldListBegin(4, ThriftType.STRUCT, 0);
@@ -189,8 +236,11 @@ function decodedLogicalType(write: (writer: CompactWriter) => void): Annotation 
 }
 
 /** The same footer, wrapped in the envelope that makes it a file `readParquet` takes. */
-function fileWithLogicalType(write: (writer: CompactWriter) => void): Uint8Array {
-  const footer = footerWithLogicalType(write);
+function fileWithLogicalType(
+  write: ((writer: CompactWriter) => void) | undefined,
+  options?: Parameters<typeof footerWithLogicalType>[1],
+): Uint8Array {
+  const footer = footerWithLogicalType(write, options);
   const bytes = new Uint8Array(MAGIC.length * 2 + footer.length + 4);
   bytes.set(MAGIC, 0);
   bytes.set(footer, MAGIC.length);
@@ -201,14 +251,34 @@ function fileWithLogicalType(write: (writer: CompactWriter) => void): Uint8Array
 
 describe("a LogicalType this version cannot read", () => {
   it("keeps a member from a later release, by its field id", () => {
-    // 17 is GEOMETRY, which tavolato has no reading for and every writer is
-    // free to produce.
+    // 42 stands for a future member this version cannot know a contract for.
     expect(
       decodedLogicalType((writer) => {
-        writer.fieldStructBegin(17);
+        writer.fieldStructBegin(42);
         writer.structEnd();
       }),
-    ).toEqual({ kind: "unknown", id: 17 });
+    ).toEqual({ kind: "unknown", id: 42 });
+  });
+
+  it("leaves a future annotation claimable without guessing its physical contract", () => {
+    const future = defineColumnType({
+      name: "future",
+      physical: "i64",
+      matches: (annotation) => annotation.kind === "unknown" && annotation.id === 42,
+      annotate: (): Annotation => ({
+        kind: "timestamp",
+        unit: "micros",
+        isAdjustedToUTC: false,
+      }),
+      read: (raw) => raw as bigint,
+      write: (value: bigint) => value,
+    });
+    const file = fileWithLogicalType((writer) => {
+      writer.fieldStructBegin(42);
+      writer.structEnd();
+    });
+
+    expect(readParquet(file, { types: [future] }).schema.columns[0].type).toBe(future);
   });
 
   it("reads a union carrying nothing as unnamed", () => {
@@ -349,6 +419,169 @@ describe("a LogicalType this version cannot read", () => {
   });
 });
 
+describe("an annotation on an illegal physical type", () => {
+  it("is malformed before a caller's broad matcher can claim it", () => {
+    let matches = 0;
+    const broad = defineColumnType({
+      name: "broad",
+      physical: "i64",
+      matches: () => {
+        matches++;
+        return true;
+      },
+      annotate: (): Annotation => ({
+        kind: "timestamp",
+        unit: "micros",
+        isAdjustedToUTC: false,
+      }),
+      read: (raw) => raw as bigint,
+      write: (value: bigint) => value,
+    });
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readParquet(
+        fileWithLogicalType((writer) => {
+          writer.fieldStructBegin(LogicalTypeId.DATE);
+          writer.structEnd();
+        }),
+        { types: [broad] },
+      ),
+    );
+    expect(error.column).toBe("c");
+    expect(error.message).toContain("DATE");
+    expect(error.message).toContain("INT32");
+    expect(matches).toBe(0);
+  });
+
+  it.each([
+    [2, "MAP"],
+    [3, "LIST"],
+    [16, "VARIANT"],
+    [19, "FILE"],
+  ])("refuses group-only logical type %s on a primitive", (id, name) => {
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readParquet(
+        fileWithLogicalType((writer) => {
+          writer.fieldStructBegin(id);
+          writer.structEnd();
+        }),
+      ),
+    );
+    expect(error.column).toBe("c");
+    expect(error.message).toContain(name);
+    expect(error.message).toContain("group");
+  });
+
+  it.each([
+    [17, "GEOMETRY"],
+    [18, "GEOGRAPHY"],
+  ])("requires BYTE_ARRAY for logical type %s", (id, name) => {
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readParquet(
+        fileWithLogicalType((writer) => {
+          writer.fieldStructBegin(id);
+          writer.structEnd();
+        }),
+      ),
+    );
+    expect(error.message).toContain(name);
+    expect(error.message).toContain("BYTE_ARRAY");
+  });
+
+  it("requires FIXED_LEN_BYTE_ARRAY(12) for legacy INTERVAL", () => {
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readParquet(fileWithLogicalType(undefined, { convertedType: ConvertedType.INTERVAL })),
+    );
+    expect(error.message).toContain("INTERVAL");
+    expect(error.message).toContain("FIXED_LEN_BYTE_ARRAY(12)");
+  });
+
+  it("leaves legal unsupported primitive annotations claimable", () => {
+    const geometry = defineColumnType({
+      name: "geometry",
+      physical: "bytes",
+      matches: (annotation) => annotation.kind === "unknown" && annotation.id === 17,
+      annotate: (): Annotation => ({ kind: "bson" }),
+      read: (raw) => raw,
+      write: (value) => value,
+    });
+    const interval = defineColumnType({
+      name: "interval",
+      physical: "fixed",
+      typeLength: 12,
+      matches: (annotation) => annotation.kind === "unknown" && annotation.id === 9,
+      annotate: (): Annotation => ({ kind: "none" }),
+      read: (raw) => raw,
+      write: (value) => value,
+    });
+    const geometryFile = fileWithLogicalType(
+      (writer) => {
+        writer.fieldStructBegin(17);
+        writer.structEnd();
+      },
+      { physical: PhysicalType.BYTE_ARRAY },
+    );
+    const intervalFile = fileWithLogicalType(undefined, {
+      physical: PhysicalType.FIXED_LEN_BYTE_ARRAY,
+      typeLength: 12,
+      convertedType: ConvertedType.INTERVAL,
+    });
+
+    expect(readParquet(geometryFile, { types: [geometry] }).schema.columns[0].type).toBe(geometry);
+    expect(readParquet(intervalFile, { types: [interval] }).schema.columns[0].type).toBe(interval);
+  });
+
+  it("allows UNKNOWN on any primitive", () => {
+    const nulls = defineColumnType({
+      name: "nulls",
+      physical: "i64",
+      matches: (annotation) => annotation.kind === "unknown" && annotation.id === 11,
+      annotate: (): Annotation => ({
+        kind: "timestamp",
+        unit: "micros",
+        isAdjustedToUTC: false,
+      }),
+      read: (raw) => raw,
+      write: (value) => value,
+    });
+    const file = fileWithLogicalType((writer) => {
+      writer.fieldStructBegin(11);
+      writer.structEnd();
+    });
+    expect(readParquet(file, { types: [nulls] }).schema.columns[0].type).toBe(nulls);
+  });
+
+  it.each([
+    [0, 0],
+    [4, -1],
+    [4, 5],
+  ])("refuses DECIMAL(%s, %s) parameters before matching", (precision, scale) => {
+    let matches = 0;
+    const broad = defineColumnType({
+      name: "broad-bytes",
+      physical: "bytes",
+      matches: () => {
+        matches++;
+        return true;
+      },
+      annotate: (): Annotation => ({ kind: "json" }),
+      read: (raw) => raw,
+      write: (value) => value,
+    });
+    const file = fileWithLogicalType(
+      (writer) => {
+        writer.fieldStructBegin(LogicalTypeId.DECIMAL);
+        writer.fieldI32(1, scale);
+        writer.fieldI32(2, precision);
+        writer.structEnd();
+      },
+      { physical: PhysicalType.BYTE_ARRAY },
+    );
+    const error = expectError("ERR_READ_MALFORMED", () => readParquet(file, { types: [broad] }));
+    expect(error.message).toContain("DECIMAL");
+    expect(matches).toBe(0);
+  });
+});
+
 describe("annotationName", () => {
   it.each([
     [{ kind: "string" }, "STRING"],
@@ -369,10 +602,12 @@ describe("annotationName", () => {
     ],
     [{ kind: "integer", bitWidth: 8, isSigned: true }, "INTEGER(8, signed)"],
     [{ kind: "integer", bitWidth: 64, isSigned: false }, "INTEGER(64, unsigned)"],
-    // A refusal names what it found even when what it found is from a later
-    // release than this one.
+    // A refusal names known unsupported members and future members alike.
     [{ kind: "unknown", id: LogicalTypeId.NULL }, "UNKNOWN"],
-    [{ kind: "unknown", id: 16 }, "VARIANT"],
+    [{ kind: "unknown", id: LogicalTypeId.VARIANT }, "VARIANT"],
+    [{ kind: "unknown", id: LogicalTypeId.GEOMETRY }, "GEOMETRY"],
+    [{ kind: "unknown", id: LogicalTypeId.GEOGRAPHY }, "GEOGRAPHY"],
+    [{ kind: "unknown", id: LogicalTypeId.FILE }, "FILE"],
     [{ kind: "unknown", id: 42 }, "logical type 42"],
     [{ kind: "unknown", id: 0 }, "an annotation this version has no name for"],
   ] as [Annotation, string][])("names %o", (annotation, name) => {

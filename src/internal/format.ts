@@ -179,6 +179,10 @@ export const LogicalTypeId: {
   readonly BSON: 13;
   readonly UUID: 14;
   readonly FLOAT16: 15;
+  readonly VARIANT: 16;
+  readonly GEOMETRY: 17;
+  readonly GEOGRAPHY: 18;
+  readonly FILE: 19;
 } = {
   STRING: 1,
   MAP: 2,
@@ -195,6 +199,10 @@ export const LogicalTypeId: {
   BSON: 13,
   UUID: 14,
   FLOAT16: 15,
+  VARIANT: 16,
+  GEOMETRY: 17,
+  GEOGRAPHY: 18,
+  FILE: 19,
 } as const;
 
 /**
@@ -670,6 +678,7 @@ const LOGICAL_TYPE_NAMES = [
   "VARIANT",
   "GEOMETRY",
   "GEOGRAPHY",
+  "FILE",
 ];
 
 const ENCODING_NAMES = [
@@ -1030,9 +1039,9 @@ function decodeIntType(reader: CompactReader): Annotation {
  *
  * A member with no parameters is skipped rather than descended into, which
  * consumes its empty struct's stop byte; the parameterised ones are read here
- * and nowhere else. An unrecognised member — a `VARIANT`, a `GEOMETRY`, or
- * whatever a later release adds — decodes to its field id, so it can still be
- * named in a refusal and still be offered to an adapter.
+ * and nowhere else. A known but unsupported member, or one a later release
+ * adds, decodes to its field id so it can still be named in a refusal and
+ * offered to an adapter where its physical contract permits one.
  */
 function decodeLogicalType(reader: CompactReader): Annotation {
   let annotation: Annotation = { kind: "unknown", id: UNNAMED_ANNOTATION };

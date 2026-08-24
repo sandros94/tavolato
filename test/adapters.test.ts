@@ -56,6 +56,23 @@ function appendOne(type: AnyLogicalAdapter, value: unknown): () => unknown {
   return () => writer.append({ v: value } as never);
 }
 
+/** Minimal custom type used to probe an annotation's legal storage contract. */
+function annotatedAs(
+  annotation: Annotation,
+  physical: PhysicalKind,
+  typeLength?: number,
+): LogicalAdapter<unknown, unknown> {
+  return defineColumnType({
+    name: `${annotation.kind}-${physical}`,
+    physical,
+    ...(typeLength === undefined ? {} : { typeLength }),
+    matches: (found) => found.kind === annotation.kind,
+    annotate: () => annotation,
+    read: (raw) => raw,
+    write: (value) => value,
+  });
+}
+
 describe("defineColumnType", () => {
   const valid = {
     name: "flag",
@@ -71,6 +88,76 @@ describe("defineColumnType", () => {
     expect(Object.isFrozen(type)).toBe(true);
     expect(type.name).toBe("flag");
   });
+
+  it("refuses an annotation on a physical type Parquet does not permit", () => {
+    const error = expectError("ERR_SCHEMA_COLUMN_INVALID", () =>
+      defineColumnType({
+        ...valid,
+        physical: "i64",
+        annotate: (): Annotation => ({ kind: "date" }),
+      }),
+    );
+    expect(error.message).toContain("DATE");
+    expect(error.message).toContain("INT32");
+  });
+
+  it.each([
+    [{ kind: "string" }, "bytes"],
+    [{ kind: "enum" }, "bytes"],
+    [{ kind: "json" }, "bytes"],
+    [{ kind: "bson" }, "bytes"],
+    [{ kind: "uuid" }, "fixed", 16],
+    [{ kind: "date" }, "i32"],
+    [{ kind: "float16" }, "fixed", 2],
+    [{ kind: "time", unit: "millis", isAdjustedToUTC: false }, "i32"],
+    [{ kind: "time", unit: "micros", isAdjustedToUTC: true }, "i64"],
+    [{ kind: "time", unit: "nanos", isAdjustedToUTC: false }, "i64"],
+    [{ kind: "timestamp", unit: "millis", isAdjustedToUTC: true }, "i64"],
+    [{ kind: "timestamp", unit: "micros", isAdjustedToUTC: false }, "i64"],
+    [{ kind: "timestamp", unit: "nanos", isAdjustedToUTC: true }, "i64"],
+    [{ kind: "integer", bitWidth: 8, isSigned: true }, "i32"],
+    [{ kind: "integer", bitWidth: 16, isSigned: false }, "i32"],
+    [{ kind: "integer", bitWidth: 32, isSigned: true }, "i32"],
+    [{ kind: "integer", bitWidth: 64, isSigned: false }, "i64"],
+    [{ kind: "decimal", precision: 9, scale: 2 }, "i32"],
+    [{ kind: "decimal", precision: 18, scale: 2 }, "i64"],
+    [{ kind: "decimal", precision: 100, scale: 2 }, "bytes"],
+    [{ kind: "decimal", precision: 100, scale: 2 }, "fixed", 42],
+    [{ kind: "decimal", precision: 311_620_928, scale: 2 }, "fixed", 129_397_790],
+  ] as [Annotation, PhysicalKind, number?][])(
+    "accepts %o on %s",
+    (annotation, physical, typeLength) => {
+      expect(annotatedAs(annotation, physical, typeLength).physical).toBe(physical);
+    },
+  );
+
+  it.each([
+    [{ kind: "string" }, "fixed", 4],
+    [{ kind: "enum" }, "i32"],
+    [{ kind: "json" }, "i64"],
+    [{ kind: "bson" }, "fixed", 4],
+    [{ kind: "uuid" }, "fixed", 15],
+    [{ kind: "date" }, "i64"],
+    [{ kind: "float16" }, "fixed", 4],
+    [{ kind: "time", unit: "millis", isAdjustedToUTC: false }, "i64"],
+    [{ kind: "time", unit: "micros", isAdjustedToUTC: true }, "i32"],
+    [{ kind: "time", unit: "nanos", isAdjustedToUTC: false }, "i32"],
+    [{ kind: "timestamp", unit: "millis", isAdjustedToUTC: true }, "i32"],
+    [{ kind: "integer", bitWidth: 8, isSigned: true }, "i64"],
+    [{ kind: "integer", bitWidth: 16, isSigned: false }, "i64"],
+    [{ kind: "integer", bitWidth: 32, isSigned: true }, "i64"],
+    [{ kind: "integer", bitWidth: 64, isSigned: false }, "i32"],
+    [{ kind: "decimal", precision: 10, scale: 2 }, "i32"],
+    [{ kind: "decimal", precision: 19, scale: 2 }, "i64"],
+    [{ kind: "decimal", precision: 5, scale: 2 }, "fixed", 2],
+    [{ kind: "decimal", precision: 311_620_929, scale: 2 }, "fixed", 129_397_790],
+    [{ kind: "decimal", precision: 3, scale: 2 }, "f32"],
+  ] as [Annotation, PhysicalKind, number?][])(
+    "refuses %o on %s",
+    (annotation, physical, typeLength) => {
+      expectError("ERR_SCHEMA_COLUMN_INVALID", () => annotatedAs(annotation, physical, typeLength));
+    },
+  );
 
   it.each([
     ["not an object", null],
@@ -95,20 +182,29 @@ describe("defineColumnType", () => {
     ["an annotate() that returns nothing", { ...valid, annotate: () => undefined }],
     ["an annotation nobody can write", { ...valid, annotate: () => ({ kind: "unknown", id: 99 }) }],
     ["a decimal without parameters", { ...valid, annotate: () => ({ kind: "decimal" }) }],
-    // The same bounds `decimal()` holds itself to: an annotation outside them
-    // is one no Parquet reader can act on, and the gate is here rather than in
-    // a file somebody else has to open.
     [
       "a decimal of negative precision",
-      { ...valid, annotate: () => ({ kind: "decimal", precision: -3, scale: 999 }) },
+      {
+        ...valid,
+        physical: "bytes",
+        annotate: () => ({ kind: "decimal", precision: -3, scale: 999 }),
+      },
     ],
     [
-      "a decimal past 38 digits",
-      { ...valid, annotate: () => ({ kind: "decimal", precision: 39, scale: 0 }) },
+      "a decimal precision larger than its i32 metadata field",
+      {
+        ...valid,
+        physical: "bytes",
+        annotate: () => ({ kind: "decimal", precision: 2 ** 31, scale: 0 }),
+      },
     ],
     [
       "a decimal scaled past its own precision",
-      { ...valid, annotate: () => ({ kind: "decimal", precision: 4, scale: 5 }) },
+      {
+        ...valid,
+        physical: "bytes",
+        annotate: () => ({ kind: "decimal", precision: 4, scale: 5 }),
+      },
     ],
     ["a timestamp without a unit", { ...valid, annotate: () => ({ kind: "timestamp" }) }],
     [
@@ -209,7 +305,7 @@ describe("claiming a column", () => {
       physical: "fixed",
       typeLength: 8,
       matches: (annotation) => annotation.kind === "uuid",
-      annotate: (): Annotation => ({ kind: "uuid" }),
+      annotate: (): Annotation => ({ kind: "none" }),
       read: (raw) => raw as Uint8Array,
       write: (value: Uint8Array) => value,
     });
@@ -226,8 +322,8 @@ describe("claiming a column", () => {
       bool: defineColumnType({
         name: "yes-no",
         physical: "bool",
-        matches: (annotation) => annotation.kind === "enum",
-        annotate: (): Annotation => ({ kind: "enum" }),
+        matches: (annotation) => annotation.kind === "none",
+        annotate: (): Annotation => ({ kind: "none" }),
         read: (raw) => ((raw as boolean) ? "yes" : "no"),
         write: (value: string) => value === "yes",
       }),

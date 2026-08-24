@@ -1,4 +1,5 @@
 import { decodeUtf8, utf8 } from "./internal/bytes.ts";
+import { logicalTypePhysicalProblem } from "./internal/logical.ts";
 import { adapterUnsupported, describe, malformed, TavolatoError } from "./error.ts";
 import type { Annotation, JsonValue, LogicalAdapter, PhysicalKind, TimeUnitName } from "./types.ts";
 
@@ -52,8 +53,9 @@ const WRITABLE_ANNOTATIONS: ReadonlySet<string> = new Set<Annotation["kind"]>([
 
 const TIME_UNITS: ReadonlySet<string> = new Set<TimeUnitName>(["millis", "micros", "nanos"]);
 
-/** Digits a Parquet `DECIMAL` can carry, which is what the annotation may declare. */
-const MAX_DECIMAL_PRECISION = 38;
+/** Digits the built-in adapter can carry in its widest, 16-byte representation. */
+const MAX_BUILTIN_DECIMAL_PRECISION = 38;
+const MAX_ANNOTATION_INTEGER = 2 ** 31 - 1;
 
 function invalid(message: string): TavolatoError {
   return new TavolatoError(message, "ERR_SCHEMA_COLUMN_INVALID");
@@ -80,20 +82,15 @@ function annotationProblem(annotation: unknown): string | undefined {
     return `annotate() returned the annotation kind ${describe(value.kind)}, which cannot be written`;
   }
   if (value.kind === "decimal") {
-    // The same bounds `decimal()` holds itself to, and for the same reason:
-    // Parquet defines `DECIMAL` only within them, so an annotation outside is
-    // one no reader can act on. Refusing it here is the schema gate keeping its
-    // promise — a schema that cannot produce a file says so before a row is
-    // appended, rather than in somebody else's query engine.
     const { precision, scale } = value;
     return Number.isSafeInteger(precision) &&
       precision >= 1 &&
-      precision <= MAX_DECIMAL_PRECISION &&
+      precision <= MAX_ANNOTATION_INTEGER &&
       Number.isSafeInteger(scale) &&
       scale >= 0 &&
       scale <= precision
       ? undefined
-      : `annotate() returned a decimal annotation of precision ${describe(precision)} and scale ${describe(scale)}; precision must be an integer from 1 to ${MAX_DECIMAL_PRECISION} and scale an integer from 0 to the precision`;
+      : `annotate() returned a decimal annotation of precision ${describe(precision)} and scale ${describe(scale)}; precision must be a positive i32 and scale an integer from 0 to the precision`;
   }
   if (value.kind === "time" || value.kind === "timestamp") {
     return TIME_UNITS.has(value.unit) && typeof value.isAdjustedToUTC === "boolean"
@@ -149,7 +146,13 @@ export function adapterProblem(spec: unknown): string | undefined {
     return `${adapter.name} threw from annotate(): ${cause instanceof Error ? cause.message : describe(cause)}`;
   }
   const problem = annotationProblem(annotation);
-  return problem === undefined ? undefined : `${adapter.name} ${problem}`;
+  if (problem !== undefined) return `${adapter.name} ${problem}`;
+  const physicalProblem = logicalTypePhysicalProblem(
+    annotation as Annotation,
+    adapter.physical,
+    adapter.typeLength,
+  );
+  return physicalProblem === undefined ? undefined : `${adapter.name} ${physicalProblem}`;
 }
 
 /**
@@ -307,9 +310,13 @@ export interface DecimalOptions {
  */
 export function decimal(options: DecimalOptions): LogicalAdapter<string, string> {
   const { precision, scale = 0 } = options;
-  if (!Number.isSafeInteger(precision) || precision < 1 || precision > MAX_DECIMAL_PRECISION) {
+  if (
+    !Number.isSafeInteger(precision) ||
+    precision < 1 ||
+    precision > MAX_BUILTIN_DECIMAL_PRECISION
+  ) {
     throw invalid(
-      `decimal precision must be an integer from 1 to ${MAX_DECIMAL_PRECISION}, received ${describe(precision)}`,
+      `decimal precision must be an integer from 1 to ${MAX_BUILTIN_DECIMAL_PRECISION}, received ${describe(precision)}`,
     );
   }
   if (!Number.isSafeInteger(scale) || scale < 0 || scale > precision) {
