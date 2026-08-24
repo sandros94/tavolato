@@ -491,7 +491,7 @@ describe("a column chunk of more than one page", () => {
     // and nothing forbids it: each step's synchronous prologue runs before any
     // of them has finished decompressing a page, so a step sharing its cursor
     // with the others would read their pages as its own.
-    expect(await Promise.all([...file])).toEqual(groups);
+    expect(await Promise.all(file)).toEqual(groups);
 
     // Awaiting each step before pulling the next says the same thing.
     const sequential: ReadRow[][] = [];
