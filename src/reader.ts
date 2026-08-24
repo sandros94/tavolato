@@ -27,6 +27,7 @@ import {
 } from "./internal/format.ts";
 import { adapterProblem, jsonValueOf } from "./adapters.ts";
 import {
+  adapterUnsupportedDetails,
   badOption,
   describe,
   malformed,
@@ -499,6 +500,10 @@ function adapt(column: ReadColumn, adapter: AnyLogicalAdapter, raw: unknown): Re
   try {
     return adapter.read(raw) as ReadValue;
   } catch (cause) {
+    const refusal = adapterUnsupportedDetails(cause);
+    if (refusal !== undefined) {
+      throw unsupported(`column "${column.name}", ${refusal.found}`, column.name, refusal.remedy);
+    }
     throw malformed(
       `The column type ${adapter.name} failed on a value of column "${column.name}"`,
       column.name,

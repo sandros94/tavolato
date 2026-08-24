@@ -126,6 +126,32 @@ export function unsupported(found: string, column?: string, remedy?: string): Ta
   );
 }
 
+/** The file feature and remedy carried out of an in-box adapter's `read`. @internal */
+export interface AdapterUnsupportedDetails {
+  readonly found: string;
+  readonly remedy: string;
+}
+
+/*
+ * Only errors made here enter this map. A caller-authored adapter throwing an
+ * `ERR_READ_UNSUPPORTED` remains a failed callback and is wrapped as malformed;
+ * in-box adapters can instead hand a valid but unrepresentable value back to
+ * the reader, which adds the column context before exposing the refusal.
+ */
+const ADAPTER_UNSUPPORTED = new WeakMap<TavolatoError, AdapterUnsupportedDetails>();
+
+/** Creates a refusal an in-box adapter can hand back to the reader. @internal */
+export function adapterUnsupported(found: string, remedy: string): TavolatoError {
+  const error = unsupported(found, undefined, remedy);
+  ADAPTER_UNSUPPORTED.set(error, { found, remedy });
+  return error;
+}
+
+/** Recovers an in-box adapter refusal without trusting caller-thrown errors. @internal */
+export function adapterUnsupportedDetails(error: unknown): AdapterUnsupportedDetails | undefined {
+  return error instanceof TavolatoError ? ADAPTER_UNSUPPORTED.get(error) : undefined;
+}
+
 /** The remedy for a column whose meaning is a decision only the caller can make. */
 export const TYPES_REMEDY: string = "pass a matching type in ReadOptions.types to read it anyway";
 

@@ -81,7 +81,8 @@ Each in-box factory maps by one rule: the value must survive the round trip unch
 
 | factory                                                | JavaScript  | Parquet                                    |
 | ------------------------------------------------------ | ----------- | ------------------------------------------ |
-| `date()`                                               | `Date`      | `INT32` / `DATE`                           |
+| `date()` or `date({ as: "date" })`                     | `Date`      | `INT32` / `DATE`                           |
+| `date({ as: "number" })`                               | `number`    | `INT32` / `DATE`                           |
 | `decimal({ precision, scale })`                        | `string`    | `INT32`, `INT64` or `FLBA(16)` / `DECIMAL` |
 | `uuid()`                                               | `string`    | `FLBA(16)` / `UUID`                        |
 | `time({ unit: "millis", isAdjustedToUTC })`            | `number`    | `INT32` / `TIME(MILLIS, …)`                |
@@ -94,6 +95,8 @@ Each in-box factory maps by one rule: the value must survive the round trip unch
 
 ```ts
 date(); // new Date(Date.UTC(2026, 7, 24)) — exactly UTC midnight, never a truncated instant
+date({ as: "date" }); // the same mapping, with the representation explicit
+date({ as: "number" }); // 20_689 — signed days since the Unix epoch, across the full INT32 domain
 decimal({ precision: 12, scale: 2 }); // "19.99" — canonical, exactly `scale` digits, one spelling per value
 uuid(); // crypto.randomUUID() — canonical lowercase 8-4-4-4-12, and only that
 time({ unit: "millis", isAdjustedToUTC: false }); // 43_200_000 — local time since midnight
@@ -104,6 +107,8 @@ json<Payload>(); // your document type, with the reviver and replacer opened up
 ```
 
 The same object serves both sides: in a schema it decides how a column is written, and in `ReadOptions.types` it claims the columns it recognises.
+
+Parquet `DATE` reaches far beyond JavaScript's ±100,000,000-day `Date` range. The default adapter refuses those otherwise-valid values with `ERR_READ_UNSUPPORTED`; use `date({ as: "number" })` for a lossless signed day count across the complete Parquet `INT32` domain. The representation is stable per adapter—never selected from the value's magnitude.
 
 `TIME` and `TIMESTAMP` carry `unit` and `isAdjustedToUTC` as separate required Parquet parameters. Adapters match and re-emit both exactly. The built-in `timestamp` type maps only `TIMESTAMP(MILLIS, true)` to `Date`; use `timestamp({ unit: "millis", isAdjustedToUTC: false })` to preserve a local timestamp as its raw `bigint` count.
 

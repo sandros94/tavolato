@@ -16,6 +16,9 @@ import {
   uuid,
 } from "../src/index.ts";
 import type {
+  DateOptions,
+  DateRepresentation,
+  DateValue,
   JsonValue,
   ParquetFile,
   ParquetRowGroups,
@@ -253,6 +256,28 @@ void [notANumber, notMillis, notNullable, notNull];
  * `ParquetSchema`, `Row` or the writer.
  */
 const money = decimal({ precision: 12, scale: 2 });
+const dateAsDate = date();
+const dateAsEmpty = date({});
+const dateAsExplicit = date({ as: "date" });
+const dateAsNumber = date({ as: "number" });
+const dateOptions: DateOptions<DateRepresentation> =
+  Math.random() > 0.5 ? { as: "date" } : { as: "number" };
+const dateAsEither = date(dateOptions);
+const dateValue: DateValue<"number"> = 0;
+dateAsDate.write(new Date(0));
+// @ts-expect-error the default representation writes Date objects
+dateAsDate.write(0);
+dateAsEmpty.write(new Date(0));
+// @ts-expect-error empty options preserve the Date default
+dateAsEmpty.write(0);
+dateAsExplicit.write(new Date(0));
+// @ts-expect-error an explicit Date representation does not widen to number
+dateAsExplicit.write(0);
+dateAsNumber.write(0);
+// @ts-expect-error the numeric representation writes day counts
+dateAsNumber.write(new Date(0));
+dateAsEither.write(Math.random() > 0.5 ? new Date(0) : 0);
+void [dateValue];
 // @ts-expect-error TIME requires the upstream UTC-adjustment parameter
 time({ unit: "millis" });
 // @ts-expect-error TIMESTAMP requires the upstream UTC-adjustment parameter
@@ -268,6 +293,7 @@ const ratio = defineColumnType({
 
 const logical = defineSchema({
   when: { type: date() },
+  dayCount: { type: date({ as: "number" }) },
   price: { type: money },
   id: { type: uuid() },
   clock: { type: time({ unit: "millis", isAdjustedToUTC: false }) },
@@ -283,6 +309,7 @@ const logical = defineSchema({
 const logicalWriter = createWriter(logical);
 const priced = {
   when: new Date(0),
+  dayCount: 0,
   price: "1.00",
   id: "b3f2c1a0-1111-4222-8333-444455556666",
   clock: 0,
@@ -300,6 +327,8 @@ logicalWriter.append(priced);
 logicalWriter.append({ ...priced, price: 1 });
 // @ts-expect-error a date column takes a Date, not epoch milliseconds
 logicalWriter.append({ ...priced, when: 0 });
+// @ts-expect-error a numeric date column takes day counts, not Date objects
+logicalWriter.append({ ...priced, dayCount: new Date(0) });
 // @ts-expect-error a uuid column takes its canonical string, not bytes
 logicalWriter.append({ ...priced, id: new Uint8Array(16) });
 // @ts-expect-error time(millis) is a number, not a bigint
@@ -321,6 +350,7 @@ const logicalRows = readParquet(new Uint8Array(), { types: [money] }).rows as Re
 const logicalRow = logicalRows[0];
 const asPrice: string = logicalRow.price;
 const asDay: Date = logicalRow.when;
+const asDayCount: number = logicalRow.dayCount;
 const asUuid: string = logicalRow.id;
 const asMillis: number = logicalRow.clock;
 const asMicros: bigint = logicalRow.precise;
@@ -335,6 +365,7 @@ const asMaybeUuid: string | null = logicalRow.maybe;
 void [
   asPrice,
   asDay,
+  asDayCount,
   asUuid,
   asMillis,
   asMicros,
@@ -348,11 +379,15 @@ void [
 
 // @ts-expect-error a decimal column reads back as its canonical string
 const notPrice: number = logicalRow.price;
+// @ts-expect-error the default date representation is not a number
+const notDefaultDayCount: number = logicalRow.when;
+// @ts-expect-error the numeric date representation is not a Date
+const notDayDate: Date = logicalRow.dayCount;
 // @ts-expect-error a uuid column reads back as a string, never as bytes
 const notRawBytes: Uint8Array = logicalRow.id;
 // @ts-expect-error an optional adapter column may be null
 const notMaybe: string = logicalRow.maybe;
-void [notPrice, notRawBytes, notMaybe];
+void [notPrice, notDefaultDayCount, notDayDate, notRawBytes, notMaybe];
 
 /*
  * The `json` column type. It defaults to `JsonValue` on both sides, and takes a

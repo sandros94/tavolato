@@ -15,6 +15,9 @@ export {
   uuid,
 } from "./adapters.ts";
 export type {
+  DateOptions,
+  DateRepresentation,
+  DateValue,
   DecimalOptions,
   IntegerOptions,
   IntegerValue,

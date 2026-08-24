@@ -8,6 +8,7 @@ import {
   float16,
   integer,
   readParquet,
+  TavolatoError,
   time,
   timestamp,
   uuid,
@@ -393,6 +394,20 @@ describe("a column type that misbehaves", () => {
     expect((error.cause as Error).message).toBe("unlucky");
   });
 
+  it("still treats a caller's unsupported error as a failed adapter", () => {
+    const typed = defineColumnType({
+      ...thrower,
+      name: "typed-thrower",
+      read: (): bigint => {
+        throw new TavolatoError("not mine", "ERR_READ_UNSUPPORTED");
+      },
+    });
+    const bytes = write(thrower, [1n]);
+    const error = expectError("ERR_READ_MALFORMED", () => readParquet(bytes, { types: [typed] }));
+    expect(error.cause).toBeInstanceOf(TavolatoError);
+    expect((error.cause as TavolatoError).code).toBe("ERR_READ_UNSUPPORTED");
+  });
+
   it.each([
     ["bool", true, "a boolean"],
     ["i32", 1, "a signed 32-bit integer"],
@@ -499,6 +514,11 @@ describe("a column type that misbehaves", () => {
 });
 
 describe("date", () => {
+  const minInt32 = -(2 ** 31);
+  const maxInt32 = 2 ** 31 - 1;
+  const minDateDays = -100_000_000;
+  const maxDateDays = 100_000_000;
+
   it("round-trips UTC midnights on both sides of the epoch", () => {
     const days = [
       new Date(Date.UTC(1970, 0, 1)),
@@ -507,6 +527,63 @@ describe("date", () => {
       new Date(Date.UTC(9999, 11, 31)),
     ];
     expect(roundtrip(date(), days)).toEqual(days);
+  });
+
+  it("round-trips the full Parquet DATE domain as signed day counts", () => {
+    const days = date({ as: "number" });
+    expect(roundtrip(days, [minInt32, minDateDays, 0, maxDateDays, maxInt32])).toEqual([
+      minInt32,
+      minDateDays,
+      0,
+      maxDateDays,
+      maxInt32,
+    ]);
+  });
+
+  it("keeps the JavaScript Date boundaries representable", () => {
+    const boundaries = [new Date(minDateDays * 86_400_000), new Date(maxDateDays * 86_400_000)];
+    expect(roundtrip(date(), boundaries)).toEqual(boundaries);
+  });
+
+  it("preserves day counts through the returned schema", () => {
+    const days = date({ as: "number" });
+    const first = readParquet(write(days, [minInt32, maxInt32]), { types: [days] });
+    expect(first.schema.columns[0].type).toBe(days);
+
+    const writer = createWriter(first.schema);
+    for (const row of first.rows) writer.append(row);
+    expect(readParquet(sync(writer.finish()), { types: [days] }).rows).toEqual(first.rows);
+  });
+
+  it("refuses a DATE outside JavaScript's range with the lossless remedy", () => {
+    const days = date({ as: "number" });
+    for (const count of [minDateDays - 1, maxDateDays + 1]) {
+      const error = expectError("ERR_READ_UNSUPPORTED", () =>
+        readParquet(write(days, [count]), { types: [date()] }),
+      );
+      expect(error.column).toBe("v");
+      expect(error.message).toContain(`${count} days`);
+      expect(error.message).toContain("-100000000 to 100000000");
+      expect(error.message).toContain('date({ as: "number" })');
+    }
+  });
+
+  it("validates signed INT32 day counts", () => {
+    const days = date({ as: "number" });
+    for (const value of [minInt32 - 1, maxInt32 + 1, 0.5, Number.NaN, 0n, new Date(0)]) {
+      const error = expectError("ERR_ROW_VALUE_INVALID", appendOne(days, value));
+      expect(error.message).toContain("signed 32-bit integer");
+    }
+  });
+
+  it("refuses an unknown representation", () => {
+    expectError("ERR_SCHEMA_COLUMN_INVALID", () => date(null as never));
+    expectError("ERR_SCHEMA_COLUMN_INVALID", () =>
+      date({
+        // @ts-expect-error deliberately wrong input
+        as: "string",
+      }),
+    );
   });
 
   it("refuses a Date carrying a time of day, rather than truncating it", () => {

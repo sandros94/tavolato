@@ -1,5 +1,5 @@
 import { decodeUtf8, utf8 } from "./internal/bytes.ts";
-import { describe, malformed, TavolatoError } from "./error.ts";
+import { adapterUnsupported, describe, malformed, TavolatoError } from "./error.ts";
 import type { Annotation, JsonValue, LogicalAdapter, PhysicalKind, TimeUnitName } from "./types.ts";
 
 /*
@@ -198,34 +198,89 @@ export function defineColumnType<TIn, TOut>(
  */
 
 const MILLIS_PER_DAY = 86_400_000;
+const MIN_INT32 = -(2 ** 31);
+const MAX_INT32 = 2 ** 31 - 1;
+const MIN_DATE_DAYS = -100_000_000;
+const MAX_DATE_DAYS = 100_000_000;
+
+/** JavaScript representation used by {@link date}. */
+export type DateRepresentation = "date" | "number";
+
+/** Options for {@link date}. */
+export interface DateOptions<TAs extends DateRepresentation = DateRepresentation> {
+  /** `Date`, or a signed count of days since the Unix epoch. Defaults to `"date"`. */
+  readonly as?: TAs;
+}
+
+/** Value read and written by a {@link date} adapter. */
+export type DateValue<TAs extends DateRepresentation> = TAs extends "number" ? number : Date;
 
 /**
- * `DATE` ⇄ `Date`, stored as days since the Unix epoch in an `INT32`.
+ * `DATE` ⇄ `Date` or a day count, stored as days since the Unix epoch in an
+ * `INT32`.
  *
- * A Parquet `DATE` has no time of day at all, so writing one requires a `Date`
- * that is exactly UTC midnight. Truncating a timestamp for you would be the
- * library quietly discarding hours it was handed; a typed error hands that
- * decision back, and `new Date(Date.UTC(y, m, d))` is how you make one.
+ * The default `"date"` representation requires exactly UTC midnight and
+ * covers the ±100,000,000 days JavaScript can represent. `"number"` preserves
+ * the complete signed `INT32` domain Parquet permits. Each representation is
+ * stable: values never change type according to their magnitude.
  */
-export function date(): LogicalAdapter<Date, Date> {
-  return defineColumnType<Date, Date>({
+export function date<TAs extends DateRepresentation = "date">(
+  options: DateOptions<TAs> = {},
+): LogicalAdapter<DateValue<TAs>, DateValue<TAs>> {
+  if (typeof options !== "object" || options === null) {
+    throw invalid(`date options must be an object, received ${describe(options)}`);
+  }
+  const { as = "date" } = options;
+  if (as !== "date" && as !== "number") {
+    throw invalid(`date as must be "date" or "number", received ${describe(as)}`);
+  }
+
+  const common = {
     name: "date",
     physical: "i32",
-    matches: (annotation) => annotation.kind === "date",
-    annotate: () => ({ kind: "date" }),
-    read: (raw) => new Date((raw as number) * MILLIS_PER_DAY),
-    write: (value) => {
-      if (!(value instanceof Date)) reject(`date expects a Date, received ${describe(value)}`);
-      const millis = value.getTime();
-      if (Number.isNaN(millis)) reject("date expects a valid Date");
-      if (millis % MILLIS_PER_DAY !== 0) {
-        reject(
-          `date expects a Date at exactly UTC midnight, received ${value.toISOString()}; a Parquet DATE has no time of day`,
-        );
-      }
-      return millis / MILLIS_PER_DAY;
-    },
-  });
+    matches: (annotation: Annotation) => annotation.kind === "date",
+    annotate: (): Annotation => ({ kind: "date" }),
+  } as const;
+  const adapter =
+    as === "number"
+      ? defineColumnType<number, number>({
+          ...common,
+          read: (raw) => raw as number,
+          write: (value) => {
+            if (!Number.isSafeInteger(value) || value < MIN_INT32 || value > MAX_INT32) {
+              reject(
+                `date as number expects a signed 32-bit integer from ${MIN_INT32} to ${MAX_INT32}, received ${describe(value)}`,
+              );
+            }
+            return value;
+          },
+        })
+      : defineColumnType<Date, Date>({
+          ...common,
+          read: (raw) => {
+            const days = raw as number;
+            if (days < MIN_DATE_DAYS || days > MAX_DATE_DAYS) {
+              throw adapterUnsupported(
+                `a DATE holding ${days} days since the Unix epoch, outside JavaScript Date's range of ${MIN_DATE_DAYS} to ${MAX_DATE_DAYS} days`,
+                `register date({ as: "number" }) in ReadOptions.types to read the count itself`,
+              );
+            }
+            return new Date(days * MILLIS_PER_DAY);
+          },
+          write: (value) => {
+            if (!(value instanceof Date))
+              reject(`date expects a Date, received ${describe(value)}`);
+            const millis = value.getTime();
+            if (Number.isNaN(millis)) reject("date expects a valid Date");
+            if (millis % MILLIS_PER_DAY !== 0) {
+              reject(
+                `date expects a Date at exactly UTC midnight, received ${value.toISOString()}; a Parquet DATE has no time of day`,
+              );
+            }
+            return millis / MILLIS_PER_DAY;
+          },
+        });
+  return adapter as LogicalAdapter<DateValue<TAs>, DateValue<TAs>>;
 }
 
 /** Options for {@link decimal}. */
