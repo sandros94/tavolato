@@ -504,8 +504,28 @@ describe("createParquetStore: stores that ignore Range", () => {
     expect(s3.requests.map((request) => request.status)).toEqual([206, 200]);
   });
 
-  it("asks the object's size of a HEAD when a partial answer does not state one", async () => {
+  it("refuses a partial answer without a Content-Range", async () => {
     const { s3, store } = storeOf({ omitContentRange: true });
+    s3.seed("cat.parquet", plain);
+
+    await expectRejection(
+      "ERR_STORE_RANGE_UNSATISFIED",
+      store.get("cat.parquet", { columns: ["n"], groups: [0] }),
+    );
+  });
+
+  it("refuses a malformed Content-Range", async () => {
+    const { s3, store } = storeOf({ contentRange: "bytes nonsense" });
+    s3.seed("cat.parquet", plain);
+
+    await expectRejection(
+      "ERR_STORE_RANGE_UNSATISFIED",
+      store.get("cat.parquet", { columns: ["n"], groups: [0] }),
+    );
+  });
+
+  it("uses HEAD to resolve an unknown total and accepts later unknown totals", async () => {
+    const { s3, store } = storeOf({ contentRangeTotal: "*" });
     s3.seed("cat.parquet", plain);
 
     const file = await store.get("cat.parquet", { columns: ["n"], groups: [0] });
@@ -514,13 +534,72 @@ describe("createParquetStore: stores that ignore Range", () => {
     expect(s3.requests.map((request) => request.method)).toEqual(["GET", "HEAD", "GET"]);
   });
 
-  it("gives up when neither the range nor the HEAD says how big the object is", async () => {
-    const { s3, store } = storeOf({ omitContentRange: true, omitContentLength: true });
+  it("refuses an unknown total when HEAD has no usable size", async () => {
+    const { s3, store } = storeOf({ contentRangeTotal: "*", omitContentLength: true });
     s3.seed("cat.parquet", plain);
 
     await expectRejection(
       "ERR_STORE_RANGE_UNSATISFIED",
-      store.get("cat.parquet", { columns: ["n"] }),
+      store.get("cat.parquet", { columns: ["n"], groups: [0] }),
+    );
+  });
+
+  it("pins the HEAD that resolves an unknown total to the tail's etag", async () => {
+    const s3 = new FakeS3();
+    s3.quirks.contentRangeTotal = "*";
+    s3.seed("cat.parquet", plain);
+    const store = createParquetStore(
+      racing(s3, (answered) => {
+        if (answered === 0) s3.replace("cat.parquet", plain);
+      }),
+      { bucket: "b", types: [id, money] },
+    );
+
+    await expectRejection(
+      "ERR_STORE_OBJECT_CHANGED",
+      store.get("cat.parquet", { columns: ["n"], groups: [0] }),
+    );
+  });
+
+  it("refuses a later partial answer without a Content-Range", async () => {
+    const s3 = new FakeS3();
+    s3.seed("cat.parquet", plain);
+    const store = createParquetStore(
+      racing(s3, (answered) => {
+        if (answered === 0) s3.quirks.omitContentRange = true;
+      }),
+      { bucket: "b", types: [id, money] },
+    );
+
+    await expectRejection(
+      "ERR_STORE_RANGE_UNSATISFIED",
+      store.get("cat.parquet", { columns: ["n"], groups: [0] }),
+    );
+  });
+
+  it("refuses an equal-length response from the wrong offset", async () => {
+    const { s3, store } = storeOf({ shiftRanges: 1 });
+    s3.seed("cat.parquet", plain);
+
+    await expectRejection(
+      "ERR_STORE_RANGE_UNSATISFIED",
+      store.get("cat.parquet", { columns: ["n"], groups: [0] }),
+    );
+  });
+
+  it("refuses a Content-Range total that changes mid-read", async () => {
+    const s3 = new FakeS3();
+    s3.seed("cat.parquet", plain);
+    const store = createParquetStore(
+      racing(s3, (answered) => {
+        if (answered === 0) s3.quirks.contentRangeTotal = plain.length + 1;
+      }),
+      { bucket: "b", types: [id, money] },
+    );
+
+    await expectRejection(
+      "ERR_STORE_RANGE_UNSATISFIED",
+      store.get("cat.parquet", { columns: ["n"], groups: [0] }),
     );
   });
 
@@ -746,16 +825,16 @@ describe("createParquetStore: files a ranged read cannot take apart", () => {
     await expectRejection("ERR_READ_MALFORMED", tight(s3).head("junk.parquet"));
   });
 
-  it("refuses a tail the store cut short", async () => {
+  it("refuses a suffix response that does not cover the requested tail", async () => {
     const s3 = new FakeS3();
     s3.quirks.truncateTail = true;
     s3.seed("hand.parquet", handBuilt());
 
     const error = await expectRejection(
-      "ERR_READ_MALFORMED",
+      "ERR_STORE_RANGE_UNSATISFIED",
       tight(s3).get("hand.parquet", { columns: ["n"] }),
     );
-    expect(error.message).toContain("bytes of envelope");
+    expect(error.message).toContain("file's tail");
   });
 
   it("refuses a footer of no bytes at all", async () => {
@@ -788,16 +867,16 @@ describe("createParquetStore: files a ranged read cannot take apart", () => {
     expect((await store.head("hand.parquet")).etag).toBeUndefined();
   });
 
-  it("ignores a Content-Range it cannot read, and asks the size of a HEAD", async () => {
+  it("refuses every malformed Content-Range", async () => {
     for (const contentRange of ["bytes nonsense", "bytes 0-1/99999999999999999999"]) {
       const s3 = new FakeS3();
       s3.quirks.contentRange = contentRange;
       s3.seed("hand.parquet", handBuilt());
 
-      const file = await tight(s3).get("hand.parquet", { columns: ["n"] });
-
-      expect(file.rows).toHaveLength(3);
-      expect(s3.requests.map((item) => item.method)).toContain("HEAD");
+      await expectRejection(
+        "ERR_STORE_RANGE_UNSATISFIED",
+        tight(s3).get("hand.parquet", { columns: ["n"] }),
+      );
     }
   });
 });

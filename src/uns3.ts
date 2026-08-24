@@ -451,17 +451,25 @@ export function createParquetStore(
     whole: bytes,
   });
 
-  /** Asks the object's size of a store that answered a range without stating one. */
+  /** Resolves the object's size when a valid `Content-Range` leaves its total unknown. */
   const sizeFromHead = async (
     key: string,
     params: Omit<HeadObjectParams, "key" | "range">,
+    etag: string | undefined,
   ): Promise<number> => {
-    const response = await request(async () => await client.head({ ...addressed(params), key }));
+    const response = await request(
+      async () =>
+        await client.head({
+          ...addressed(params),
+          ...(etag === undefined ? {} : { ifMatch: etag }),
+          key,
+        }),
+    );
     const length = response.headers.get("content-length");
     const size = length === null ? Number.NaN : Number(length);
     if (!Number.isSafeInteger(size) || size < 0) {
       throw new TavolatoError(
-        `The store answered a ranged read of "${key}" without a Content-Range, and its HEAD states no usable Content-Length either`,
+        `The store answered a ranged read of "${key}" with an unknown total, and its HEAD states no usable Content-Length`,
         "ERR_STORE_RANGE_UNSATISFIED",
       );
     }
@@ -474,8 +482,8 @@ export function createParquetStore(
    *
    * The object's size comes from the ranged response's own `Content-Range`
    * rather than from a `HEAD` in front of it, which is one request saved on
-   * every read; the `HEAD` is only there for a store that answers a range
-   * without saying what it ranged over.
+   * every read; the `HEAD` is only there for a valid response whose total is
+   * `*`.
    */
   const open = async (
     key: string,
@@ -502,8 +510,11 @@ export function createParquetStore(
       return whole(body, etag, options);
     }
 
-    const size = contentRangeOf(first)?.total ?? (await sizeFromHead(key, params));
-    if (body.length >= size) return whole(body, etag, options);
+    const tailRange = contentRangeOf(first);
+    expectRangeBytes(tailRange, body, "the file's tail");
+    const size = tailRange.total ?? (await sizeFromHead(key, params, etag));
+    expectSuffix(tailRange, tailBytes, size);
+    if (body.length === size) return whole(body, etag, options);
 
     let tail = body;
     const need = footerBytes(tail) + FOOTER_SUFFIX;
@@ -519,7 +530,7 @@ export function createParquetStore(
       const response = await ranged(key, params, missing, etag);
       const bytes = await bytesOf(response);
       if (response.status === 200) return whole(bytes, etag, options);
-      expectSpan(missing, bytes, "the file's metadata");
+      expectSpan(response, missing, bytes, size, "the file's metadata");
       tail = concat(bytes, tail);
     }
 
@@ -623,7 +634,7 @@ export function createParquetStore(
         // Same fallback as the tail read, one step further in: a store that
         // ignores ranges hands over everything, and everything is enough.
         if (response.status === 200) return await local(bytes, read, wanted);
-        expectSpan(range, bytes, "a column chunk");
+        expectSpan(response, range, bytes, opened.size, "a column chunk");
         fetched.push({ ...range, bytes });
       }
 
@@ -867,14 +878,22 @@ function footerBytes(tail: Uint8Array): number {
   return length;
 }
 
-/** Holds a store to the range it was asked for, before the bytes are believed. */
-function expectSpan(span: Span, bytes: Uint8Array, what: string): void {
-  const size = span.end - span.start;
-  if (bytes.length === size) return;
-  throw new TavolatoError(
-    `A ranged read of ${what} asked for ${size} bytes at offset ${span.start} and received ${bytes.length}`,
-    "ERR_STORE_RANGE_UNSATISFIED",
-  );
+/** Holds a store to an explicit range before any returned bytes are believed. */
+function expectSpan(
+  response: Response,
+  span: Span,
+  bytes: Uint8Array,
+  size: number,
+  what: string,
+): void {
+  const range = contentRangeOf(response);
+  expectRangeBytes(range, bytes, what);
+  if (range.start !== span.start || range.end !== span.end - 1) {
+    throw rangeUnsatisfied(
+      `A ranged read of ${what} asked for bytes ${span.start}-${span.end - 1} and received bytes ${range.start}-${range.end}`,
+    );
+  }
+  expectRangeTotal(range, size, what);
 }
 
 /** The object moved under a read that had already started. */
@@ -903,16 +922,73 @@ function etagOf(response: Response): string | undefined {
   return response.headers.get("etag") ?? undefined;
 }
 
-/** What a `Content-Range` says the response covers, and of how big an object. */
-function contentRangeOf(response: Response): { start: number; total: number } | undefined {
+interface ContentRange {
+  readonly start: number;
+  readonly end: number;
+  /** Undefined is the RFC `*`: a structurally valid, unknown total. */
+  readonly total: number | undefined;
+}
+
+/** Parses the single byte range every accepted `206` must state. */
+function contentRangeOf(response: Response): ContentRange {
   const header = response.headers.get("content-range");
-  if (header === null) return undefined;
-  const match = /^bytes\s+(\d+)-(\d+)\/(\d+)$/.exec(header.trim());
-  if (match === null) return undefined;
+  if (header === null) {
+    throw rangeUnsatisfied("A 206 Partial Content response has no Content-Range header");
+  }
+  const match = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(header.trim());
+  if (match === null) {
+    throw rangeUnsatisfied(
+      `A 206 Partial Content response has malformed Content-Range ${JSON.stringify(header)}`,
+    );
+  }
   const start = Number(match[1]);
-  const total = Number(match[3]);
-  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(total)) return undefined;
-  return { start, total };
+  const end = Number(match[2]);
+  const total = match[3] === "*" ? undefined : Number(match[3]);
+  if (
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(end) ||
+    start < 0 ||
+    end < start ||
+    (total !== undefined && (!Number.isSafeInteger(total) || total <= 0 || end >= total))
+  ) {
+    throw rangeUnsatisfied(
+      `A 206 Partial Content response has invalid Content-Range ${JSON.stringify(header)}`,
+    );
+  }
+  return { start, end, total };
+}
+
+/** Proves the body is exactly the single range its response declares. */
+function expectRangeBytes(range: ContentRange, bytes: Uint8Array, what: string): void {
+  const declared = range.end - range.start + 1;
+  if (bytes.length === declared) return;
+  throw rangeUnsatisfied(
+    `A ranged read of ${what} declares ${declared} bytes at offset ${range.start} and received ${bytes.length}`,
+  );
+}
+
+/** Holds a known object size against a response that chose to state its total. */
+function expectRangeTotal(range: ContentRange, size: number, what: string): void {
+  if (range.total === undefined || range.total === size) return;
+  throw rangeUnsatisfied(
+    `A ranged read of ${what} belongs to a ${size} byte object but its Content-Range states ${range.total}`,
+  );
+}
+
+/** Proves a suffix response covers exactly the tail asked for. */
+function expectSuffix(range: ContentRange, wanted: number, size: number): void {
+  expectRangeTotal(range, size, "the file's tail");
+  const start = Math.max(0, size - wanted);
+  const end = size - 1;
+  if (range.start === start && range.end === end) return;
+  throw rangeUnsatisfied(
+    `A ranged read of the file's tail asked for its last ${wanted} bytes and received bytes ${range.start}-${range.end} of ${size}`,
+  );
+}
+
+/** One typed refusal for every way a partial answer can contradict its request. */
+function rangeUnsatisfied(message: string): TavolatoError {
+  return new TavolatoError(message, "ERR_STORE_RANGE_UNSATISFIED");
 }
 
 /** Joins two byte runs into one. */

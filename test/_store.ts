@@ -113,6 +113,10 @@ export interface FakeQuirks {
   truncateTail?: boolean;
   /** Answer a partial GET with this `Content-Range` in place of the true one. */
   contentRange?: string;
+  /** Replace the total in an otherwise truthful `Content-Range`. */
+  contentRangeTotal?: number | "*";
+  /** Serve explicit ranges from this many bytes after the requested offset. */
+  shiftRanges?: number;
   /** Answer without an `ETag`, as a store with no entity tags to give does. */
   omitEtag?: boolean;
   /** Return an unexpected status as a response instead of throwing, unlike `uns3`. */
@@ -205,14 +209,19 @@ export class FakeS3 implements ParquetStoreClient {
     }
 
     const size = object.bytes.length;
-    const start = params.range.start ?? Math.max(0, size - (params.range.end ?? size));
-    const end =
+    const requestedStart = params.range.start ?? Math.max(0, size - (params.range.end ?? size));
+    const requestedEnd =
       params.range.start === undefined
         ? size - 1
         : Math.min(params.range.end ?? size - 1, size - 1);
-    if (start >= size || end < start) return this.#answer("GET", params, 416, null, headers);
+    if (requestedStart >= size || requestedEnd < requestedStart) {
+      return this.#answer("GET", params, 416, null, headers);
+    }
 
     const suffix = params.range.start === undefined;
+    const start = suffix ? requestedStart : requestedStart + (this.quirks.shiftRanges ?? 0);
+    const end = start + (requestedEnd - requestedStart);
+    if (start < 0 || end >= size) return this.#answer("GET", params, 416, null, headers);
     const truncate = suffix
       ? this.quirks.truncateTail === true
       : this.quirks.truncateRanges === true;
@@ -220,7 +229,9 @@ export class FakeS3 implements ParquetStoreClient {
     // range one byte short: both are less than what was asked for.
     const last = truncate ? (suffix ? start : Math.max(start, end - 1)) : end;
     if (this.quirks.omitContentRange !== true) {
-      headers["content-range"] = this.quirks.contentRange ?? `bytes ${start}-${last}/${size}`;
+      headers["content-range"] =
+        this.quirks.contentRange ??
+        `bytes ${start}-${last}/${this.quirks.contentRangeTotal ?? size}`;
     }
     return this.#answer("GET", params, 206, object.bytes.subarray(start, last + 1), headers);
   }
@@ -228,6 +239,9 @@ export class FakeS3 implements ParquetStoreClient {
   async head(params: HeadObjectParams): Promise<Response> {
     const object = this.#objects.get(this.#id(params.bucket, params.key));
     if (object === undefined) return this.#answer("HEAD", params, 404, null, {});
+    if (this.#mismatched(params.ifMatch, object.etag)) {
+      return this.#answer("HEAD", params, 412, null, {});
+    }
     const headers: Record<string, string> = {
       "etag": object.etag,
       "last-modified": object.lastModified,
