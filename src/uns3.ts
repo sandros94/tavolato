@@ -347,9 +347,9 @@ interface RemoteFooter {
  *
  * One thing is asked of that client, and only by the ranged path: its `get` has
  * to hand back a `206 Partial Content` rather than treat it as a failure, since
- * that is the correct answer to the `Range` header the store just sent. A
- * client that refuses one throws its own error, untouched, out of `get` and
- * `head` — see the store's tests for where `uns3` 0.0.7 stands on this.
+ * that is the correct answer to the `Range` header the store just sent — `uns3`
+ * within the declared peer range does. A client that refuses one throws its own
+ * error, untouched, out of `get` and `head`.
  *
  * @example
  * import { S3Client } from "uns3";
@@ -360,6 +360,13 @@ interface RemoteFooter {
  * const schema = defineSchema({ at: { type: "timestamp" }, n: { type: "i64" } });
  *
  * await store.put("events/2026-08-22.parquet", { schema, rows: [{ at: Date.now(), n: 1n }] });
+ *
+ * @example
+ * // A writer already in hand works too: the store finishes it, asynchronous
+ * // codec and all.
+ * const writer = createWriter(schema);
+ * writer.append({ at: Date.now(), n: 2n });
+ * await store.put("events/2026-08-22.parquet", writer);
  *
  * @example
  * // One column of one row group: the rest of the object is never transferred.

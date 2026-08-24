@@ -319,13 +319,18 @@ The optional `tavolato/uns3` subpath puts Parquet in the middle of an [`uns3`](h
 
 ```ts
 import { S3Client } from "uns3";
-import { defineSchema } from "tavolato";
+import { createWriter, defineSchema } from "tavolato";
 import { createParquetStore } from "tavolato/uns3";
 
 const store = createParquetStore(new S3Client({/* … */}), { bucket: "metrics" });
 const schema = defineSchema({ at: { type: "timestamp" }, n: { type: "i64" } });
 
 await store.put("events/2026-08-24.parquet", { schema, rows: [{ at: Date.now(), n: 1n }] });
+
+// …or hand over a writer you have been appending to — the store finishes it.
+const writer = createWriter(schema);
+writer.append({ at: Date.now(), n: 2n });
+await store.put("events/2026-08-25.parquet", writer);
 
 const { size, rowCount, groupCount } = await store.head("events/2026-08-24.parquet");
 const { rows } = await store.get("events/2026-08-24.parquet", { columns: ["n"], groups: [0] });
@@ -349,9 +354,6 @@ The factory takes defaults; every one of them is overridable per call, and `code
 | `tailBytes` | Bytes read from the end of an object when a read needs the footer. Defaults to 64 KiB; a larger footer costs one extra request, never a wrong answer. |
 
 Per call, `get` also takes `uns3`'s own get parameters (minus `key` and `range`, which the store owns) and `put` takes `uns3`'s put parameters plus `writer`. An index the file does not have, a repeated one, or an empty `groups` list is `ERR_READ_OPTION_INVALID`.
-
-> [!IMPORTANT]
-> A ranged read needs a client whose `get` treats `206 Partial Content` as the answer rather than a failure — which is the correct answer to the `Range` header the store just sent. `uns3` **0.0.7** checks every response against a hard-coded `[200, 304]` and throws an `S3Error` for the 206 it asked for, so `head` and any narrowed `get` cannot run on it yet. The store already sends `expectedStatus: [200, 206]` and works the moment a client honours it; whole-object `get`, `put`, `del` and `list` are unaffected today.
 
 For a single upload with no store around it, `putParquet` is the one call that predates the store:
 
