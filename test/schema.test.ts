@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { createWriter, defineSchema, isTavolatoError, TavolatoError } from "../src/index.ts";
+import {
+  createWriter,
+  decimal,
+  defineSchema,
+  isTavolatoError,
+  TavolatoError,
+  uuid,
+} from "../src/index.ts";
 import { expectError } from "./_errors.ts";
 
 describe("defineSchema", () => {
@@ -19,7 +26,9 @@ describe("defineSchema", () => {
       s: { type: "string" },
       j: { type: "json" },
       f: { type: "f64" },
+      g: { type: "f32" },
       i: { type: "i64" },
+      n: { type: "i32" },
       b: { type: "bool" },
       t: { type: "timestamp" },
     });
@@ -27,10 +36,41 @@ describe("defineSchema", () => {
       "string",
       "json",
       "f64",
+      "f32",
       "i64",
+      "i32",
       "bool",
       "timestamp",
     ]);
+  });
+
+  it("accepts a logical column type, and carries its byte width", () => {
+    const id = uuid();
+    const schema = defineSchema({ id: { type: id }, price: { type: decimal({ precision: 9 }) } });
+    expect(schema.columns[0]).toEqual({ name: "id", type: id, optional: false, typeLength: 16 });
+    // Only a FIXED_LEN_BYTE_ARRAY has a width, so nothing else grows the key.
+    expect(schema.columns[1]).toEqual({
+      name: "price",
+      type: schema.definition.price.type,
+      optional: false,
+    });
+    expect(Object.hasOwn(schema.columns[1], "typeLength")).toBe(false);
+  });
+
+  it("refuses an object that is not a column type", () => {
+    for (const type of [
+      {},
+      { name: "x" },
+      { name: "x", physical: "i128", matches: () => true },
+      { name: "x", physical: "fixed", matches: () => true, annotate: () => ({ kind: "uuid" }) },
+      { name: "x", physical: "i32", annotate: () => ({ kind: "date" }) },
+    ]) {
+      const error = expectError("ERR_SCHEMA_COLUMN_INVALID", () =>
+        // @ts-expect-error deliberately wrong input
+        defineSchema({ c: { type } }),
+      );
+      expect(error.column).toBe("c");
+    }
   });
 
   it("refuses a schema with no columns", () => {
@@ -74,13 +114,15 @@ describe("row validation", () => {
     s: { type: "string" },
     j: { type: "json" },
     f: { type: "f64" },
+    g: { type: "f32" },
     i: { type: "i64" },
+    n: { type: "i32" },
     b: { type: "bool" },
     t: { type: "timestamp" },
     opt: { type: "string", optional: true },
   });
 
-  const valid = { s: "x", j: "{}", f: 1, i: 1n, b: true, t: 0 } as const;
+  const valid = { s: "x", j: "{}", f: 1, g: 1, i: 1n, n: 1, b: true, t: 0 } as const;
 
   it("accepts a well-formed row", () => {
     const writer = createWriter(schema);
@@ -125,10 +167,18 @@ describe("row validation", () => {
     ["j", 1],
     ["f", "1"],
     ["f", 1n],
+    ["g", "1"],
+    ["g", 1n],
     ["i", "1"],
     ["i", 1.5],
     ["i", Number.NaN],
     ["i", 2 ** 60],
+    ["n", "1"],
+    ["n", 1n],
+    ["n", 1.5],
+    ["n", Number.NaN],
+    ["n", 2 ** 31],
+    ["n", -(2 ** 31) - 1],
     ["b", 1],
     ["t", "2024-01-01"],
     ["t", 1.5],
@@ -151,6 +201,12 @@ describe("row validation", () => {
     const writer = createWriter(schema);
     expect(() => writer.append({ ...valid, i: 2n ** 63n - 1n })).not.toThrow();
     expect(() => writer.append({ ...valid, i: -(2n ** 63n) })).not.toThrow();
+  });
+
+  it("accepts the signed 32-bit extremes", () => {
+    const writer = createWriter(schema);
+    expect(() => writer.append({ ...valid, n: 2 ** 31 - 1 })).not.toThrow();
+    expect(() => writer.append({ ...valid, n: -(2 ** 31) })).not.toThrow();
   });
 
   it("leaves the writer untouched when a row is rejected", () => {

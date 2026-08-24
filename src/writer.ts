@@ -5,6 +5,8 @@ import {
   CODEC_IDS,
   codecId,
   type ColumnChunkMeta,
+  columnPhysical,
+  columnTypeName,
   CompressionCodec,
   encodeDataPageHeader,
   encodeFileMetadata,
@@ -12,8 +14,9 @@ import {
   MAX_DEFINITION_LEVEL_BIT_WIDTH,
   type RowGroupMeta,
 } from "./internal/format.ts";
-import { TavolatoError } from "./error.ts";
+import { describe, TavolatoError } from "./error.ts";
 import type {
+  AnyLogicalAdapter,
   ParquetSchema,
   Row,
   SchemaColumn,
@@ -27,6 +30,8 @@ const DEFAULT_CREATED_BY = "tavolato";
 
 const INT64_MIN = -(2n ** 63n);
 const INT64_MAX = 2n ** 63n - 1n;
+const INT32_MIN = -(2 ** 31);
+const INT32_MAX = 2 ** 31 - 1;
 
 /**
  * `PageHeader` stores page sizes as signed 32-bit integers, so a page body may
@@ -42,8 +47,11 @@ const MAX_ROWS_PER_GROUP = 0x7f_ff_ff_ff;
 /** A validated value on its way into a column buffer; `null` means "no value". */
 type StagedValue =
   | { readonly kind: "bytes"; readonly value: Uint8Array }
+  | { readonly kind: "fixed"; readonly value: Uint8Array }
   | { readonly kind: "f64"; readonly value: number }
+  | { readonly kind: "f32"; readonly value: number }
   | { readonly kind: "i64"; readonly value: bigint }
+  | { readonly kind: "i32"; readonly value: number }
   | { readonly kind: "bool"; readonly value: boolean }
   | null;
 
@@ -58,26 +66,11 @@ interface ColumnState {
 }
 
 function createColumnState(column: SchemaColumn): ColumnState {
-  let values: ColumnValues;
-  switch (column.type) {
-    case "string":
-    case "json": {
-      values = { kind: "bytes", items: [] };
-      break;
-    }
-    case "f64": {
-      values = { kind: "f64", items: [] };
-      break;
-    }
-    case "bool": {
-      values = { kind: "bool", items: [] };
-      break;
-    }
-    default: {
-      // i64 and timestamp both land on INT64.
-      values = { kind: "i64", items: [] };
-    }
-  }
+  const physical = columnPhysical(column.type);
+  const values: ColumnValues =
+    physical === "fixed"
+      ? { kind: physical, typeLength: column.typeLength ?? 0, items: [] }
+      : { kind: physical, items: [] };
   return { column, values, levels: [], nullCount: 0, byteArraySize: 0 };
 }
 
@@ -88,36 +81,9 @@ function resetColumnState(state: ColumnState): void {
   state.byteArraySize = 0;
 }
 
-/** Renders an offending value for an error message, without ever stringifying an object. */
-function describe(value: unknown): string {
-  if (value === null) return "null";
-  switch (typeof value) {
-    case "undefined": {
-      return "undefined";
-    }
-    case "bigint": {
-      return `${value}n`;
-    }
-    case "string": {
-      return JSON.stringify(value);
-    }
-    case "number":
-    case "boolean": {
-      return String(value);
-    }
-    case "symbol": {
-      return value.toString();
-    }
-    default: {
-      // object and function
-      return Object.prototype.toString.call(value);
-    }
-  }
-}
-
 function invalid(column: SchemaColumn, value: unknown, expected: string): TavolatoError {
   return new TavolatoError(
-    `Column "${column.name}" of type ${column.type} expects ${expected}, received ${describe(
+    `Column "${column.name}" of type ${columnTypeName(column.type)} expects ${expected}, received ${describe(
       value,
     )}`,
     "ERR_ROW_VALUE_INVALID",
@@ -158,7 +124,18 @@ function toEpochMillis(column: SchemaColumn, value: unknown): bigint {
   throw invalid(column, value, "a Date or integer epoch milliseconds");
 }
 
-function stage(column: SchemaColumn, value: unknown, present: boolean): StagedValue {
+function toInt32(column: SchemaColumn, value: unknown): number {
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    throw invalid(column, value, "an integer number");
+  }
+  if (value < INT32_MIN || value > INT32_MAX) {
+    throw invalid(column, value, "a value within the signed 32-bit range");
+  }
+  return value;
+}
+
+function stage(state: ColumnState, value: unknown, present: boolean): StagedValue {
+  const { column } = state;
   if (value === null || value === undefined) {
     if (!column.optional) {
       throw new TavolatoError(
@@ -171,7 +148,11 @@ function stage(column: SchemaColumn, value: unknown, present: boolean): StagedVa
     }
     return null;
   }
-  switch (column.type) {
+  const { type } = column;
+  // An adapter column runs the caller's transform first, then holds what comes
+  // back to the physical type it promised. Nulls never get this far.
+  if (typeof type !== "string") return stageRaw(state, type, adapt(column, type, value));
+  switch (type) {
     case "string":
     case "json": {
       // A `json` value is a string end to end: tavolato never parses it, never
@@ -184,6 +165,12 @@ function stage(column: SchemaColumn, value: unknown, present: boolean): StagedVa
       if (typeof value !== "number") throw invalid(column, value, "a number");
       return { kind: "f64", value };
     }
+    case "f32": {
+      // Stored at single precision, so this is the one built-in type whose
+      // value is rounded on the way in — once, here, and never again.
+      if (typeof value !== "number") throw invalid(column, value, "a number");
+      return { kind: "f32", value };
+    }
     case "bool": {
       if (typeof value !== "boolean") throw invalid(column, value, "a boolean");
       return { kind: "bool", value };
@@ -191,8 +178,84 @@ function stage(column: SchemaColumn, value: unknown, present: boolean): StagedVa
     case "i64": {
       return { kind: "i64", value: toInt64(column, value) };
     }
+    case "i32": {
+      return { kind: "i32", value: toInt32(column, value) };
+    }
     default: {
       return { kind: "i64", value: toEpochMillis(column, value) };
+    }
+  }
+}
+
+/** Runs an adapter's `write`, turning anything it throws into a typed error. */
+function adapt(column: SchemaColumn, adapter: AnyLogicalAdapter, value: unknown): unknown {
+  try {
+    return adapter.write(value);
+  } catch (cause) {
+    throw new TavolatoError(
+      `Column "${column.name}" of type ${adapter.name} rejected a value: ${
+        cause instanceof Error ? cause.message : describe(cause)
+      }`,
+      "ERR_ROW_VALUE_INVALID",
+      column.name,
+      cause,
+    );
+  }
+}
+
+/**
+ * Checks that what an adapter handed back is the physical value it said it
+ * would produce, and stages it.
+ *
+ * The same courtesy the codec hooks get: a hook is a caller's function, and
+ * the type it promises is not the type it delivers. Writing an unchecked
+ * `undefined` into a `DataView` would silently store a zero instead.
+ *
+ * The check is against the *buffer* the value is about to land in, resolved
+ * once when the column state was built, rather than against what the adapter
+ * says its physical type is now — the same reason the codec's id is resolved in
+ * the constructor.
+ */
+function stageRaw(state: ColumnState, adapter: AnyLogicalAdapter, raw: unknown): StagedValue {
+  const { column, values } = state;
+  const returned = (expected: string): TavolatoError =>
+    new TavolatoError(
+      `Column "${column.name}" of type ${adapter.name} returned ${describe(raw)} where ${expected} was expected`,
+      "ERR_ROW_VALUE_INVALID",
+      column.name,
+    );
+
+  switch (values.kind) {
+    case "bytes": {
+      if (!(raw instanceof Uint8Array)) throw returned("bytes");
+      return { kind: "bytes", value: raw };
+    }
+    case "fixed": {
+      if (!(raw instanceof Uint8Array) || raw.length !== values.typeLength) {
+        throw returned(`exactly ${values.typeLength} bytes`);
+      }
+      return { kind: "fixed", value: raw };
+    }
+    case "bool": {
+      if (typeof raw !== "boolean") throw returned("a boolean");
+      return { kind: "bool", value: raw };
+    }
+    case "f64":
+    case "f32": {
+      if (typeof raw !== "number") throw returned("a number");
+      return { kind: values.kind, value: raw };
+    }
+    case "i32": {
+      if (typeof raw !== "number" || !Number.isInteger(raw) || raw < INT32_MIN || raw > INT32_MAX) {
+        throw returned("a signed 32-bit integer");
+      }
+      return { kind: "i32", value: raw };
+    }
+    default: {
+      if (typeof raw !== "bigint" || raw < INT64_MIN || raw > INT64_MAX) {
+        throw returned("a signed 64-bit integer");
+      }
+      return { kind: "i64", value: raw };
     }
   }
 }
@@ -229,8 +292,17 @@ function projectedPageSize(state: ColumnState, staged: StagedValue): number {
         (staged !== null && staged.kind === "bytes" ? 4 + staged.value.length : 0);
       break;
     }
+    case "fixed": {
+      bytes = valueCount * values.typeLength;
+      break;
+    }
     case "bool": {
       bytes = Math.ceil(valueCount / 8);
+      break;
+    }
+    case "i32":
+    case "f32": {
+      bytes = valueCount * 4;
       break;
     }
     default: {
@@ -395,8 +467,9 @@ export class ParquetWriter<TDefinition extends SchemaDefinition = SchemaDefiniti
     // leave the column buffers holding a partial row.
     const staged = this.#staged;
     for (let index = 0; index < this.#states.length; index++) {
-      const column = this.#states[index].column;
-      staged[index] = stage(column, record[column.name], Object.hasOwn(record, column.name));
+      const state = this.#states[index];
+      const { name } = state.column;
+      staged[index] = stage(state, record[name], Object.hasOwn(record, name));
     }
 
     // Page sizes are i32 fields, so no column chunk may grow past
@@ -443,6 +516,10 @@ export class ParquetWriter<TDefinition extends SchemaDefinition = SchemaDefiniti
    * Returns a promise under the same rule as {@link ParquetWriter.append}: only
    * when a codec deferred, and from then on the remaining rows are appended in
    * its continuation. The iterable is pulled lazily either way.
+   *
+   * The re-entry guard is **per row**, by design: an append that interleaves
+   * with an unawaited one lands whole or draws `ERR_WRITER_BUSY`, never half a
+   * row and never a torn file.
    */
   appendAll(rows: Iterable<Row<TDefinition>>): void | Promise<void> {
     const iterator = rows[Symbol.iterator]();

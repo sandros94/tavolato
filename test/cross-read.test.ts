@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { gunzipSync, zstdDecompressSync } from "node:zlib";
 import { afterAll, describe, expect, it } from "vitest";
-import { readParquet } from "../src/index.ts";
+import { date, decimal, integer, readParquet, time, timestamp, uuid } from "../src/index.ts";
 import type { CodecName, ReaderCodec } from "../src/index.ts";
 import { cleanupTempDir, duckdb, duckdbRow, sqlPath, tempDir } from "./_duckdb.ts";
 import { expectError } from "./_errors.ts";
@@ -111,6 +111,18 @@ describe("files DuckDB writes inside the subset", () => {
     const { schema, rows } = readParquet(bytes);
     expect(schema.columns.map((column) => column.name)).toEqual(["n"]);
     expect(rows).toEqual([]);
+  });
+
+  it("reads the narrower physical types the built-ins own", () => {
+    // DuckDB annotates an INTEGER with the deprecated INT_32, which says no
+    // more than the bare INT32 does — the same leniency as INT_64 on i64.
+    const bytes = copyTo(
+      "cross-narrow.parquet",
+      `SELECT i::INTEGER AS n, (i + 0.5)::FLOAT AS f FROM range(5) tbl(i)`,
+    );
+    const { schema, rows } = readParquet(bytes);
+    expect(schema.columns.map((column) => column.type)).toEqual(["i32", "f32"]);
+    expect(rows).toEqual(Array.from({ length: 5 }, (_, i) => ({ n: i, f: i + 0.5 })));
   });
 
   it("reads a JSON-annotated column as a json column of strings", () => {
@@ -230,12 +242,6 @@ describe("files DuckDB writes outside the subset", () => {
       names: "nested",
     },
     {
-      what: "INT32, which is not one of the column types",
-      file: "cross-int32.parquet",
-      select: `SELECT i::INTEGER AS n FROM range(5) tbl(i)`,
-      names: "INT_32",
-    },
-    {
       what: "microsecond timestamps",
       file: "cross-micros.parquet",
       select: `SELECT epoch_ms(1700000000000 + i)::TIMESTAMPTZ AS t FROM range(5) tbl(i)`,
@@ -269,4 +275,132 @@ describe("files DuckDB writes outside the subset", () => {
       expect(error.message).toContain("tavolato only reads the files it writes");
     });
   }
+});
+
+/**
+ * The annotated half of DuckDB's output. Each of these is refused until a
+ * column type claims it, and read value for value once one does — the same
+ * shape of promise the codec hooks make, for the same reason: tavolato will
+ * not decide what a `DECIMAL` should be in JavaScript, but it will not stand
+ * in the way either.
+ */
+describe("files DuckDB annotates, read with a matching column type", () => {
+  it("reads DATE, TIME, TIMESTAMP and UUID", () => {
+    const bytes = copyTo(
+      "cross-annotated.parquet",
+      `SELECT
+         (DATE '2026-08-24' + i::INTEGER) AS d,
+         (TIME '12:34:56.789012' + INTERVAL (i) SECOND) AS t,
+         (TIMESTAMP '2026-01-01 03:04:05.123456' + INTERVAL (i) SECOND) AS ts,
+         (TIMESTAMPTZ '2026-01-01 03:04:05.123456+00' + INTERVAL (i) SECOND) AS tstz,
+         ('b3f2c1a0-1111-4222-8333-44445555666' || i)::UUID AS u
+       FROM range(3) tbl(i)`,
+    );
+    const types = [date(), time({ unit: "micros" }), timestamp({ unit: "micros" }), uuid()];
+
+    const refusal = expectError("ERR_READ_UNSUPPORTED", () => readParquet(bytes));
+    expect(refusal.message).toContain("pass a matching type in ReadOptions.types");
+
+    const { schema, rows } = readParquet(bytes, { types });
+    expect(schema.columns.map((column) => (column.type as { name: string }).name)).toEqual([
+      "date",
+      "time(micros)",
+      "timestamp(micros)",
+      "timestamp(micros)",
+      "uuid",
+    ]);
+    // The naive TIMESTAMP and the TIMESTAMPTZ differ only in a flag neither
+    // the count nor this reading depends on.
+    expect(rows).toEqual(
+      Array.from({ length: 3 }, (_, i) => ({
+        d: new Date(Date.UTC(2026, 7, 24 + i)),
+        t: 45_296_789_012n + BigInt(i) * 1_000_000n,
+        ts: 1_767_236_645_123_456n + BigInt(i) * 1_000_000n,
+        tstz: 1_767_236_645_123_456n + BigInt(i) * 1_000_000n,
+        u: `b3f2c1a0-1111-4222-8333-44445555666${i}`,
+      })),
+    );
+  });
+
+  it("reads a DECIMAL at each of the three widths DuckDB stores them in", () => {
+    const bytes = copyTo(
+      "cross-decimals.parquet",
+      `SELECT
+         (i + 0.25)::DECIMAL(9, 2) AS small,
+         (i + 0.25)::DECIMAL(18, 2) AS medium,
+         (i + 0.25)::DECIMAL(30, 2) AS large
+       FROM range(3) tbl(i)`,
+    );
+    const types = [
+      decimal({ precision: 9, scale: 2 }),
+      decimal({ precision: 18, scale: 2 }),
+      decimal({ precision: 30, scale: 2 }),
+    ];
+    const { schema, rows } = readParquet(bytes, { types });
+    // Three precisions, three physical types, one JavaScript type.
+    expect(schema.columns.map((column) => column.typeLength)).toEqual([undefined, undefined, 16]);
+    expect(rows).toEqual(
+      Array.from({ length: 3 }, (_, i) => ({
+        small: `${i}.25`,
+        medium: `${i}.25`,
+        large: `${i}.25`,
+      })),
+    );
+  });
+
+  it("reads every signed and unsigned integer width", () => {
+    const bytes = copyTo(
+      "cross-integers.parquet",
+      `SELECT
+         (i - 1)::TINYINT AS i8, (i - 1)::SMALLINT AS i16, (i - 1)::INTEGER AS i32,
+         (i - 1)::BIGINT AS i64, i::UTINYINT AS u8, i::USMALLINT AS u16,
+         i::UINTEGER AS u32, i::UBIGINT AS u64
+       FROM range(3) tbl(i)`,
+    );
+    const types = [
+      integer({ bitWidth: 8 }),
+      integer({ bitWidth: 16 }),
+      integer({ bitWidth: 8, signed: false }),
+      integer({ bitWidth: 16, signed: false }),
+      integer({ bitWidth: 32, signed: false }),
+      integer({ bitWidth: 64, signed: false }),
+    ];
+    const { schema, rows } = readParquet(bytes, { types });
+    // i32 and i64 keep their built-in reading: the annotation DuckDB puts on
+    // them says no more than the physical type already does.
+    expect(schema.columns.map((column) => column.type).slice(2, 4)).toEqual(["i32", "i64"]);
+    expect(rows).toEqual(
+      Array.from({ length: 3 }, (_, i) => ({
+        i8: i - 1,
+        i16: i - 1,
+        i32: i - 1,
+        i64: BigInt(i - 1),
+        u8: i,
+        u16: i,
+        u32: i,
+        u64: BigInt(i),
+      })),
+    );
+  });
+
+  it("reads an annotated column out of a compressed file", () => {
+    const bytes = copyTo(
+      "cross-annotated-gzip.parquet",
+      `SELECT (DATE '2026-08-24' + i::INTEGER) AS d, (i + 0.25)::DECIMAL(18, 2) AS n
+       FROM range(50) tbl(i)`,
+      "COMPRESSION GZIP",
+    );
+    const { rows } = sync(
+      readParquet(bytes, {
+        codecs: { GZIP: { decompress: (page) => gunzipSync(page) } },
+        types: [date(), decimal({ precision: 18, scale: 2 })],
+      }),
+    );
+    expect(rows).toEqual(
+      Array.from({ length: 50 }, (_, i) => ({
+        d: new Date(Date.UTC(2026, 7, 24 + i)),
+        n: `${i}.25`,
+      })),
+    );
+  });
 });

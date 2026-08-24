@@ -21,6 +21,7 @@ export type TavolatoErrorCode =
   | "ERR_WRITER_BUSY" // used again before the promise a previous call returned settled
   | "ERR_WRITER_CODEC_FAILED" // the compression hook threw, rejected, or returned something unusable
   // File reading
+  | "ERR_READ_OPTION_INVALID" // bad `readParquet` option
   | "ERR_READ_MALFORMED" // the bytes are not a well-formed Parquet file
   | "ERR_READ_UNSUPPORTED" // well-formed Parquet, but outside the subset tavolato writes
   | (string & {}); // forward-compatible escape hatch
@@ -58,6 +59,38 @@ export class TavolatoError<TCode extends TavolatoErrorCode = TavolatoErrorCode> 
 }
 
 /**
+ * Renders an offending value for an error message, without ever stringifying
+ * an object: a message about a bad value must not run somebody's `toString`.
+ *
+ * @internal
+ */
+export function describe(value: unknown): string {
+  if (value === null) return "null";
+  switch (typeof value) {
+    case "undefined": {
+      return "undefined";
+    }
+    case "bigint": {
+      return `${value}n`;
+    }
+    case "string": {
+      return JSON.stringify(value);
+    }
+    case "number":
+    case "boolean": {
+      return String(value);
+    }
+    case "symbol": {
+      return value.toString();
+    }
+    default: {
+      // object and function
+      return Object.prototype.toString.call(value);
+    }
+  }
+}
+
+/**
  * The bytes are not a well-formed Parquet file: wrong magic, a truncated
  * stream, a length that does not fit, a structure that contradicts itself.
  *
@@ -72,20 +105,33 @@ export function malformed(message: string, column?: string, cause?: unknown): Ta
  * therefore refuses to read. `found` names the offending feature; the rest of
  * the sentence — the scope promise — is worded here, once.
  *
- * `remedy` is appended where the refusal is one the caller can lift, which
- * today means registering a decompressor for a codec tavolato knows by name but
- * cannot implement.
+ * `remedy` is appended where the refusal is one the caller can lift: a codec
+ * tavolato knows by name but cannot implement, or an annotation whose
+ * JavaScript type is a decision only the caller can make.
  *
  * @internal
  */
 export function unsupported(found: string, column?: string, remedy?: string): TavolatoError {
   return new TavolatoError(
-    `Cannot read ${found}: tavolato only reads the files it writes — flat schemas of string, json, f64, i64, bool and timestamp columns, PLAIN encoded, UNCOMPRESSED, in v1 data pages${
+    `Cannot read ${found}: tavolato only reads the files it writes — flat schemas of string, json, f64, f32, i64, i32, bool and timestamp columns, PLAIN encoded, UNCOMPRESSED, in v1 data pages${
       remedy === undefined ? "" : ` — ${remedy}`
     }`,
     "ERR_READ_UNSUPPORTED",
     column,
   );
+}
+
+/** The remedy for a column whose meaning is a decision only the caller can make. */
+export const TYPES_REMEDY: string = "pass a matching type in ReadOptions.types to read it anyway";
+
+/**
+ * Something handed to `readParquet` in its options cannot be used as given —
+ * as opposed to the *file* being unreadable, which is what the other two say.
+ *
+ * @internal
+ */
+export function badOption(message: string, column?: string, cause?: unknown): TavolatoError {
+  return new TavolatoError(message, "ERR_READ_OPTION_INVALID", column, cause);
 }
 
 /**

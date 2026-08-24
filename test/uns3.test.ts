@@ -99,10 +99,18 @@ describe("export map", () => {
       "ParquetWriter",
       "TavolatoError",
       "createWriter",
+      "date",
+      "decimal",
+      "defineColumnType",
       "defineSchema",
+      "float16",
+      "integer",
       "isTavolatoError",
       "readParquet",
       "readSchema",
+      "time",
+      "timestamp",
+      "uuid",
     ]);
   });
 });

@@ -1,6 +1,17 @@
 import { gzipSync, zstdCompressSync } from "node:zlib";
 import { afterAll, describe, expect, it } from "vitest";
-import { createWriter, defineSchema, TavolatoError } from "../src/index.ts";
+import {
+  createWriter,
+  date,
+  decimal,
+  defineSchema,
+  float16,
+  integer,
+  TavolatoError,
+  time,
+  timestamp,
+  uuid,
+} from "../src/index.ts";
 import type { WriterCodec } from "../src/index.ts";
 import { cleanupTempDir, duckdb, duckdbRow, sqlPath, writeParquet } from "./_duckdb.ts";
 import { sync } from "./_sync.ts";
@@ -37,6 +48,23 @@ describe("value round-trips", () => {
     ).toEqual([
       { s: "alpha", f: 1.5, i: 42, b: true, t: 1_700_000_000_000 },
       { s: "beta", f: -0.25, i: -7, b: false, t: 1_700_000_001_500 },
+    ]);
+  });
+
+  it("round-trips the narrower numeric types", () => {
+    const schema = defineSchema({ n: { type: "i32" }, f: { type: "f32" } });
+    const writer = createWriter(schema);
+    writer.append({ n: -(2 ** 31), f: 0.5 });
+    writer.append({ n: 2 ** 31 - 1, f: -0.25 });
+    const path = emit("narrow.parquet", writer.finish());
+
+    // The physical types are the narrow ones, not a widening of i64/f64.
+    expect(
+      duckdb(`DESCRIBE SELECT * FROM read_parquet(${path});`).map((row) => row.column_type),
+    ).toEqual(["INTEGER", "FLOAT"]);
+    expect(duckdb(`SELECT n, f FROM read_parquet(${path}) ORDER BY n;`)).toEqual([
+      { n: -2_147_483_648, f: 0.5 },
+      { n: 2_147_483_647, f: -0.25 },
     ]);
   });
 
@@ -342,6 +370,306 @@ describe("json columns", () => {
     expect(duckdbRow(`SELECT count(maybe) AS present FROM read_parquet(${path()});`)).toEqual({
       present: 2,
     });
+  });
+});
+
+/**
+ * The other half of the adapter story: DuckDB reads what the in-box column
+ * types write, as the type they claim to be. `parquet_schema` proves the
+ * annotation is the one the format prescribes; `DESCRIBE` proves a reader that
+ * is not tavolato acts on it.
+ */
+describe("logical column types", () => {
+  const schema = defineSchema({
+    k: { type: "i64" },
+    d: { type: date() },
+    small: { type: decimal({ precision: 9, scale: 2 }) },
+    medium: { type: decimal({ precision: 18, scale: 4 }) },
+    large: { type: decimal({ precision: 38, scale: 6 }) },
+    id: { type: uuid() },
+    clock: { type: time({ unit: "millis" }) },
+    precise: { type: time({ unit: "micros" }) },
+    at: { type: timestamp({ unit: "micros" }) },
+    half: { type: float16() },
+    i8: { type: integer({ bitWidth: 8 }) },
+    i16: { type: integer({ bitWidth: 16 }) },
+    u8: { type: integer({ bitWidth: 8, signed: false }) },
+    u32: { type: integer({ bitWidth: 32, signed: false }) },
+    u64: { type: integer({ bitWidth: 64, signed: false }) },
+    maybe: { type: uuid(), optional: true },
+  });
+
+  function path(): string {
+    const writer = createWriter(schema);
+    for (let index = 0; index < 3; index++) {
+      writer.append({
+        k: BigInt(index),
+        d: new Date(Date.UTC(2026, 7, 24 + index)),
+        small: `${index}.25`,
+        medium: `-${index}.0001`,
+        large: `12345678901234567890123456789012.${index}00000`,
+        id: `b3f2c1a0-1111-4222-8333-44445555666${index}`,
+        clock: 45_296_789 + index,
+        precise: 45_296_789_012n + BigInt(index),
+        at: 1_767_236_645_123_456n + BigInt(index),
+        half: 1.5 * index,
+        i8: index - 128,
+        i16: index - 32_768,
+        u8: 255 - index,
+        u32: 4_294_967_295 - index,
+        u64: 18_446_744_073_709_551_615n - BigInt(index),
+        maybe: index % 2 === 0 ? null : `00000000-0000-0000-0000-00000000000${index}`,
+      });
+    }
+    return emit("logical.parquet", writer.finish());
+  }
+
+  it("declares the physical and logical types the format prescribes", () => {
+    expect(
+      duckdb(
+        `SELECT name, type, type_length, converted_type, scale, precision, logical_type
+         FROM parquet_schema(${path()}) WHERE num_children IS NULL;`,
+      ),
+    ).toEqual([
+      {
+        name: "k",
+        type: "INT64",
+        type_length: null,
+        converted_type: null,
+        scale: null,
+        precision: null,
+        logical_type: null,
+      },
+      {
+        name: "d",
+        type: "INT32",
+        type_length: null,
+        converted_type: "DATE",
+        scale: null,
+        precision: null,
+        logical_type: "DateType()",
+      },
+      {
+        name: "small",
+        type: "INT32",
+        type_length: null,
+        converted_type: "DECIMAL",
+        scale: 2,
+        precision: 9,
+        logical_type: "DecimalType(scale=2, precision=9)",
+      },
+      {
+        name: "medium",
+        type: "INT64",
+        type_length: null,
+        converted_type: "DECIMAL",
+        scale: 4,
+        precision: 18,
+        logical_type: "DecimalType(scale=4, precision=18)",
+      },
+      {
+        name: "large",
+        type: "FIXED_LEN_BYTE_ARRAY",
+        type_length: "16",
+        converted_type: "DECIMAL",
+        scale: 6,
+        precision: 38,
+        logical_type: "DecimalType(scale=6, precision=38)",
+      },
+      {
+        name: "id",
+        type: "FIXED_LEN_BYTE_ARRAY",
+        type_length: "16",
+        converted_type: null,
+        scale: null,
+        precision: null,
+        logical_type: "UUIDType()",
+      },
+      {
+        name: "clock",
+        type: "INT32",
+        type_length: null,
+        converted_type: "TIME_MILLIS",
+        scale: null,
+        precision: null,
+        logical_type:
+          "TimeType(isAdjustedToUTC=0, unit=TimeUnit(MILLIS=MilliSeconds(), MICROS=<null>, NANOS=<null>))",
+      },
+      {
+        name: "precise",
+        type: "INT64",
+        type_length: null,
+        converted_type: "TIME_MICROS",
+        scale: null,
+        precision: null,
+        logical_type:
+          "TimeType(isAdjustedToUTC=0, unit=TimeUnit(MILLIS=<null>, MICROS=MicroSeconds(), NANOS=<null>))",
+      },
+      {
+        name: "at",
+        type: "INT64",
+        type_length: null,
+        converted_type: "TIMESTAMP_MICROS",
+        scale: null,
+        precision: null,
+        logical_type:
+          "TimestampType(isAdjustedToUTC=1, unit=TimeUnit(MILLIS=<null>, MICROS=MicroSeconds(), NANOS=<null>))",
+      },
+      {
+        name: "half",
+        type: "FIXED_LEN_BYTE_ARRAY",
+        type_length: "2",
+        converted_type: null,
+        scale: null,
+        precision: null,
+        logical_type: "Float16Type()",
+      },
+      {
+        name: "i8",
+        type: "INT32",
+        type_length: null,
+        converted_type: "INT_8",
+        scale: null,
+        precision: null,
+        logical_type: "IntType(bitWidth=\b, isSigned=1)",
+      },
+      {
+        name: "i16",
+        type: "INT32",
+        type_length: null,
+        converted_type: "INT_16",
+        scale: null,
+        precision: null,
+        logical_type: "IntType(bitWidth=, isSigned=1)",
+      },
+      {
+        name: "u8",
+        type: "INT32",
+        type_length: null,
+        converted_type: "UINT_8",
+        scale: null,
+        precision: null,
+        logical_type: "IntType(bitWidth=\b, isSigned=0)",
+      },
+      {
+        name: "u32",
+        type: "INT32",
+        type_length: null,
+        converted_type: "UINT_32",
+        scale: null,
+        precision: null,
+        logical_type: "IntType(bitWidth= , isSigned=0)",
+      },
+      {
+        name: "u64",
+        type: "INT64",
+        type_length: null,
+        converted_type: "UINT_64",
+        scale: null,
+        precision: null,
+        logical_type: "IntType(bitWidth=@, isSigned=0)",
+      },
+      {
+        name: "maybe",
+        type: "FIXED_LEN_BYTE_ARRAY",
+        type_length: "16",
+        converted_type: null,
+        scale: null,
+        precision: null,
+        logical_type: "UUIDType()",
+      },
+    ]);
+  });
+
+  it("gives DuckDB the types it names, not bytes to interpret", () => {
+    expect(
+      duckdb(`DESCRIBE SELECT * FROM read_parquet(${path()});`).map((row) => row.column_type),
+    ).toEqual([
+      "BIGINT",
+      "DATE",
+      "DECIMAL(9,2)",
+      "DECIMAL(18,4)",
+      "DECIMAL(38,6)",
+      "UUID",
+      "TIME",
+      "TIME",
+      "TIMESTAMP WITH TIME ZONE",
+      "FLOAT",
+      "TINYINT",
+      "SMALLINT",
+      "UTINYINT",
+      "UINTEGER",
+      "UBIGINT",
+      "UUID",
+    ]);
+  });
+
+  it("agrees with DuckDB on every value", () => {
+    expect(
+      duckdb(`
+      SELECT
+        k, d::VARCHAR AS d, small::VARCHAR AS small, medium::VARCHAR AS medium,
+        large::VARCHAR AS large, id::VARCHAR AS id, clock::VARCHAR AS clock,
+        precise::VARCHAR AS precise, epoch_us("at") AS at, half,
+        i8, i16, u8, u32, u64::VARCHAR AS u64, maybe::VARCHAR AS maybe
+      FROM read_parquet(${path()}) ORDER BY k;
+    `),
+    ).toEqual(
+      Array.from({ length: 3 }, (_, index) => ({
+        k: index,
+        d: `2026-08-${24 + index}`,
+        small: `${index}.25`,
+        medium: `-${index}.0001`,
+        large: `12345678901234567890123456789012.${index}00000`,
+        id: `b3f2c1a0-1111-4222-8333-44445555666${index}`,
+        // 45_296_789 ms and 45_296_789_012 µs are the same instant of the day;
+        // DuckDB prints a TIME without its trailing zeroes.
+        clock: ["12:34:56.789", "12:34:56.79", "12:34:56.791"][index],
+        precise: `12:34:56.78901${2 + index}`,
+        at: 1_767_236_645_123_456 + index,
+        half: 1.5 * index,
+        i8: index - 128,
+        i16: index - 32_768,
+        u8: 255 - index,
+        u32: 4_294_967_295 - index,
+        u64: (18_446_744_073_709_551_615n - BigInt(index)).toString(),
+        maybe: index % 2 === 0 ? null : `00000000-0000-0000-0000-00000000000${index}`,
+      })),
+    );
+  });
+
+  it("stays readable through a codec", () => {
+    // Adapters transform values, codecs transform the page those values land
+    // in, and neither knows about the other — DuckDB is the one asked to agree.
+    const compressed = defineSchema({
+      d: { type: date() },
+      n: { type: decimal({ precision: 12, scale: 2 }) },
+      id: { type: uuid() },
+    });
+    const writer = createWriter(compressed, { codec: { name: "GZIP", compress: gzipSync } });
+    for (let index = 0; index < 40; index++) {
+      sync(
+        writer.append({
+          d: new Date(Date.UTC(2026, 0, 1 + index)),
+          n: `${index}.50`,
+          id: `b3f2c1a0-1111-4222-8333-4444555566${String(index).padStart(2, "0")}`,
+        }),
+      );
+    }
+    const path = emit("logical-gzip.parquet", writer.finish());
+
+    expect(duckdb(`SELECT DISTINCT compression FROM parquet_metadata(${path});`)).toEqual([
+      { compression: "GZIP" },
+    ]);
+    expect(
+      duckdbRow(`
+      SELECT
+        count(*) AS rows,
+        count(*) FILTER (WHERE d <> DATE '2026-01-01' + (n - 0.5)::INTEGER) AS d_mismatch,
+        sum(n)::VARCHAR AS total
+      FROM read_parquet(${path});
+    `),
+    ).toEqual({ rows: 40, d_mismatch: 0, total: "800.00" });
   });
 });
 

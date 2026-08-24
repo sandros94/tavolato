@@ -121,6 +121,14 @@ describe("CompactWriter", () => {
     expect(encode((w) => w.fieldI32(1, 1))).toBe("15 02 00");
   });
 
+  it("writes i8 fields as one raw byte, not a zigzag varint", () => {
+    // 0x13 = delta 1 << 4 | I8(3); the value follows verbatim. This is the one
+    // integer the compact protocol does not transform, and `IntType.bitWidth`
+    // is the only place Parquet uses it.
+    expect(encode((w) => w.fieldI8(1, 64))).toBe("13 40 00");
+    expect(encode((w) => w.fieldI8(1, 8))).toBe("13 08 00");
+  });
+
   it("writes booleans inside the field header", () => {
     // BOOLEAN_TRUE = 1, BOOLEAN_FALSE = 2; no payload bytes follow.
     expect(
@@ -340,6 +348,20 @@ describe("CompactReader", () => {
       -2,
       3,
     ]);
+  });
+
+  it("reads an i8 back, sign extended", () => {
+    for (const value of [0, 8, 16, 32, 64, 127, -1, -128]) {
+      const writer = new CompactWriter();
+      writer.structBegin();
+      writer.fieldI8(1, value);
+      writer.structEnd();
+      const compact = new CompactReader(new ByteReader(writer.toBytes()));
+      compact.structBegin();
+      expect(compact.fieldBegin()).toEqual({ id: 1, type: ThriftType.I8 });
+      expect(compact.i8()).toBe(value);
+      compact.structEnd();
+    }
   });
 
   it("reads an empty struct as no fields at all", () => {

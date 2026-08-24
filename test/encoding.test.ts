@@ -137,8 +137,29 @@ describe("PLAIN encoding", () => {
     );
   });
 
+  it("writes INT32 little-endian", () => {
+    expect(plain({ kind: "i32", items: [1, -1, 2 ** 31 - 1] })).toBe(
+      "01 00 00 00 ff ff ff ff ff ff ff 7f",
+    );
+  });
+
   it("writes DOUBLE little-endian", () => {
     expect(plain({ kind: "f64", items: [1] })).toBe("00 00 00 00 00 00 f0 3f");
+  });
+
+  it("writes FLOAT little-endian", () => {
+    expect(plain({ kind: "f32", items: [1, -2] })).toBe("00 00 80 3f 00 00 00 c0");
+  });
+
+  it("writes FIXED_LEN_BYTE_ARRAY without a length prefix", () => {
+    // The width lives in the schema, so the values are simply concatenated.
+    expect(
+      plain({
+        kind: "fixed",
+        typeLength: 2,
+        items: [new Uint8Array([0x00, 0x3c]), new Uint8Array([0xff, 0x7b])],
+      }),
+    ).toBe("00 3c ff 7b");
   });
 
   it("bit-packs BOOLEAN least-significant-bit first", () => {
@@ -236,7 +257,12 @@ describe("PLAIN decoding", () => {
   function plainRoundtrip(values: ColumnValues): ColumnValues {
     const out = new ByteWriter();
     writePlain(out, values);
-    return readPlain(new ByteReader(out.toBytes()), values.kind, values.items.length);
+    return readPlain(
+      new ByteReader(out.toBytes()),
+      values.kind,
+      values.items.length,
+      values.kind === "fixed" ? values.typeLength : undefined,
+    );
   }
 
   it("inverts BYTE_ARRAY, length prefix included", () => {
@@ -253,11 +279,39 @@ describe("PLAIN decoding", () => {
     expect(plainRoundtrip({ kind: "i64", items })).toEqual({ kind: "i64", items });
   });
 
+  it("inverts INT32 at the signed extremes", () => {
+    const items = [0, 1, -1, 2 ** 31 - 1, -(2 ** 31)];
+    expect(plainRoundtrip({ kind: "i32", items })).toEqual({ kind: "i32", items });
+  });
+
   it("inverts DOUBLE, negative zero included", () => {
     const items = [1, -0, Number.NaN, Number.POSITIVE_INFINITY, 5e-324];
     const read = plainRoundtrip({ kind: "f64", items });
     expect(read.items).toEqual(items);
     expect(Object.is(read.items[1], -0)).toBe(true);
+  });
+
+  it("inverts FLOAT for values single precision holds exactly", () => {
+    const items = [1, -0, 0.5, Number.NaN, Number.POSITIVE_INFINITY, 3.4028234663852886e38];
+    const read = plainRoundtrip({ kind: "f32", items });
+    expect(read.items).toEqual(items);
+    expect(Object.is(read.items[1], -0)).toBe(true);
+  });
+
+  it("rounds a FLOAT once, and never again", () => {
+    // 0.1 is not a single, so it moves on the way in — and then stays put.
+    const once = plainRoundtrip({ kind: "f32", items: [0.1] }).items[0] as number;
+    expect(once).not.toBe(0.1);
+    expect(plainRoundtrip({ kind: "f32", items: [once] }).items[0]).toBe(once);
+  });
+
+  it("inverts FIXED_LEN_BYTE_ARRAY at its declared width", () => {
+    const items = [new Uint8Array([1, 2, 3]), new Uint8Array([0xff, 0, 0xff])];
+    expect(plainRoundtrip({ kind: "fixed", typeLength: 3, items })).toEqual({
+      kind: "fixed",
+      typeLength: 3,
+      items,
+    });
   });
 
   it("inverts BOOLEAN across byte boundaries", () => {
@@ -273,16 +327,22 @@ describe("PLAIN decoding", () => {
   });
 
   it("reads nothing for an empty column", () => {
-    for (const kind of ["bytes", "f64", "i64", "bool"] as const) {
-      expect(readPlain(new ByteReader(new Uint8Array()), kind, 0).items).toEqual([]);
+    for (const kind of ["bytes", "fixed", "f64", "f32", "i64", "i32", "bool"] as const) {
+      expect(readPlain(new ByteReader(new Uint8Array()), kind, 0, 4).items).toEqual([]);
     }
   });
 
   it("refuses to read past the end of a page", () => {
     expectError("ERR_READ_MALFORMED", () => readPlain(new ByteReader(unhex("01 00")), "i64", 1));
+    expectError("ERR_READ_MALFORMED", () => readPlain(new ByteReader(unhex("01 00")), "i32", 1));
+    expectError("ERR_READ_MALFORMED", () => readPlain(new ByteReader(unhex("01 00")), "f32", 1));
     // A BYTE_ARRAY whose length prefix promises more than the page holds.
     expectError("ERR_READ_MALFORMED", () =>
       readPlain(new ByteReader(unhex("ff 00 00 00 61")), "bytes", 1),
+    );
+    // A FIXED_LEN_BYTE_ARRAY whose declared width outruns the page.
+    expectError("ERR_READ_MALFORMED", () =>
+      readPlain(new ByteReader(unhex("61 62")), "fixed", 1, 4),
     );
   });
 });

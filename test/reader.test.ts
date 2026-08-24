@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   createWriter,
+  decimal,
   defineSchema,
   isTavolatoError,
   readParquet,
   readSchema,
   TavolatoError,
+  uuid,
 } from "../src/index.ts";
 import { expectError } from "./_errors.ts";
 import { sync } from "./_sync.ts";
@@ -19,19 +21,36 @@ import { sync } from "./_sync.ts";
  * loop that never ends.
  */
 
-/** A small but complete file: two row groups, nulls, strings, every type. */
+/** The logical types the sample file's annotated columns need. */
+const TYPES = [decimal({ precision: 9, scale: 2 }), uuid()];
+
+/** Reads with the sample's column types registered, as its own writer would. */
+function read(bytes: Uint8Array): unknown {
+  return readParquet(bytes, { types: TYPES });
+}
+
+/**
+ * A small but complete file: two row groups, nulls, and one column of every
+ * physical type the writer can emit — the fixed-width ones and their
+ * annotations included, so the sweeps below cover the annotation decoder too.
+ */
 function sample(): Uint8Array {
   const schema = defineSchema({
     s: { type: "string", optional: true },
     f: { type: "f64" },
+    g: { type: "f32" },
     i: { type: "i64" },
+    n: { type: "i32" },
     b: { type: "bool", optional: true },
     t: { type: "timestamp" },
+    p: { type: TYPES[0] },
+    u: { type: TYPES[1], optional: true },
   });
   const writer = createWriter(schema, { rowGroupSize: 2 });
-  writer.append({ s: "alpha", f: 1.5, i: 1n, b: true, t: 0 });
-  writer.append({ s: null, f: -0.25, i: 2n, b: null, t: 1000 });
-  writer.append({ s: "gamma", f: 0, i: 3n, b: false, t: 2000 });
+  const id = "b3f2c1a0-1111-4222-8333-444455556666";
+  writer.append({ s: "alpha", f: 1.5, g: 0.5, i: 1n, n: 1, b: true, t: 0, p: "1.25", u: id });
+  writer.append({ s: null, f: -0.25, g: -1, i: 2n, n: -2, b: null, t: 1000, p: "-0.01", u: null });
+  writer.append({ s: "gamma", f: 0, g: 2, i: 3n, n: 3, b: false, t: 2000, p: "0.00", u: id });
   return sync(writer.finish());
 }
 
@@ -172,6 +191,84 @@ describe("unsupported features", () => {
   });
 });
 
+/**
+ * Rewrites the physical type of `minimal()`'s single column, standing in for a
+ * file no writer here can produce.
+ *
+ * The leaf's `SchemaElement` is `15 04 25 00 18 01 6e`: type INT64
+ * (zigzag 2 = 4), repetition REQUIRED, then the name. Only the schema element
+ * spells the type that way — the column chunk's copy is followed by its
+ * encodings list — so the pattern is unambiguous.
+ */
+function withPhysicalType(bytes: Uint8Array, physical: number): Uint8Array {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const footer = bytes.length - 8 - view.getUint32(bytes.length - 8, true);
+  for (let offset = footer; offset < bytes.length - 8; offset++) {
+    if (bytes[offset] === 0x15 && bytes[offset + 1] === 0x04 && bytes[offset + 2] === 0x25) {
+      const copy = bytes.slice();
+      copy[offset + 1] = physical * 2; // zigzag of a small positive number
+      return copy;
+    }
+  }
+  throw new Error("no INT64 schema element found");
+}
+
+describe("types the reader refuses outright", () => {
+  it("refuses INT96 permanently, and says why", () => {
+    const error = expectError("ERR_READ_UNSUPPORTED", () =>
+      readParquet(withPhysicalType(minimal(), 3)),
+    );
+    expect(error.message).toContain("INT96");
+    expect(error.message).toContain("deprecated");
+    // No remedy: this one does not lift for any option.
+    expect(error.message).not.toContain("ReadOptions");
+    expect(error.column).toBe("n");
+  });
+
+  it("refuses a physical type Parquet does not define", () => {
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readParquet(withPhysicalType(minimal(), 9)),
+    );
+    expect(error.message).toContain("9");
+    expect(error.column).toBe("n");
+  });
+
+  it("refuses a FIXED_LEN_BYTE_ARRAY with no type_length", () => {
+    // Physical type changed to FIXED_LEN_BYTE_ARRAY, but the element carries no
+    // width, so the column's values have no length at all.
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readParquet(withPhysicalType(minimal(), 7)),
+    );
+    expect(error.message).toContain("type_length");
+    expect(error.column).toBe("n");
+  });
+
+  it("names the annotation, with its parameters, and the remedy", () => {
+    const schema = defineSchema({ p: { type: decimal({ precision: 9, scale: 2 }) } });
+    const writer = createWriter(schema);
+    writer.append({ p: "1.25" });
+    const bytes = sync(writer.finish());
+
+    const error = expectError("ERR_READ_UNSUPPORTED", () => readParquet(bytes));
+    expect(error.message).toContain("DECIMAL(precision=9, scale=2)");
+    expect(error.message).toContain("INT32");
+    expect(error.message).toContain("pass a matching type in ReadOptions.types");
+    expect(error.column).toBe("p");
+
+    // A type that claims a *different* decimal does not claim this one.
+    expectError("ERR_READ_UNSUPPORTED", () =>
+      readParquet(bytes, { types: [decimal({ precision: 9, scale: 4 })] }),
+    );
+  });
+
+  it("names a fixed-width column by the width it declares", () => {
+    const writer = createWriter(defineSchema({ u: { type: uuid() } }));
+    writer.append({ u: "b3f2c1a0-1111-4222-8333-444455556666" });
+    const error = expectError("ERR_READ_UNSUPPORTED", () => readParquet(sync(writer.finish())));
+    expect(error.message).toContain("FIXED_LEN_BYTE_ARRAY(16) annotated UUID");
+  });
+});
+
 describe("truncation", () => {
   it("rejects every truncation of a real file", () => {
     // Every prefix loses the trailing magic, so every one of them must be
@@ -182,7 +279,7 @@ describe("truncation", () => {
     const codes = new Set<string>();
     const survived: number[] = [];
     for (let length = 0; length < bytes.length; length++) {
-      const error = caught(() => readParquet(bytes.subarray(0, length)));
+      const error = caught(() => read(bytes.subarray(0, length)));
       if (error === undefined) survived.push(length);
       else codes.add(error.code);
     }
@@ -198,7 +295,7 @@ describe("truncation", () => {
       const copy = new Uint8Array(bytes.length - removed);
       copy.set(bytes.subarray(0, 8), 0);
       copy.set(bytes.subarray(8 + removed), 8);
-      expect(caught(() => readParquet(copy))).toBeInstanceOf(TavolatoError);
+      expect(caught(() => read(copy))).toBeInstanceOf(TavolatoError);
     }
   });
 
@@ -212,11 +309,28 @@ describe("truncation", () => {
       for (const mask of [0x01, 0x80, 0xff]) {
         const copy = bytes.slice();
         copy[offset] ^= mask;
-        if (caught(() => readParquet(copy)) !== undefined) thrown++;
+        if (caught(() => read(copy)) !== undefined) thrown++;
       }
     }
     // Most corruptions are structural and must be caught, not shrugged off.
     expect(thrown).toBeGreaterThan(bytes.length);
+  });
+
+  it("survives every single-byte corruption with no column types registered", () => {
+    // The same sweep with the annotated columns unclaimed: every read now ends
+    // in a refusal rather than a value, and `caught` still insists that every
+    // one of them is a TavolatoError.
+    const bytes = sample();
+    const codes = new Set<string>();
+    for (let offset = 0; offset < bytes.length; offset++) {
+      for (const mask of [0x01, 0xff]) {
+        const copy = bytes.slice();
+        copy[offset] ^= mask;
+        const error = caught(() => readParquet(copy));
+        if (error !== undefined) codes.add(error.code);
+      }
+    }
+    expect([...codes].sort()).toEqual(["ERR_READ_MALFORMED", "ERR_READ_UNSUPPORTED"]);
   });
 });
 
@@ -231,14 +345,28 @@ describe("readSchema", () => {
     const bytes = sample();
     const copy = bytes.slice();
     copy.fill(0xff, 4, 40);
-    expect(readSchema(copy).columns.map((column) => column.name)).toEqual([
+    expect(readSchema(copy, { types: TYPES }).columns.map((column) => column.name)).toEqual([
       "s",
       "f",
+      "g",
       "i",
+      "n",
       "b",
       "t",
+      "p",
+      "u",
     ]);
-    expect(caught(() => readParquet(copy))).toBeInstanceOf(TavolatoError);
+    expect(caught(() => read(copy))).toBeInstanceOf(TavolatoError);
+  });
+
+  it("claims columns with the same types readParquet would", () => {
+    const bytes = sample();
+    expect(readSchema(bytes, { types: TYPES })).toEqual(
+      (readParquet(bytes, { types: TYPES }) as { schema: unknown }).schema,
+    );
+    // Without them the annotated columns have no meaning, and it says so.
+    const error = expectError("ERR_READ_UNSUPPORTED", () => readSchema(bytes));
+    expect(error.column).toBe("p");
   });
 });
 

@@ -1,25 +1,157 @@
 /**
  * The column types tavolato writes.
  *
- * | tavolato    | Parquet physical | Parquet logical                          |
- * | ----------- | ---------------- | ---------------------------------------- |
- * | `string`    | `BYTE_ARRAY`     | `STRING` (`UTF8`)                        |
- * | `json`      | `BYTE_ARRAY`     | `JSON`                                   |
- * | `f64`       | `DOUBLE`         | —                                        |
- * | `i64`       | `INT64`          | —                                        |
- * | `bool`      | `BOOLEAN`        | —                                        |
+ * | tavolato    | Parquet physical | Parquet logical                               |
+ * | ----------- | ---------------- | --------------------------------------------- |
+ * | `string`    | `BYTE_ARRAY`     | `STRING` (`UTF8`)                             |
+ * | `json`      | `BYTE_ARRAY`     | `JSON`                                        |
+ * | `f64`       | `DOUBLE`         | —                                             |
+ * | `f32`       | `FLOAT`          | —                                             |
+ * | `i64`       | `INT64`          | —                                             |
+ * | `i32`       | `INT32`          | —                                             |
+ * | `bool`      | `BOOLEAN`        | —                                             |
  * | `timestamp` | `INT64`          | `TIMESTAMP(UTC, MILLIS)` (`TIMESTAMP_MILLIS`) |
  *
  * The *shape* is frozen — one flat level of scalar columns, forever — but the
  * list itself grows: a minor version may add a member, as `json` was added
  * next to `string`. Switch over it with a `default` arm rather than an
  * exhaustive one, or a new member turns into a type error on upgrade.
+ *
+ * These are the types that own a *bare* physical type, the one a file carries
+ * with no annotation at all. Everything a column can additionally *mean* —
+ * a date, a decimal, a UUID — is an annotation, and annotations are claimed by
+ * a {@link LogicalAdapter} rather than by a member of this union.
  */
-export type ColumnType = "string" | "json" | "f64" | "i64" | "bool" | "timestamp";
+export type ColumnType = "string" | "json" | "f64" | "f32" | "i64" | "i32" | "bool" | "timestamp";
+
+/*
+ * ---------------------------------------------------------------------------
+ * Annotations
+ *
+ * Parquet stores a column twice over: as a *physical* type, which says how the
+ * bytes are laid out, and as an annotation, which says what they mean. The
+ * annotation comes in two spellings — the modern `LogicalType` union and the
+ * deprecated `ConvertedType` enum — and tavolato reads both into the one model
+ * below.
+ *
+ * That model mirrors `parquet.thrift` rather than tavolato's own scope: the
+ * format froze these members, so decoding all of them costs nothing, and
+ * refusing one *by name* is worth everything.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The resolutions Parquet's `TimeUnit` union names. */
+export type TimeUnitName = "millis" | "micros" | "nanos";
+
+/**
+ * What a column's annotation says, once `LogicalType` and `ConvertedType` have
+ * been reconciled (the modern spelling wins where a file carries both).
+ *
+ * Only a handful of these have a built-in column type. The rest are exactly
+ * what a {@link LogicalAdapter} exists to claim — and `unknown` is the
+ * forward-compatible escape hatch: an annotation a later Parquet release adds
+ * decodes to its field id rather than throwing, and reaches `matches` like
+ * any other.
+ */
+export type Annotation =
+  | { readonly kind: "none" }
+  | { readonly kind: "string" }
+  | { readonly kind: "json" }
+  | { readonly kind: "bson" }
+  | { readonly kind: "enum" }
+  | { readonly kind: "uuid" }
+  | { readonly kind: "date" }
+  | { readonly kind: "float16" }
+  | { readonly kind: "decimal"; readonly precision: number; readonly scale: number }
+  | {
+      readonly kind: "time" | "timestamp";
+      readonly unit: TimeUnitName;
+      readonly isAdjustedToUTC: boolean;
+    }
+  | { readonly kind: "integer"; readonly bitWidth: 8 | 16 | 32 | 64; readonly isSigned: boolean }
+  /** An annotation this version has no name for; `id` is its `LogicalType` field id. */
+  | { readonly kind: "unknown"; readonly id: number };
+
+/**
+ * How a column's values are physically stored, and therefore which raw
+ * JavaScript value a {@link LogicalAdapter} is handed and has to hand back.
+ *
+ * | kind    | Parquet physical       | raw value                             |
+ * | ------- | ---------------------- | ------------------------------------- |
+ * | `bool`  | `BOOLEAN`              | `boolean`                             |
+ * | `i32`   | `INT32`                | `number`                              |
+ * | `i64`   | `INT64`                | `bigint`                              |
+ * | `f32`   | `FLOAT`                | `number`                              |
+ * | `f64`   | `DOUBLE`               | `number`                              |
+ * | `bytes` | `BYTE_ARRAY`           | `Uint8Array`, any length              |
+ * | `fixed` | `FIXED_LEN_BYTE_ARRAY` | `Uint8Array` of exactly `typeLength`  |
+ *
+ * `INT96` is deliberately absent: the format deprecated it, so tavolato
+ * refuses it outright rather than offering a hook for it.
+ */
+export type PhysicalKind = "bool" | "i32" | "i64" | "f32" | "f64" | "bytes" | "fixed";
+
+/**
+ * A logical column type you supply: the two functions that turn one physical
+ * value into the JavaScript value you want, and back.
+ *
+ * An adapter is you resolving an ambiguity tavolato refuses to guess at. A
+ * `DECIMAL(38, 4)` column is sixteen bytes of two's complement; whether those
+ * should become a `string`, a `bigint` or somebody's arbitrary-precision object
+ * is a question about *your* program, and answering it for you would be the
+ * same overreach as silently reading an `INT96`. So tavolato names what it
+ * found and stops — and an adapter is how you answer.
+ *
+ * Both halves are **synchronous**: an adapter is a pure value transform, and
+ * the one place tavolato defers is the codec seam.
+ *
+ * Nulls never reach an adapter. `optional` columns are handled by the
+ * definition-level machinery on both sides, so `read` and `write` only ever
+ * see values that are present.
+ *
+ * Build one with {@link defineColumnType}, which validates the shape and
+ * freezes it.
+ */
+export interface LogicalAdapter<TIn, TOut> {
+  /** Used in error messages and wherever a schema is displayed. */
+  readonly name: string;
+  /** Which physical type the values are stored as. */
+  readonly physical: PhysicalKind;
+  /** Byte width, required when `physical` is `"fixed"` and rejected otherwise. */
+  readonly typeLength?: number;
+  /**
+   * Whether this adapter claims a column carrying `annotation`. The physical
+   * type (and, for `"fixed"`, the byte width) is checked before this is called,
+   * so it only has the annotation left to judge.
+   */
+  matches(annotation: Annotation, physical: PhysicalKind): boolean;
+  /** The annotation to stamp on a column written through this adapter. */
+  annotate(): Annotation;
+  /** Turns one raw physical value into the value a caller reads. */
+  read(raw: unknown): TOut;
+  /** Turns one value a caller wrote into a raw physical value. */
+  write(value: TIn): unknown;
+}
+
+/**
+ * Any adapter, whatever it maps between.
+ *
+ * The two `any`s are confined to this one alias on purpose: a column
+ * definition has to accept *some* adapter without knowing which, and the
+ * alternative — a generic parameter threaded through `ParquetSchema`, `Row`,
+ * `ParquetWriter` and every public signature that touches them — would be paid
+ * for by every caller, adapters or not. Inference is recovered where it
+ * matters, in {@link ColumnInput} and {@link ColumnOutput}, which read the
+ * adapter's own type arguments back off the schema definition.
+ */
+// oxlint-disable-next-line no-explicit-any
+export type AnyLogicalAdapter = LogicalAdapter<any, any>;
 
 /** Declaration of a single column. */
-export interface ColumnDefinition<TType extends ColumnType = ColumnType> {
-  /** Column type. */
+export interface ColumnDefinition<
+  TType extends ColumnType | AnyLogicalAdapter = ColumnType | AnyLogicalAdapter,
+> {
+  /** Column type: a built-in name, or an adapter built with `defineColumnType`. */
   type: TType;
   /** When `true` the column is nullable (Parquet `OPTIONAL`). Defaults to `false`. */
   optional?: boolean;
@@ -31,8 +163,14 @@ export type SchemaDefinition = Record<string, ColumnDefinition>;
 /** A normalized column, in the order it appears in the file. */
 export interface SchemaColumn {
   readonly name: string;
-  readonly type: ColumnType;
+  readonly type: ColumnType | AnyLogicalAdapter;
   readonly optional: boolean;
+  /**
+   * Byte width of a `FIXED_LEN_BYTE_ARRAY` column; absent for every other
+   * physical type. On the way in it comes from the adapter, on the way out
+   * from the file, and the two have to agree for the adapter to claim it.
+   */
+  readonly typeLength?: number;
 }
 
 /**
@@ -46,17 +184,20 @@ export interface ParquetSchema<TDefinition extends SchemaDefinition = SchemaDefi
 }
 
 /** The JavaScript values accepted for a given column type. */
-export type ColumnInput<TType extends ColumnType> = TType extends "string" | "json"
-  ? string
-  : TType extends "f64"
-    ? number
-    : TType extends "i64"
-      ? bigint | number
-      : TType extends "bool"
-        ? boolean
-        : TType extends "timestamp"
-          ? Date | number
-          : never;
+export type ColumnInput<TType extends ColumnType | AnyLogicalAdapter> =
+  TType extends LogicalAdapter<infer TIn, unknown>
+    ? TIn
+    : TType extends "string" | "json"
+      ? string
+      : TType extends "f64" | "f32" | "i32"
+        ? number
+        : TType extends "i64"
+          ? bigint | number
+          : TType extends "bool"
+            ? boolean
+            : TType extends "timestamp"
+              ? Date | number
+              : never;
 
 type OptionalColumns<TDefinition extends SchemaDefinition> = {
   [K in keyof TDefinition]: TDefinition[K] extends { optional: true } ? K : never;
@@ -87,28 +228,41 @@ export type Row<TDefinition extends SchemaDefinition> = {
  * | `string`    | `string`     |
  * | `json`      | `string`     |
  * | `f64`       | `number`     |
+ * | `f32`       | `number`     |
  * | `i64`       | `bigint`     |
+ * | `i32`       | `number`     |
  * | `bool`      | `boolean`    |
  * | `timestamp` | `Date`       |
+ *
+ * For an adapter column it is whatever that adapter's `read` returns.
  */
-export type ColumnOutput<TType extends ColumnType> = TType extends "string" | "json"
-  ? string
-  : TType extends "f64"
-    ? number
-    : TType extends "i64"
-      ? bigint
-      : TType extends "bool"
-        ? boolean
-        : TType extends "timestamp"
-          ? Date
-          : never;
+export type ColumnOutput<TType extends ColumnType | AnyLogicalAdapter> =
+  TType extends LogicalAdapter<never, infer TOut>
+    ? TOut
+    : TType extends "string" | "json"
+      ? string
+      : TType extends "f64" | "f32" | "i32"
+        ? number
+        : TType extends "i64"
+          ? bigint
+          : TType extends "bool"
+            ? boolean
+            : TType extends "timestamp"
+              ? Date
+              : never;
 
 /**
- * Any value the reader can produce; `null` for a null in an optional column.
+ * Any value the reader can produce for a **built-in** column type; `null` for a
+ * null in an optional column.
  *
  * `Uint8Array` is reserved for a future raw-binary column type and is listed
  * here so that adding one is not a breaking change to every `switch` over a
- * read value. Nothing returns it today.
+ * read value. Nothing returns it today — an unannotated `BYTE_ARRAY` or
+ * `FIXED_LEN_BYTE_ARRAY` is refused rather than handed back as bytes.
+ *
+ * A column read through a {@link LogicalAdapter} yields whatever that adapter's
+ * `read` returns, which the in-box adapters keep inside this union. One of your
+ * own is free not to; {@link ReadRowOf} is where its real type is recovered.
  */
 export type ReadValue = string | number | bigint | boolean | Date | Uint8Array | null;
 
@@ -216,4 +370,15 @@ export interface ReadOptions {
    * registering one is how you opt into reading it.
    */
   codecs?: Partial<Record<CodecName, ReaderCodec>>;
+  /**
+   * Logical column types, tried **in order**: the first adapter whose physical
+   * type, byte width and `matches` all agree claims the column, and its object
+   * becomes that column's `type` in the schema the reader returns.
+   *
+   * Adapters are consulted before the built-in types, so an annotated column is
+   * yours to claim. The in-box adapters never claim an unannotated one, which
+   * is what leaves the bare physical types to `i32`, `i64`, `f32`, `f64` and
+   * `bool`.
+   */
+  types?: readonly AnyLogicalAdapter[];
 }

@@ -1,3 +1,5 @@
+import { adapterProblem } from "./adapters.ts";
+import { columnTypeLength } from "./internal/format.ts";
 import { TavolatoError } from "./error.ts";
 import type { ColumnType, ParquetSchema, SchemaColumn, SchemaDefinition } from "./types.ts";
 
@@ -5,7 +7,9 @@ const COLUMN_TYPES: ReadonlySet<string> = new Set<ColumnType>([
   "string",
   "json",
   "f64",
+  "f32",
   "i64",
+  "i32",
   "bool",
   "timestamp",
 ]);
@@ -16,11 +20,17 @@ const COLUMN_TYPES: ReadonlySet<string> = new Set<ColumnType>([
  * Column order is the declaration order of the object's own enumerable string
  * keys, and that is the order columns appear in the file.
  *
+ * A column's `type` is either one of the built-in names or a logical column
+ * type from `defineColumnType`, which is checked here for the same reason the
+ * names are: a schema that cannot produce a file should say so before a single
+ * row is appended.
+ *
  * @example
  * const schema = defineSchema({
  *   at: { type: "timestamp" },
  *   host: { type: "string", optional: true },
  *   n: { type: "i64" },
+ *   price: { type: decimal({ precision: 12, scale: 2 }) },
  * });
  *
  * @throws {TavolatoError} `ERR_SCHEMA_EMPTY` when no column is declared.
@@ -51,11 +61,16 @@ export function defineSchema<const TDefinition extends SchemaDefinition>(
         name,
       );
     }
-    if (!COLUMN_TYPES.has(column.type)) {
+    if (typeof column.type === "object" && column.type !== null) {
+      const problem = adapterProblem(column.type);
+      if (problem !== undefined) {
+        throw new TavolatoError(`Column "${name}" ${problem}`, "ERR_SCHEMA_COLUMN_INVALID", name);
+      }
+    } else if (!COLUMN_TYPES.has(column.type)) {
       throw new TavolatoError(
         `Column "${name}" has unsupported type ${JSON.stringify(column.type)}; expected one of ${[
           ...COLUMN_TYPES,
-        ].join(", ")}`,
+        ].join(", ")}, or a column type from defineColumnType`,
         "ERR_SCHEMA_COLUMN_INVALID",
         name,
       );
@@ -67,7 +82,15 @@ export function defineSchema<const TDefinition extends SchemaDefinition>(
         name,
       );
     }
-    columns.push(Object.freeze({ name, type: column.type, optional: column.optional === true }));
+    const typeLength = columnTypeLength(column.type);
+    columns.push(
+      Object.freeze({
+        name,
+        type: column.type,
+        optional: column.optional === true,
+        ...(typeLength === undefined ? {} : { typeLength }),
+      }),
+    );
   }
 
   return Object.freeze({

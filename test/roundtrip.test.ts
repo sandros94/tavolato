@@ -1,7 +1,20 @@
 import { gunzipSync, gzipSync, zstdCompressSync, zstdDecompressSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
-import { createWriter, defineSchema, readParquet, readSchema } from "../src/index.ts";
+import {
+  createWriter,
+  date,
+  decimal,
+  defineSchema,
+  float16,
+  integer,
+  readParquet,
+  readSchema,
+  time,
+  timestamp,
+  uuid,
+} from "../src/index.ts";
 import type {
+  AnyLogicalAdapter,
   ParquetSchema,
   ReadOptions,
   ReadRow,
@@ -70,14 +83,17 @@ describe.each(LEGS)("$label", ({ codec }) => {
   function roundtrip<TDefinition extends SchemaDefinition>(
     schema: ParquetSchema<TDefinition>,
     rows: Iterable<Row<TDefinition>>,
-    rowGroupSize?: number,
+    options: { rowGroupSize?: number; types?: readonly AnyLogicalAdapter[] } = {},
   ): { schema: ParquetSchema; rows: ReadRow[] } {
+    const { rowGroupSize, types } = options;
     const writer = createWriter(schema, {
       ...(rowGroupSize === undefined ? {} : { rowGroupSize }),
       codec,
     });
     sync(writer.appendAll(rows));
-    return sync(readParquet(sync(writer.finish()), read));
+    return sync(
+      readParquet(sync(writer.finish()), { ...read, ...(types === undefined ? {} : { types }) }),
+    );
   }
 
   describe("schema", () => {
@@ -162,18 +178,68 @@ describe.each(LEGS)("$label", ({ codec }) => {
       const schema = defineSchema({
         s: { type: "string" },
         f: { type: "f64" },
+        g: { type: "f32" },
         i: { type: "i64" },
+        n: { type: "i32" },
         b: { type: "bool" },
         t: { type: "timestamp" },
       });
       const { rows } = roundtrip(schema, [
-        { s: "alpha", f: 1.5, i: 42n, b: true, t: 1_700_000_000_000 },
-        { s: "beta", f: -0.25, i: -7, b: false, t: new Date(1_700_000_001_500) },
+        { s: "alpha", f: 1.5, g: 0.5, i: 42n, n: 42, b: true, t: 1_700_000_000_000 },
+        { s: "beta", f: -0.25, g: -0.25, i: -7, n: -7, b: false, t: new Date(1_700_000_001_500) },
       ]);
       expect(rows).toEqual([
-        { s: "alpha", f: 1.5, i: 42n, b: true, t: new Date(1_700_000_000_000) },
-        { s: "beta", f: -0.25, i: -7n, b: false, t: new Date(1_700_000_001_500) },
+        { s: "alpha", f: 1.5, g: 0.5, i: 42n, n: 42, b: true, t: new Date(1_700_000_000_000) },
+        {
+          s: "beta",
+          f: -0.25,
+          g: -0.25,
+          i: -7n,
+          n: -7,
+          b: false,
+          t: new Date(1_700_000_001_500),
+        },
       ]);
+    });
+
+    it("round-trips the signed 32-bit extremes as numbers", () => {
+      const schema = defineSchema({ k: { type: "i64" }, n: { type: "i32", optional: true } });
+      const extremes = [-(2 ** 31), -(2 ** 31) + 1, -1, 0, 1, 2 ** 31 - 2, 2 ** 31 - 1];
+      const { rows } = roundtrip(schema, [
+        ...extremes.map((value, index) => ({ k: BigInt(index), n: value })),
+        { k: BigInt(extremes.length), n: null },
+      ]);
+      expect(rows.map((row) => row.n)).toEqual([...extremes, null]);
+      expect(rows.every((row) => row.n === null || typeof row.n === "number")).toBe(true);
+    });
+
+    it("round-trips single specials, and rounds every value exactly once", () => {
+      // 0.1 is not a single, so it moves on the way in. What matters is that it
+      // then stops moving: reading gives the stored value, and writing that
+      // value again reproduces it.
+      const schema = defineSchema({ k: { type: "i64" }, g: { type: "f32" } });
+      const values = [0, 1, -1, 0.5, 0.1, 3.402_823_466_385_288_6e38, 1.175_494_35e-38];
+      const { rows } = roundtrip(schema, [
+        ...values.map((value, index) => ({ k: BigInt(index), g: value })),
+        { k: 100n, g: -0 },
+        { k: 101n, g: Number.NaN },
+        { k: 102n, g: Number.POSITIVE_INFINITY },
+        { k: 103n, g: Number.NEGATIVE_INFINITY },
+      ]);
+      const stored = rows.slice(0, values.length).map((row) => row.g as number);
+      expect(stored[4]).not.toBe(0.1); // rounded to single, once
+      expect(stored[4]).toBeCloseTo(0.1, 7);
+      expect(Object.is(rows[values.length].g, -0)).toBe(true);
+      expect(Number.isNaN(rows[values.length + 1].g as number)).toBe(true);
+      expect(rows.at(-2)?.g).toBe(Number.POSITIVE_INFINITY);
+      expect(rows.at(-1)?.g).toBe(Number.NEGATIVE_INFINITY);
+
+      // Re-writing what came back must reproduce it exactly.
+      const again = roundtrip(
+        schema,
+        stored.map((value, index) => ({ k: BigInt(index), g: value })),
+      );
+      expect(again.rows.map((row) => row.g)).toEqual(stored);
     });
 
     it("round-trips nulls in every column", () => {
@@ -353,6 +419,135 @@ describe.each(LEGS)("$label", ({ codec }) => {
     });
   });
 
+  /*
+   * Logical column types are pure value transforms, and a codec is a byte
+   * transform around the page they land in — so running the whole set through
+   * every leg is what says the two seams do not know about each other.
+   */
+  describe("logical column types", () => {
+    const money = decimal({ precision: 9, scale: 2 });
+    const big = decimal({ precision: 18, scale: 4 });
+    const huge = decimal({ precision: 38, scale: 6 });
+    const id = uuid();
+    const day = date();
+    const clock = time({ unit: "millis" });
+    const precise = time({ unit: "micros" });
+    const nanos = time({ unit: "nanos" });
+    const instant = timestamp({ unit: "micros" });
+    const half = float16();
+    const tiny = integer({ bitWidth: 8 });
+    const short = integer({ bitWidth: 16 });
+    const wide = integer({ bitWidth: 32, signed: false });
+    const huge64 = integer({ bitWidth: 64, signed: false });
+    const types = [
+      money,
+      big,
+      huge,
+      id,
+      day,
+      clock,
+      precise,
+      nanos,
+      instant,
+      half,
+      tiny,
+      short,
+      wide,
+      huge64,
+    ];
+
+    const schema = defineSchema({
+      money: { type: money },
+      big: { type: big },
+      huge: { type: huge },
+      id: { type: id },
+      day: { type: day },
+      clock: { type: clock },
+      precise: { type: precise },
+      nanos: { type: nanos },
+      instant: { type: instant },
+      half: { type: half },
+      tiny: { type: tiny },
+      short: { type: short },
+      wide: { type: wide },
+      huge64: { type: huge64 },
+      maybe: { type: money, optional: true },
+    });
+
+    const rows = [
+      {
+        money: "1234567.89",
+        big: "-12345678901234.5678",
+        huge: "12345678901234567890123456789012.345678",
+        id: "b3f2c1a0-1111-4222-8333-444455556666",
+        day: new Date(Date.UTC(2026, 7, 24)),
+        clock: 45_296_789,
+        precise: 45_296_789_012n,
+        nanos: 45_296_789_012_345n,
+        instant: 1_767_225_845_123_456n,
+        half: 1.5,
+        tiny: -128,
+        short: 32_767,
+        wide: 4_294_967_295,
+        huge64: 18_446_744_073_709_551_615n,
+        maybe: "0.01",
+      },
+      {
+        money: "-0.01",
+        big: "0.0000",
+        huge: "-0.000001",
+        id: "00000000-0000-0000-0000-000000000000",
+        day: new Date(0),
+        clock: 0,
+        precise: 0n,
+        nanos: 0n,
+        instant: -1n,
+        half: -65_504,
+        tiny: 127,
+        short: -32_768,
+        wide: 0,
+        huge64: 0n,
+        maybe: null,
+      },
+    ];
+
+    it("hands every value back exactly as it was written", () => {
+      const read = roundtrip(schema, rows, { types });
+      expect(read.rows).toEqual(rows);
+    });
+
+    it("recovers the column types themselves, and writes the same file again", () => {
+      const recovered = roundtrip(schema, rows, { types });
+      expect(recovered.schema.columns).toEqual(schema.columns);
+      // The claiming adapter *is* the column's type, so a recovered schema is
+      // valid `createWriter` input with no registry to rebuild.
+      expect(recovered.schema.columns[0].type).toBe(money);
+      expect(recovered.schema.definition.id).toEqual({ type: id, optional: false });
+
+      const again = createWriter(recovered.schema, { codec });
+      sync(again.appendAll(recovered.rows as never[]));
+      const reread = sync(readParquet(sync(again.finish()), { ...read, types }));
+      expect(reread.rows).toEqual(rows);
+    });
+
+    it("keeps a half-precision value exactly, once it has been rounded", () => {
+      const halfSchema = defineSchema({ k: { type: "i64" }, h: { type: half } });
+      const values = [0, -0, 1, -2, 0.5, 6.103_515_625e-5, 5.960_464_477_539_063e-8, 65_504];
+      const first = roundtrip(
+        halfSchema,
+        values.map((value, index) => ({ k: BigInt(index), h: value })),
+        { types },
+      ).rows.map((row) => row.h as number);
+      expect(first).toEqual(values);
+      expect(Object.is(first[1], -0)).toBe(true);
+
+      // A value that is not a half moves once, and then never again.
+      const rounded = roundtrip(halfSchema, [{ k: 0n, h: 0.1 }], { types }).rows[0].h as number;
+      expect(rounded).toBe(0.099_975_585_937_5);
+      expect(roundtrip(halfSchema, [{ k: 0n, h: rounded }], { types }).rows[0].h).toBe(rounded);
+    });
+  });
+
   describe("file structure", () => {
     it("reads a file with zero rows back as an empty row list", () => {
       const schema = defineSchema({
@@ -372,13 +567,13 @@ describe.each(LEGS)("$label", ({ codec }) => {
         n: BigInt(index),
         s: index % 4 === 0 ? null : `row-${index}`,
       }));
-      expect(roundtrip(schema, expected, 7).rows).toEqual(expected);
+      expect(roundtrip(schema, expected, { rowGroupSize: 7 }).rows).toEqual(expected);
     });
 
     it("round-trips one row group per row", () => {
       const schema = defineSchema({ n: { type: "i64" } });
       const expected = Array.from({ length: 20 }, (_, index) => ({ n: BigInt(index) }));
-      expect(roundtrip(schema, expected, 1).rows).toEqual(expected);
+      expect(roundtrip(schema, expected, { rowGroupSize: 1 }).rows).toEqual(expected);
     });
 
     it("round-trips 100k rows across ten row groups", () => {

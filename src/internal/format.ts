@@ -1,31 +1,98 @@
 import { ByteReader } from "./bytes.ts";
 import { CompactReader, CompactWriter, type ThriftField, ThriftType } from "./thrift.ts";
 import { malformed } from "../error.ts";
-import type { CodecName, ColumnType } from "../types.ts";
+import type {
+  Annotation,
+  AnyLogicalAdapter,
+  CodecName,
+  ColumnType,
+  PhysicalKind,
+  TimeUnitName,
+} from "../types.ts";
 
 /**
- * The subset of `parquet.thrift` enums this writer emits.
+ * The `parquet.thrift` enums, as tavolato names them.
+ *
+ * The physical types are the whole enum: `INT96` included, because refusing it
+ * by name is the only thing tavolato ever does with it.
  *
  * @see https://github.com/apache/parquet-format/blob/master/src/main/thrift/parquet.thrift
  */
 export const PhysicalType: {
   readonly BOOLEAN: 0;
+  readonly INT32: 1;
   readonly INT64: 2;
+  readonly INT96: 3;
+  readonly FLOAT: 4;
   readonly DOUBLE: 5;
   readonly BYTE_ARRAY: 6;
-} = { BOOLEAN: 0, INT64: 2, DOUBLE: 5, BYTE_ARRAY: 6 } as const;
+  readonly FIXED_LEN_BYTE_ARRAY: 7;
+} = {
+  BOOLEAN: 0,
+  INT32: 1,
+  INT64: 2,
+  INT96: 3,
+  FLOAT: 4,
+  DOUBLE: 5,
+  BYTE_ARRAY: 6,
+  FIXED_LEN_BYTE_ARRAY: 7,
+} as const;
 
 /**
- * `INT_64` is not written by tavolato but is accepted on the way in: it
- * annotates an `INT64` with exactly the domain an unannotated one already has,
- * so it carries no information the reader would have to drop.
+ * The deprecated `ConvertedType` enum, in full.
+ *
+ * It is deprecated, not gone: every writer still emits it beside the modern
+ * `LogicalType` so that readers predating the union keep working, and DuckDB
+ * emits *only* this one for `INT_32`, `DATE` and the unsigned integers. Both
+ * spellings therefore have to be understood, and both are written.
  */
 export const ConvertedType: {
   readonly UTF8: 0;
+  readonly MAP: 1;
+  readonly MAP_KEY_VALUE: 2;
+  readonly LIST: 3;
+  readonly ENUM: 4;
+  readonly DECIMAL: 5;
+  readonly DATE: 6;
+  readonly TIME_MILLIS: 7;
+  readonly TIME_MICROS: 8;
   readonly TIMESTAMP_MILLIS: 9;
+  readonly TIMESTAMP_MICROS: 10;
+  readonly UINT_8: 11;
+  readonly UINT_16: 12;
+  readonly UINT_32: 13;
+  readonly UINT_64: 14;
+  readonly INT_8: 15;
+  readonly INT_16: 16;
+  readonly INT_32: 17;
   readonly INT_64: 18;
   readonly JSON: 19;
-} = { UTF8: 0, TIMESTAMP_MILLIS: 9, INT_64: 18, JSON: 19 } as const;
+  readonly BSON: 20;
+  readonly INTERVAL: 21;
+} = {
+  UTF8: 0,
+  MAP: 1,
+  MAP_KEY_VALUE: 2,
+  LIST: 3,
+  ENUM: 4,
+  DECIMAL: 5,
+  DATE: 6,
+  TIME_MILLIS: 7,
+  TIME_MICROS: 8,
+  TIMESTAMP_MILLIS: 9,
+  TIMESTAMP_MICROS: 10,
+  UINT_8: 11,
+  UINT_16: 12,
+  UINT_32: 13,
+  UINT_64: 14,
+  INT_8: 15,
+  INT_16: 16,
+  INT_32: 17,
+  INT_64: 18,
+  JSON: 19,
+  BSON: 20,
+  INTERVAL: 21,
+} as const;
 
 export const FieldRepetitionType: {
   readonly REQUIRED: 0;
@@ -90,15 +157,76 @@ export function registrableCodec(id: number): CodecName | undefined {
 
 export const PageType: { readonly DATA_PAGE: 0 } = { DATA_PAGE: 0 } as const;
 
-/** The `LogicalType` union field ids tavolato recognises by name. */
-export const LogicalTypeId: { readonly STRING: 1; readonly TIMESTAMP: 8; readonly JSON: 12 } = {
+/**
+ * The `LogicalType` union field ids.
+ *
+ * Field 9 is reserved for the `INTERVAL` the union never gained; the nested
+ * types (`MAP`, `LIST`) are here to be *named* in a refusal, never to be read.
+ */
+export const LogicalTypeId: {
+  readonly STRING: 1;
+  readonly MAP: 2;
+  readonly LIST: 3;
+  readonly ENUM: 4;
+  readonly DECIMAL: 5;
+  readonly DATE: 6;
+  readonly TIME: 7;
+  readonly TIMESTAMP: 8;
+  readonly INTERVAL: 9;
+  readonly INTEGER: 10;
+  readonly NULL: 11;
+  readonly JSON: 12;
+  readonly BSON: 13;
+  readonly UUID: 14;
+  readonly FLOAT16: 15;
+} = {
   STRING: 1,
+  MAP: 2,
+  LIST: 3,
+  ENUM: 4,
+  DECIMAL: 5,
+  DATE: 6,
+  TIME: 7,
   TIMESTAMP: 8,
+  INTERVAL: 9,
+  INTEGER: 10,
+  NULL: 11,
   JSON: 12,
+  BSON: 13,
+  UUID: 14,
+  FLOAT16: 15,
 } as const;
 
+/**
+ * The field id that stands for "an annotation this version cannot name".
+ *
+ * Zero is not a legal Thrift field id, so it can never collide with a real
+ * member of the union — which is what makes it the right marker for a
+ * `ConvertedType` outside the enum, or a `LogicalType` struct carrying no
+ * member at all.
+ */
+export const UNNAMED_ANNOTATION = 0 as const;
+
 /** `TimeUnit` union field ids. */
-export const TimeUnit: { readonly MILLIS: 1 } = { MILLIS: 1 } as const;
+export const TimeUnit: { readonly MILLIS: 1; readonly MICROS: 2; readonly NANOS: 3 } = {
+  MILLIS: 1,
+  MICROS: 2,
+  NANOS: 3,
+} as const;
+
+/** The `TimeUnit` union field id for each resolution, and back again. */
+const TIME_UNIT_IDS: Readonly<Record<TimeUnitName, number>> = {
+  millis: TimeUnit.MILLIS,
+  micros: TimeUnit.MICROS,
+  nanos: TimeUnit.NANOS,
+};
+
+const TIME_UNIT_KINDS: readonly (TimeUnitName | undefined)[] = [
+  undefined,
+  "millis",
+  "micros",
+  "nanos",
+];
 
 /** `PAR1`, the four magic bytes that open and close every Parquet file. */
 export const MAGIC: Uint8Array = /* @__PURE__ */ new Uint8Array([0x50, 0x41, 0x52, 0x31]);
@@ -110,29 +238,81 @@ export const MAGIC: Uint8Array = /* @__PURE__ */ new Uint8Array([0x50, 0x41, 0x5
  */
 export const MAX_DEFINITION_LEVEL_BIT_WIDTH: number = 1;
 
-/** How each supported column type maps onto Parquet's physical/logical types. */
-export interface PhysicalMapping {
-  readonly physical: number;
-  readonly convertedType?: number;
-}
-
-const MAPPINGS: Record<ColumnType, PhysicalMapping> = {
-  string: { physical: PhysicalType.BYTE_ARRAY, convertedType: ConvertedType.UTF8 },
-  json: { physical: PhysicalType.BYTE_ARRAY, convertedType: ConvertedType.JSON },
-  f64: { physical: PhysicalType.DOUBLE },
-  i64: { physical: PhysicalType.INT64 },
-  bool: { physical: PhysicalType.BOOLEAN },
-  timestamp: { physical: PhysicalType.INT64, convertedType: ConvertedType.TIMESTAMP_MILLIS },
+/** The `Type` id each physical kind is stored as, and back again. */
+const PHYSICAL_IDS: Readonly<Record<PhysicalKind, number>> = {
+  bool: PhysicalType.BOOLEAN,
+  i32: PhysicalType.INT32,
+  i64: PhysicalType.INT64,
+  f32: PhysicalType.FLOAT,
+  f64: PhysicalType.DOUBLE,
+  bytes: PhysicalType.BYTE_ARRAY,
+  fixed: PhysicalType.FIXED_LEN_BYTE_ARRAY,
 };
 
-export function physicalMapping(type: ColumnType): PhysicalMapping {
-  return MAPPINGS[type];
+/** `INT96` has no kind: it is deprecated in the format and permanently refused. */
+const PHYSICAL_KINDS: readonly (PhysicalKind | undefined)[] = [
+  "bool",
+  "i32",
+  "i64",
+  undefined,
+  "f32",
+  "f64",
+  "bytes",
+  "fixed",
+];
+
+export function physicalTypeId(kind: PhysicalKind): number {
+  return PHYSICAL_IDS[kind];
+}
+
+/** The kind a `Type` id stands for, or `undefined` for `INT96` and for no type at all. */
+export function physicalKindOf(id: number): PhysicalKind | undefined {
+  return PHYSICAL_KINDS[id];
+}
+
+const NO_ANNOTATION: Annotation = { kind: "none" };
+
+/** How each built-in column type is stored, and what it is annotated with. */
+const BUILTINS: Readonly<
+  Record<ColumnType, { readonly physical: PhysicalKind; readonly annotation: Annotation }>
+> = {
+  string: { physical: "bytes", annotation: { kind: "string" } },
+  json: { physical: "bytes", annotation: { kind: "json" } },
+  f64: { physical: "f64", annotation: NO_ANNOTATION },
+  f32: { physical: "f32", annotation: NO_ANNOTATION },
+  i64: { physical: "i64", annotation: NO_ANNOTATION },
+  i32: { physical: "i32", annotation: NO_ANNOTATION },
+  bool: { physical: "bool", annotation: NO_ANNOTATION },
+  timestamp: {
+    physical: "i64",
+    annotation: { kind: "timestamp", unit: "millis", isAdjustedToUTC: true },
+  },
+};
+
+/** Which physical type — and therefore which value buffer — a column uses. */
+export function columnPhysical(type: ColumnType | AnyLogicalAdapter): PhysicalKind {
+  return typeof type === "string" ? BUILTINS[type].physical : type.physical;
+}
+
+/** What a column is annotated with on the way into a file. */
+export function columnAnnotation(type: ColumnType | AnyLogicalAdapter): Annotation {
+  return typeof type === "string" ? BUILTINS[type].annotation : type.annotate();
+}
+
+/** A column's `type_length`, which only a `FIXED_LEN_BYTE_ARRAY` has. */
+export function columnTypeLength(type: ColumnType | AnyLogicalAdapter): number | undefined {
+  return typeof type === "string" || type.physical !== "fixed" ? undefined : type.typeLength;
+}
+
+/** What to call a column type in an error message: the name, or the adapter's. */
+export function columnTypeName(type: ColumnType | AnyLogicalAdapter): string {
+  return typeof type === "string" ? type : type.name;
 }
 
 /** Everything the footer needs to know about one column chunk. */
 export interface ColumnChunkMeta {
   readonly name: string;
-  readonly type: ColumnType;
+  readonly type: ColumnType | AnyLogicalAdapter;
   readonly optional: boolean;
   /** `CompressionCodec` id the page bodies were written with. */
   readonly codec: number;
@@ -186,56 +366,168 @@ export function encodeDataPageHeader(
   return writer.toBytes();
 }
 
-function writeSchemaElement(writer: CompactWriter, column: SchemaColumnLike): void {
-  const mapping = physicalMapping(column.type);
-  writer.structBegin();
-  writer.fieldI32(1, mapping.physical);
-  writer.fieldI32(3, column.optional ? FieldRepetitionType.OPTIONAL : FieldRepetitionType.REQUIRED);
-  writer.fieldString(4, column.name);
-  if (mapping.convertedType !== undefined) writer.fieldI32(6, mapping.convertedType);
-
-  // logicalType (field 10) — the modern annotation; ConvertedType above stays
-  // for readers that predate it.
-  switch (column.type) {
+/**
+ * The `ConvertedType` an annotation is also spelled as, or `undefined` where
+ * the deprecated enum has no word for it (`UUID`, `FLOAT16`, and anything in
+ * nanoseconds).
+ *
+ * The legacy spelling defines `TIME_*` and `TIMESTAMP_*` as UTC-normalised,
+ * which an annotation that is not adjusted to UTC contradicts — and it is
+ * still written, because that is what every other writer does (DuckDB's own
+ * `TIME` is a `TIME_MICROS` with `isAdjustedToUTC=0`) and because dropping it
+ * would hide the column from readers that only know the old enum.
+ */
+function convertedTypeOf(annotation: Annotation): number | undefined {
+  switch (annotation.kind) {
     case "string": {
-      writer.fieldStructBegin(10);
-      writer.fieldStructBegin(LogicalTypeId.STRING);
-      writer.structEnd();
-      writer.structEnd();
-      break;
+      return ConvertedType.UTF8;
     }
     case "json": {
-      // JsonType is an empty struct, exactly like StringType: the annotation
-      // says the bytes are JSON text, nothing more.
-      writer.fieldStructBegin(10);
-      writer.fieldStructBegin(LogicalTypeId.JSON);
-      writer.structEnd();
-      writer.structEnd();
-      break;
+      return ConvertedType.JSON;
+    }
+    case "bson": {
+      return ConvertedType.BSON;
+    }
+    case "enum": {
+      return ConvertedType.ENUM;
+    }
+    case "decimal": {
+      return ConvertedType.DECIMAL;
+    }
+    case "date": {
+      return ConvertedType.DATE;
+    }
+    case "time": {
+      return annotation.unit === "millis"
+        ? ConvertedType.TIME_MILLIS
+        : annotation.unit === "micros"
+          ? ConvertedType.TIME_MICROS
+          : undefined;
     }
     case "timestamp": {
+      return annotation.unit === "millis"
+        ? ConvertedType.TIMESTAMP_MILLIS
+        : annotation.unit === "micros"
+          ? ConvertedType.TIMESTAMP_MICROS
+          : undefined;
+    }
+    case "integer": {
+      const width = INTEGER_WIDTH_ORDER.indexOf(annotation.bitWidth);
+      return (annotation.isSigned ? ConvertedType.INT_8 : ConvertedType.UINT_8) + width;
+    }
+    default: {
+      // none, uuid, float16 and unknown have no deprecated spelling.
+      return undefined;
+    }
+  }
+}
+
+/** `UINT_8 … UINT_64` and `INT_8 … INT_64` both run in this order. */
+const INTEGER_WIDTH_ORDER: readonly (8 | 16 | 32 | 64)[] = [8, 16, 32, 64];
+
+/** Writes the `TimeUnit` union inside a `TimeType` / `TimestampType`. */
+function writeTimeUnit(writer: CompactWriter, unit: TimeUnitName): void {
+  writer.fieldStructBegin(2); // unit
+  writer.fieldStructBegin(TIME_UNIT_IDS[unit]);
+  writer.structEnd();
+  writer.structEnd();
+}
+
+/**
+ * Writes `logicalType` (field 10), the modern annotation; the `ConvertedType`
+ * beside it stays for readers that predate the union.
+ *
+ * Every member is an empty struct unless the format gives it parameters, and
+ * the parameterised ones are written in `parquet.thrift`'s own field order.
+ */
+function writeLogicalType(writer: CompactWriter, annotation: Annotation): void {
+  switch (annotation.kind) {
+    case "string":
+    case "enum":
+    case "date":
+    case "json":
+    case "bson":
+    case "uuid":
+    case "float16": {
+      // An empty struct: the annotation is the name, and says nothing more.
       writer.fieldStructBegin(10);
-      writer.fieldStructBegin(LogicalTypeId.TIMESTAMP);
-      // ConvertedType TIMESTAMP_MILLIS is defined as UTC-normalised, so the
-      // logical annotation must say so too (LogicalTypes.md, backward compat).
-      writer.fieldBool(1, true); // isAdjustedToUTC
-      writer.fieldStructBegin(2); // unit
-      writer.fieldStructBegin(TimeUnit.MILLIS);
-      writer.structEnd();
-      writer.structEnd();
+      writer.fieldStructBegin(EMPTY_LOGICAL_TYPE_IDS[annotation.kind]);
       writer.structEnd();
       writer.structEnd();
       break;
     }
-    // No default: the remaining types carry no logical annotation at all.
+    case "decimal": {
+      writer.fieldStructBegin(10);
+      writer.fieldStructBegin(LogicalTypeId.DECIMAL);
+      writer.fieldI32(1, annotation.scale); // DecimalType puts scale first
+      writer.fieldI32(2, annotation.precision);
+      writer.structEnd();
+      writer.structEnd();
+      break;
+    }
+    case "time":
+    case "timestamp": {
+      writer.fieldStructBegin(10);
+      writer.fieldStructBegin(
+        annotation.kind === "time" ? LogicalTypeId.TIME : LogicalTypeId.TIMESTAMP,
+      );
+      writer.fieldBool(1, annotation.isAdjustedToUTC);
+      writeTimeUnit(writer, annotation.unit);
+      writer.structEnd();
+      writer.structEnd();
+      break;
+    }
+    case "integer": {
+      writer.fieldStructBegin(10);
+      writer.fieldStructBegin(LogicalTypeId.INTEGER);
+      writer.fieldI8(1, annotation.bitWidth); // IntType.bitWidth is an i8
+      writer.fieldBool(2, annotation.isSigned);
+      writer.structEnd();
+      writer.structEnd();
+      break;
+    }
+    // No default: `none` carries no annotation at all, and `unknown` never
+    // reaches a schema — `defineColumnType` refuses an adapter that returns one.
   }
+}
+
+/** The members of the union that are a bare name and nothing else. */
+const EMPTY_LOGICAL_TYPE_IDS: Readonly<
+  Record<"string" | "enum" | "date" | "json" | "bson" | "uuid" | "float16", number>
+> = {
+  string: LogicalTypeId.STRING,
+  enum: LogicalTypeId.ENUM,
+  date: LogicalTypeId.DATE,
+  json: LogicalTypeId.JSON,
+  bson: LogicalTypeId.BSON,
+  uuid: LogicalTypeId.UUID,
+  float16: LogicalTypeId.FLOAT16,
+};
+
+function writeSchemaElement(writer: CompactWriter, column: SchemaColumnLike): void {
+  const annotation = columnAnnotation(column.type);
+  const typeLength = columnTypeLength(column.type);
+  writer.structBegin();
+  writer.fieldI32(1, physicalTypeId(columnPhysical(column.type)));
+  if (typeLength !== undefined) writer.fieldI32(2, typeLength);
+  writer.fieldI32(3, column.optional ? FieldRepetitionType.OPTIONAL : FieldRepetitionType.REQUIRED);
+  writer.fieldString(4, column.name);
+  const convertedType = convertedTypeOf(annotation);
+  if (convertedType !== undefined) writer.fieldI32(6, convertedType);
+  if (annotation.kind === "decimal") {
+    // The deprecated decimal spelling keeps its parameters on the element
+    // itself, and the format requires them there for a DECIMAL column.
+    writer.fieldI32(7, annotation.scale);
+    writer.fieldI32(8, annotation.precision);
+  }
+  writeLogicalType(writer, annotation);
   writer.structEnd();
 }
 
 /** The shape `writeSchemaElement` needs; satisfied by both schema and chunk metadata. */
 export interface SchemaColumnLike {
   readonly name: string;
-  readonly type: ColumnType;
+  readonly type: ColumnType | AnyLogicalAdapter;
   readonly optional: boolean;
 }
 
@@ -245,7 +537,7 @@ function writeColumnChunk(writer: CompactWriter, chunk: ColumnChunkMeta): void {
   // ColumnMetaData is written outside the footer, which is our case.
   writer.fieldI64(2, 0n);
   writer.fieldStructBegin(3); // meta_data
-  writer.fieldI32(1, physicalMapping(chunk.type).physical);
+  writer.fieldI32(1, physicalTypeId(columnPhysical(chunk.type)));
   const encodings = chunk.optional ? [Encoding.RLE, Encoding.PLAIN] : [Encoding.PLAIN];
   writer.fieldListBegin(2, ThriftType.I32, encodings.length);
   for (const encoding of encodings) writer.elementI32(encoding);
@@ -312,7 +604,11 @@ export function encodeFileMetadata(
  * ---------------------------------------------------------------------------
  */
 
-/** Names for the enum values the reader may have to reject, so errors can say what it found. */
+/**
+ * Names for the enum values the reader may have to reject, so errors can say what
+ * it found. The deprecated `ConvertedType` has no table of its own: it is
+ * decoded into the annotation model, and an annotation names itself.
+ */
 const PHYSICAL_TYPE_NAMES = [
   "BOOLEAN",
   "INT32",
@@ -322,31 +618,6 @@ const PHYSICAL_TYPE_NAMES = [
   "DOUBLE",
   "BYTE_ARRAY",
   "FIXED_LEN_BYTE_ARRAY",
-];
-
-const CONVERTED_TYPE_NAMES = [
-  "UTF8",
-  "MAP",
-  "MAP_KEY_VALUE",
-  "LIST",
-  "ENUM",
-  "DECIMAL",
-  "DATE",
-  "TIME_MILLIS",
-  "TIME_MICROS",
-  "TIMESTAMP_MILLIS",
-  "TIMESTAMP_MICROS",
-  "UINT_8",
-  "UINT_16",
-  "UINT_32",
-  "UINT_64",
-  "INT_8",
-  "INT_16",
-  "INT_32",
-  "INT_64",
-  "JSON",
-  "BSON",
-  "INTERVAL",
 ];
 
 const LOGICAL_TYPE_NAMES = [
@@ -359,7 +630,7 @@ const LOGICAL_TYPE_NAMES = [
   "DATE",
   "TIME",
   "TIMESTAMP",
-  "",
+  "INTERVAL", // reserved in the union, and what the deprecated enum called it
   "INTEGER",
   "UNKNOWN",
   "JSON",
@@ -370,8 +641,6 @@ const LOGICAL_TYPE_NAMES = [
   "GEOMETRY",
   "GEOGRAPHY",
 ];
-
-const TIME_UNIT_NAMES = ["", "MILLIS", "MICROS", "NANOS"];
 
 const ENCODING_NAMES = [
   "PLAIN",
@@ -399,16 +668,8 @@ export function physicalTypeName(id: number | undefined): string {
   return nameOf(PHYSICAL_TYPE_NAMES, id, "physical type");
 }
 
-export function convertedTypeName(id: number | undefined): string {
-  return nameOf(CONVERTED_TYPE_NAMES, id, "converted type");
-}
-
 export function logicalTypeName(id: number | undefined): string {
   return nameOf(LOGICAL_TYPE_NAMES, id, "logical type");
-}
-
-export function timeUnitName(id: number | undefined): string {
-  return nameOf(TIME_UNIT_NAMES, id, "time unit");
 }
 
 export function encodingName(id: number | undefined): string {
@@ -423,22 +684,135 @@ export function pageTypeName(id: number | undefined): string {
   return nameOf(PAGE_TYPE_NAMES, id, "page type");
 }
 
-/** A `LogicalType` union, reduced to the two facts the reader acts on. */
-export interface LogicalType {
-  /** The union's field id; see {@link LogicalTypeId}. */
-  readonly id: number;
-  /** For `TIMESTAMP`, the `TimeUnit` union field id; see {@link TimeUnit}. */
-  readonly unit?: number;
+/**
+ * How an annotation reads in an error message, parameters included: the point
+ * of refusing by name is that the name says everything the caller needs to
+ * write an adapter for it.
+ */
+export function annotationName(annotation: Annotation): string {
+  switch (annotation.kind) {
+    case "decimal": {
+      return `DECIMAL(precision=${annotation.precision}, scale=${annotation.scale})`;
+    }
+    case "time":
+    case "timestamp": {
+      const name = annotation.kind === "time" ? "TIME" : "TIMESTAMP";
+      return `${name}(${annotation.unit.toUpperCase()}, isAdjustedToUTC=${annotation.isAdjustedToUTC})`;
+    }
+    case "integer": {
+      return `INTEGER(${annotation.bitWidth}, ${annotation.isSigned ? "signed" : "unsigned"})`;
+    }
+    case "unknown": {
+      return annotation.id === UNNAMED_ANNOTATION
+        ? "an annotation this version has no name for"
+        : logicalTypeName(annotation.id);
+    }
+    default: {
+      // Every remaining member is a bare name, and `none` is never named.
+      return annotation.kind.toUpperCase();
+    }
+  }
 }
 
 /** One `SchemaElement`, as far as the reader inspects it. */
 export interface SchemaElement {
   readonly name: string;
   readonly physical?: number;
+  /** `type_length`, the byte width of a `FIXED_LEN_BYTE_ARRAY`. */
+  readonly typeLength?: number;
   readonly repetition?: number;
   readonly numChildren: number;
   readonly convertedType?: number;
-  readonly logical?: LogicalType;
+  /** The deprecated decimal parameters, which live on the element rather than in the annotation. */
+  readonly scale?: number;
+  readonly precision?: number;
+  /** The modern annotation, already reduced to the model; wins over `convertedType`. */
+  readonly logical?: Annotation;
+}
+
+/**
+ * What a `SchemaElement` says its column means.
+ *
+ * The modern `LogicalType` wins wherever a file carries both spellings, which
+ * is what the format prescribes: the deprecated enum cannot express half of
+ * what the union can, so where they disagree the union is the truth.
+ *
+ * Nothing here throws. An annotation this version cannot name decodes to
+ * `unknown` and is refused — by name — one layer up, where the column is
+ * known and an adapter has had its chance to claim it.
+ */
+export function annotationOf(element: SchemaElement): Annotation {
+  return element.logical ?? convertedAnnotation(element);
+}
+
+/** Reads the deprecated `ConvertedType` (plus its element-level parameters) into the model. */
+function convertedAnnotation(element: SchemaElement): Annotation {
+  const { convertedType } = element;
+  switch (convertedType) {
+    case undefined: {
+      return NO_ANNOTATION;
+    }
+    case ConvertedType.UTF8: {
+      return { kind: "string" };
+    }
+    case ConvertedType.JSON: {
+      return { kind: "json" };
+    }
+    case ConvertedType.BSON: {
+      return { kind: "bson" };
+    }
+    case ConvertedType.ENUM: {
+      return { kind: "enum" };
+    }
+    case ConvertedType.DATE: {
+      return { kind: "date" };
+    }
+    case ConvertedType.DECIMAL: {
+      return { kind: "decimal", precision: element.precision ?? 0, scale: element.scale ?? 0 };
+    }
+    case ConvertedType.TIME_MILLIS:
+    case ConvertedType.TIME_MICROS:
+    case ConvertedType.TIMESTAMP_MILLIS:
+    case ConvertedType.TIMESTAMP_MICROS: {
+      // The deprecated spelling only knows two resolutions, and defines both as
+      // UTC-normalised (LogicalTypes.md, backward compatibility).
+      const millis =
+        convertedType === ConvertedType.TIME_MILLIS ||
+        convertedType === ConvertedType.TIMESTAMP_MILLIS;
+      return {
+        kind: convertedType <= ConvertedType.TIME_MICROS ? "time" : "timestamp",
+        unit: millis ? "millis" : "micros",
+        isAdjustedToUTC: true,
+      };
+    }
+    case ConvertedType.UINT_8:
+    case ConvertedType.UINT_16:
+    case ConvertedType.UINT_32:
+    case ConvertedType.UINT_64:
+    case ConvertedType.INT_8:
+    case ConvertedType.INT_16:
+    case ConvertedType.INT_32:
+    case ConvertedType.INT_64: {
+      const isSigned = convertedType >= ConvertedType.INT_8;
+      const base = isSigned ? ConvertedType.INT_8 : ConvertedType.UINT_8;
+      return { kind: "integer", bitWidth: INTEGER_WIDTH_ORDER[convertedType - base], isSigned };
+    }
+    case ConvertedType.MAP:
+    case ConvertedType.MAP_KEY_VALUE: {
+      return { kind: "unknown", id: LogicalTypeId.MAP };
+    }
+    case ConvertedType.LIST: {
+      return { kind: "unknown", id: LogicalTypeId.LIST };
+    }
+    case ConvertedType.INTERVAL: {
+      return { kind: "unknown", id: LogicalTypeId.INTERVAL };
+    }
+    default: {
+      // An id outside the enum: real Parquet has none, and guessing `none`
+      // would read a column tavolato cannot vouch for.
+      return { kind: "unknown", id: UNNAMED_ANNOTATION };
+    }
+  }
 }
 
 /** One `ColumnChunk` plus its inlined `ColumnMetaData`. */
@@ -496,45 +870,175 @@ function eachField(reader: CompactReader, read: (field: ThriftField) => boolean)
   reader.structEnd();
 }
 
-function decodeTimeUnit(reader: CompactReader): number | undefined {
-  let unit: number | undefined;
+function decodeTimeUnit(reader: CompactReader): TimeUnitName | undefined {
+  let unit: TimeUnitName | undefined;
   eachField(reader, (field) => {
-    unit = field.id;
+    unit = TIME_UNIT_KINDS[field.id];
     return false; // the union's payload is an empty struct; skipping it reads the stop byte
   });
   return unit;
 }
 
-function decodeLogicalType(reader: CompactReader): LogicalType {
-  let id = 0;
-  let unit: number | undefined;
+/** `TimeType` and `TimestampType` are the same two fields, in the same order. */
+function decodeTimeLike(reader: CompactReader, kind: "time" | "timestamp"): Annotation {
+  let isAdjustedToUTC = false;
+  let unit: TimeUnitName | undefined;
   eachField(reader, (field) => {
-    id = field.id;
-    if (field.id !== LogicalTypeId.TIMESTAMP || field.type !== ThriftType.STRUCT) return false;
-    // TimestampType { 1: isAdjustedToUTC, 2: unit }. The UTC flag is advisory
-    // here: the value is epoch milliseconds either way, and that is what a
-    // `Date` holds.
-    eachField(reader, (inner) => {
-      if (inner.id !== 2 || inner.type !== ThriftType.STRUCT) return false;
-      unit = decodeTimeUnit(reader);
-      return true;
-    });
-    return true;
+    switch (field.id) {
+      case 1: {
+        // A bool carries its value in the field header, so there is nothing to read.
+        isAdjustedToUTC = reader.bool(field.type);
+        return true;
+      }
+      case 2: {
+        if (field.type !== ThriftType.STRUCT) return false;
+        unit = decodeTimeUnit(reader);
+        return true;
+      }
+      default: {
+        return false;
+      }
+    }
   });
-  return { id, unit };
+  // A resolution nobody has named yet is not a `TIME` this version understands,
+  // and pretending it is milliseconds would move every value.
+  return unit === undefined
+    ? { kind: "unknown", id: kind === "time" ? LogicalTypeId.TIME : LogicalTypeId.TIMESTAMP }
+    : { kind, unit, isAdjustedToUTC };
+}
+
+/** `DecimalType { 1: scale, 2: precision }` — scale first, as the format has it. */
+function decodeDecimalType(reader: CompactReader): Annotation {
+  let scale = 0;
+  let precision = 0;
+  eachField(reader, (field) => {
+    switch (field.id) {
+      case 1: {
+        scale = reader.i32();
+        return true;
+      }
+      case 2: {
+        precision = reader.i32();
+        return true;
+      }
+      default: {
+        return false;
+      }
+    }
+  });
+  return { kind: "decimal", precision, scale };
+}
+
+/** `IntType { 1: i8 bitWidth, 2: bool isSigned }`. */
+function decodeIntType(reader: CompactReader): Annotation {
+  let bitWidth = 0;
+  let isSigned = false;
+  eachField(reader, (field) => {
+    switch (field.id) {
+      case 1: {
+        if (field.type !== ThriftType.I8) return false;
+        bitWidth = reader.i8();
+        return true;
+      }
+      case 2: {
+        isSigned = reader.bool(field.type);
+        return true;
+      }
+      default: {
+        return false;
+      }
+    }
+  });
+  const width = INTEGER_WIDTH_ORDER.find((candidate) => candidate === bitWidth);
+  return width === undefined
+    ? { kind: "unknown", id: LogicalTypeId.INTEGER }
+    : { kind: "integer", bitWidth: width, isSigned };
+}
+
+/**
+ * Reads the `LogicalType` union straight into the annotation model.
+ *
+ * A member with no parameters is skipped rather than descended into, which
+ * consumes its empty struct's stop byte; the parameterised ones are read here
+ * and nowhere else. An unrecognised member — a `VARIANT`, a `GEOMETRY`, or
+ * whatever a later release adds — decodes to its field id, so it can still be
+ * named in a refusal and still be offered to an adapter.
+ */
+function decodeLogicalType(reader: CompactReader): Annotation {
+  let annotation: Annotation = { kind: "unknown", id: UNNAMED_ANNOTATION };
+  eachField(reader, (field) => {
+    switch (field.id) {
+      case LogicalTypeId.STRING: {
+        annotation = { kind: "string" };
+        return false;
+      }
+      case LogicalTypeId.ENUM: {
+        annotation = { kind: "enum" };
+        return false;
+      }
+      case LogicalTypeId.DATE: {
+        annotation = { kind: "date" };
+        return false;
+      }
+      case LogicalTypeId.JSON: {
+        annotation = { kind: "json" };
+        return false;
+      }
+      case LogicalTypeId.BSON: {
+        annotation = { kind: "bson" };
+        return false;
+      }
+      case LogicalTypeId.UUID: {
+        annotation = { kind: "uuid" };
+        return false;
+      }
+      case LogicalTypeId.FLOAT16: {
+        annotation = { kind: "float16" };
+        return false;
+      }
+      case LogicalTypeId.DECIMAL: {
+        if (field.type !== ThriftType.STRUCT) return false;
+        annotation = decodeDecimalType(reader);
+        return true;
+      }
+      case LogicalTypeId.TIME:
+      case LogicalTypeId.TIMESTAMP: {
+        if (field.type !== ThriftType.STRUCT) return false;
+        annotation = decodeTimeLike(reader, field.id === LogicalTypeId.TIME ? "time" : "timestamp");
+        return true;
+      }
+      case LogicalTypeId.INTEGER: {
+        if (field.type !== ThriftType.STRUCT) return false;
+        annotation = decodeIntType(reader);
+        return true;
+      }
+      default: {
+        annotation = { kind: "unknown", id: field.id };
+        return false;
+      }
+    }
+  });
+  return annotation;
 }
 
 function decodeSchemaElement(reader: CompactReader): SchemaElement {
   let name = "";
   let physical: number | undefined;
+  let typeLength: number | undefined;
   let repetition: number | undefined;
   let numChildren = 0;
   let convertedType: number | undefined;
-  let logical: LogicalType | undefined;
+  let scale: number | undefined;
+  let precision: number | undefined;
+  let logical: Annotation | undefined;
   eachField(reader, (field) => {
     switch (field.id) {
       case 1: {
         physical = reader.i32();
+        return true;
+      }
+      case 2: {
+        typeLength = reader.i32();
         return true;
       }
       case 3: {
@@ -553,6 +1057,14 @@ function decodeSchemaElement(reader: CompactReader): SchemaElement {
         convertedType = reader.i32();
         return true;
       }
+      case 7: {
+        scale = reader.i32();
+        return true;
+      }
+      case 8: {
+        precision = reader.i32();
+        return true;
+      }
       case 10: {
         if (field.type !== ThriftType.STRUCT) return false;
         logical = decodeLogicalType(reader);
@@ -563,7 +1075,17 @@ function decodeSchemaElement(reader: CompactReader): SchemaElement {
       }
     }
   });
-  return { name, physical, repetition, numChildren, convertedType, logical };
+  return {
+    name,
+    physical,
+    typeLength,
+    repetition,
+    numChildren,
+    convertedType,
+    scale,
+    precision,
+    logical,
+  };
 }
 
 function decodeColumnMetaData(reader: CompactReader, chunk: MutableChunk): void {

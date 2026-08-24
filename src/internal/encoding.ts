@@ -1,14 +1,23 @@
 import { ByteReader, ByteWriter } from "./bytes.ts";
 import { malformed } from "../error.ts";
+import type { PhysicalKind } from "../types.ts";
 
 /**
  * Non-null column values, kept in the shape the PLAIN encoder wants so no
  * per-value type checks are needed when a page is flushed.
+ *
+ * One member per {@link PhysicalKind}: the buffer's kind *is* the column's
+ * physical type, which is what lets an adapter name its storage and get the
+ * right buffer without a second table.
  */
 export type ColumnValues =
   | { readonly kind: "bytes"; readonly items: Uint8Array[] }
+  /** Every item is exactly `typeLength` bytes long; the writer checks that before it buffers one. */
+  | { readonly kind: "fixed"; readonly typeLength: number; readonly items: Uint8Array[] }
   | { readonly kind: "f64"; readonly items: number[] }
+  | { readonly kind: "f32"; readonly items: number[] }
   | { readonly kind: "i64"; readonly items: bigint[] }
+  | { readonly kind: "i32"; readonly items: number[] }
   | { readonly kind: "bool"; readonly items: boolean[] };
 
 /**
@@ -26,12 +35,25 @@ export function writePlain(out: ByteWriter, values: ColumnValues): void {
       }
       break;
     }
+    case "fixed": {
+      // FIXED_LEN_BYTE_ARRAY: the width is in the schema, so no length prefix.
+      for (const item of values.items) out.raw(item);
+      break;
+    }
     case "f64": {
       for (const item of values.items) out.f64(item);
       break;
     }
+    case "f32": {
+      for (const item of values.items) out.f32(item);
+      break;
+    }
     case "i64": {
       for (const item of values.items) out.i64(item);
+      break;
+    }
+    case "i32": {
+      for (const item of values.items) out.i32(item);
       break;
     }
     case "bool": {
@@ -56,11 +78,15 @@ export function writePlain(out: ByteWriter, values: ColumnValues): void {
  * `count` is the number of *present* values, which for a nullable column is
  * fewer than the page's `num_values`: nulls occupy a definition level but no
  * bytes in the value stream.
+ *
+ * `typeLength` is the schema's `type_length` and is only read for `"fixed"`,
+ * the one kind whose values carry no width of their own.
  */
 export function readPlain(
   input: ByteReader,
-  kind: ColumnValues["kind"],
+  kind: PhysicalKind,
   count: number,
+  typeLength = 0,
 ): ColumnValues {
   switch (kind) {
     case "bytes": {
@@ -68,14 +94,29 @@ export function readPlain(
       for (let index = 0; index < count; index++) items.push(input.raw(input.u32()));
       return { kind, items };
     }
+    case "fixed": {
+      const items: Uint8Array[] = [];
+      for (let index = 0; index < count; index++) items.push(input.raw(typeLength));
+      return { kind, typeLength, items };
+    }
     case "f64": {
       const items: number[] = [];
       for (let index = 0; index < count; index++) items.push(input.f64());
       return { kind, items };
     }
+    case "f32": {
+      const items: number[] = [];
+      for (let index = 0; index < count; index++) items.push(input.f32());
+      return { kind, items };
+    }
     case "i64": {
       const items: bigint[] = [];
       for (let index = 0; index < count; index++) items.push(input.i64());
+      return { kind, items };
+    }
+    case "i32": {
+      const items: number[] = [];
+      for (let index = 0; index < count; index++) items.push(input.i32());
       return { kind, items };
     }
     case "bool": {

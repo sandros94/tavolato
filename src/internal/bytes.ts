@@ -51,10 +51,25 @@ export class ByteWriter {
     this.#view.setUint32(offset, value, true);
   }
 
+  /** Appends a signed 32-bit integer, little-endian. */
+  i32(value: number): void {
+    const offset = this.#reserve(4);
+    this.#view.setInt32(offset, value, true);
+  }
+
   /** Appends a signed 64-bit integer, little-endian. */
   i64(value: bigint): void {
     const offset = this.#reserve(8);
     this.#view.setBigInt64(offset, value, true);
+  }
+
+  /**
+   * Appends an IEEE-754 single, little-endian. The value is rounded to single
+   * precision here, once, and every read of it afterwards is exact.
+   */
+  f32(value: number): void {
+    const offset = this.#reserve(4);
+    this.#view.setFloat32(offset, value, true);
   }
 
   /** Appends an IEEE-754 double, little-endian. */
@@ -178,9 +193,19 @@ export class ByteReader {
     return this.#view.getUint32(this.#take(4), true);
   }
 
+  /** Reads a signed 32-bit integer, little-endian. */
+  i32(): number {
+    return this.#view.getInt32(this.#take(4), true);
+  }
+
   /** Reads a signed 64-bit integer, little-endian. */
   i64(): bigint {
     return this.#view.getBigInt64(this.#take(8), true);
+  }
+
+  /** Reads an IEEE-754 single, little-endian. */
+  f32(): number {
+    return this.#view.getFloat32(this.#take(4), true);
   }
 
   /** Reads an IEEE-754 double, little-endian. */

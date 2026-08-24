@@ -61,10 +61,11 @@ export function unzigzag64(value: bigint): bigint {
  * A minimal Thrift compact protocol *writer*.
  *
  * Only the subset Parquet footers actually need is implemented: structs
- * (including nested ones and unions, which encode identically), `bool`, `i32`,
- * `i64`, `double`, `binary` / `string`, and homogeneous `list`s of `i32`,
- * `binary` and `struct`. Maps, sets, `i8`/`i16`, `uuid` and the RPC message
- * envelope are intentionally absent — Parquet metadata never uses them.
+ * (including nested ones and unions, which encode identically), `bool`, `i8`,
+ * `i32`, `i64`, `double`, `binary` / `string`, and homogeneous `list`s of
+ * `i32`, `binary` and `struct`. Maps, sets, `i16`, `uuid` and the RPC message
+ * envelope are intentionally absent — Parquet metadata never uses them. `i8`
+ * earns its place with a single field in the whole format: `IntType.bitWidth`.
  *
  * Field ids must be written in ascending order within a struct, which is what
  * lets the encoder always take the compact one-byte "field id delta" form.
@@ -107,6 +108,12 @@ export class CompactWriter {
   /** Booleans carry their value in the field header itself, so they add no bytes. */
   fieldBool(id: number, value: boolean): void {
     this.#header(id, value ? ThriftType.BOOLEAN_TRUE : ThriftType.BOOLEAN_FALSE);
+  }
+
+  /** An `i8` is the one integer the compact protocol stores raw, not as a zigzag varint. */
+  fieldI8(id: number, value: number): void {
+    this.#header(id, ThriftType.I8);
+    this.out.u8(value);
   }
 
   fieldI32(id: number, value: number): void {
@@ -194,8 +201,8 @@ const MAX_SKIP_DEPTH = 64;
  * A minimal Thrift compact protocol *reader*, the mirror of
  * {@link CompactWriter}.
  *
- * It decodes the same subset the writer emits — structs, `bool`, `i32`, `i64`,
- * `double`, `binary` / `string` and `list` — and can additionally *skip* any
+ * It decodes the same subset the writer emits — structs, `bool`, `i8`, `i32`,
+ * `i64`, `double`, `binary` / `string` and `list` — and can additionally *skip* any
  * value of any compact type, including maps, sets and types it has no accessor
  * for. Skipping is what the Thrift protocol prescribes for unrecognised
  * fields, and it is what lets a future Parquet release add footer fields
@@ -248,6 +255,11 @@ export class CompactReader {
   /** Booleans carry their value in the field header, so the type id *is* the value. */
   bool(type: number): boolean {
     return type === ThriftType.BOOLEAN_TRUE;
+  }
+
+  /** The mirror of {@link CompactWriter.fieldI8}: one raw byte, sign extended. */
+  i8(): number {
+    return (this.in.u8() << 24) >> 24;
   }
 
   i32(): number {

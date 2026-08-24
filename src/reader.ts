@@ -2,37 +2,46 @@ import { ByteReader, decodeUtf8 } from "./internal/bytes.ts";
 import { chain, chainEach, isThenable } from "./internal/chain.ts";
 import { type ColumnValues, decodeRleBitPackedHybrid, readPlain } from "./internal/encoding.ts";
 import {
+  annotationName,
+  annotationOf,
   codecName,
   type ColumnChunkInfo,
+  columnPhysical,
   CompressionCodec,
-  convertedTypeName,
-  ConvertedType,
   decodeFileMetadata,
   decodePageHeader,
   Encoding,
   encodingName,
   FieldRepetitionType,
-  logicalTypeName,
-  LogicalTypeId,
   MAGIC,
   MAX_DEFINITION_LEVEL_BIT_WIDTH,
   type PageHeaderInfo,
   PageType,
   pageTypeName,
-  physicalMapping,
+  physicalKindOf,
   PhysicalType,
+  physicalTypeId,
   physicalTypeName,
   registrableCodec,
   type RowGroupInfo,
   type SchemaElement,
-  timeUnitName,
-  TimeUnit,
 } from "./internal/format.ts";
-import { malformed, type TavolatoError, unsupported } from "./error.ts";
+import { adapterProblem } from "./adapters.ts";
+import {
+  badOption,
+  describe,
+  malformed,
+  type TavolatoError,
+  TYPES_REMEDY,
+  unsupported,
+} from "./error.ts";
 import type {
+  Annotation,
+  AnyLogicalAdapter,
   ColumnType,
   ParquetFile,
   ParquetSchema,
+  PhysicalKind,
   ReadOptions,
   ReadRow,
   ReadValue,
@@ -42,33 +51,6 @@ import type {
 
 /** Leading magic, the footer length, and the trailing magic: the smallest envelope. */
 const MIN_FILE_BYTES = MAGIC.length * 2 + 4;
-
-/**
- * What a `SchemaElement`'s annotation says, once converted and logical types
- * have been reconciled. `int-64` is `INT_64`, which annotates an `INT64` with
- * the domain it already has.
- */
-type Annotation = "none" | "string" | "json" | "timestamp-millis" | "int-64";
-
-/** Which PLAIN buffer shape a column type is stored in. */
-function plainKind(type: ColumnType): ColumnValues["kind"] {
-  switch (type) {
-    case "string":
-    case "json": {
-      return "bytes";
-    }
-    case "f64": {
-      return "f64";
-    }
-    case "bool": {
-      return "bool";
-    }
-    default: {
-      // i64 and timestamp both land on INT64.
-      return "i64";
-    }
-  }
-}
 
 function hasMagic(bytes: Uint8Array, offset: number): boolean {
   for (let index = 0; index < MAGIC.length; index++) {
@@ -107,114 +89,154 @@ function locateFooter(bytes: Uint8Array): Uint8Array {
 }
 
 /**
- * Reduces a `SchemaElement`'s converted and logical type to a single
- * annotation, rejecting by name anything tavolato has no column type for.
+ * The built-in column type for a bare physical type, or `undefined` where the
+ * annotation means something tavolato has no built-in reading for.
+ *
+ * Two leniencies live here, and neither moves a value. `INT_32` / `INT_64`
+ * (however they are spelled) say exactly what the bare physical type already
+ * says, so they read as `i32` and `i64`; and a `TIMESTAMP(MILLIS)` reads as a
+ * `Date` whichever way its UTC flag points, because a `Date` is an instant and
+ * the milliseconds are the same number either way. Together they are what lets
+ * DuckDB's own `COPY … (FORMAT PARQUET)` output be read directly.
  */
-function annotationOf(element: SchemaElement): Annotation {
-  const { logical, name } = element;
-  if (logical !== undefined) {
-    switch (logical.id) {
-      case LogicalTypeId.STRING: {
-        return "string";
-      }
-      case LogicalTypeId.JSON: {
-        return "json";
-      }
-      case LogicalTypeId.TIMESTAMP: {
-        if (logical.unit !== TimeUnit.MILLIS) {
-          throw unsupported(`column "${name}", a TIMESTAMP in ${timeUnitName(logical.unit)}`, name);
-        }
-        return "timestamp-millis";
-      }
-      default: {
-        throw unsupported(`column "${name}", annotated ${logicalTypeName(logical.id)}`, name);
-      }
+function builtinTypeOf(physical: PhysicalKind, annotation: Annotation): ColumnType | undefined {
+  const bare = annotation.kind === "none";
+  switch (physical) {
+    case "bool": {
+      return bare ? "bool" : undefined;
     }
-  }
-  switch (element.convertedType) {
-    case undefined: {
-      return "none";
+    case "f64": {
+      return bare ? "f64" : undefined;
     }
-    case ConvertedType.UTF8: {
-      return "string";
+    case "f32": {
+      return bare ? "f32" : undefined;
     }
-    case ConvertedType.JSON: {
-      return "json";
+    case "i32": {
+      return bare || isPlainInteger(annotation, 32) ? "i32" : undefined;
     }
-    case ConvertedType.TIMESTAMP_MILLIS: {
-      return "timestamp-millis";
+    case "i64": {
+      if (bare || isPlainInteger(annotation, 64)) return "i64";
+      return annotation.kind === "timestamp" && annotation.unit === "millis"
+        ? "timestamp"
+        : undefined;
     }
-    case ConvertedType.INT_64: {
-      return "int-64";
+    case "bytes": {
+      if (annotation.kind === "string") return "string";
+      return annotation.kind === "json" ? "json" : undefined;
     }
     default: {
-      throw unsupported(
-        `column "${name}", annotated ${convertedTypeName(element.convertedType)}`,
-        name,
-      );
+      // A FIXED_LEN_BYTE_ARRAY never has a built-in meaning: every use of it
+      // in the format is an annotation, and an annotation is an adapter's.
+      return undefined;
     }
   }
 }
 
-/** Maps one leaf `SchemaElement` onto a column type, or refuses it by name. */
-function columnTypeOf(element: SchemaElement): ColumnType {
+/** Whether an annotation says no more than the signed physical type it sits on. */
+function isPlainInteger(annotation: Annotation, bitWidth: 32 | 64): boolean {
+  return annotation.kind === "integer" && annotation.bitWidth === bitWidth && annotation.isSigned;
+}
+
+/**
+ * Finds the adapter that claims a column, if any.
+ *
+ * Registration order is the resolution order: the first adapter whose physical
+ * type, byte width and `matches` all agree takes the column. A `matches` that
+ * throws is the caller's option misbehaving, not the file's fault, and says so.
+ */
+function claimedBy(
+  element: SchemaElement,
+  physical: PhysicalKind,
+  typeLength: number | undefined,
+  annotation: Annotation,
+  types: readonly AnyLogicalAdapter[],
+): AnyLogicalAdapter | undefined {
+  for (const adapter of types) {
+    if (adapter.physical !== physical) continue;
+    if (physical === "fixed" && adapter.typeLength !== typeLength) continue;
+    let claimed: boolean;
+    try {
+      claimed = adapter.matches(annotation, physical);
+    } catch (cause) {
+      throw badOption(
+        `The column type ${adapter.name} threw from matches() on column "${element.name}"`,
+        element.name,
+        cause,
+      );
+    }
+    if (claimed) return adapter;
+  }
+  return undefined;
+}
+
+/** Maps one leaf `SchemaElement` onto a column, or refuses it by name. */
+function columnOf(element: SchemaElement, types: readonly AnyLogicalAdapter[]): SchemaColumn {
   const { name, physical } = element;
   if (physical === undefined) {
     throw malformed(`Column "${name}" declares no physical type`, name);
   }
-  const annotation = annotationOf(element);
-  switch (physical) {
-    case PhysicalType.BOOLEAN: {
-      if (annotation === "none") return "bool";
-      break;
-    }
-    case PhysicalType.DOUBLE: {
-      if (annotation === "none") return "f64";
-      break;
-    }
-    case PhysicalType.INT64: {
-      if (annotation === "none" || annotation === "int-64") return "i64";
-      if (annotation === "timestamp-millis") return "timestamp";
-      break;
-    }
-    case PhysicalType.BYTE_ARRAY: {
-      if (annotation === "string") return "string";
-      if (annotation === "json") return "json";
-      // An unannotated BYTE_ARRAY is raw binary, which tavolato has no type for.
-      break;
-    }
-    // No default: every other physical type falls through to the throw below.
+  if (physical === PhysicalType.INT96) {
+    // Deprecated by the format itself. tavolato may refuse anything Parquet has
+    // deprecated outright, and owes no hook for it — this is the named case.
+    throw unsupported(
+      `column "${name}", an INT96 — a type the format deprecated, and one tavolato refuses permanently`,
+      name,
+    );
   }
-  throw unsupported(
-    annotation === "none"
-      ? `column "${name}", an unannotated ${physicalTypeName(physical)}`
-      : `column "${name}", a ${physicalTypeName(physical)} annotated ${convertedAnnotationName(annotation)}`,
-    name,
-  );
-}
+  const kind = physicalKindOf(physical);
+  if (kind === undefined) {
+    throw malformed(
+      `Column "${name}" declares the physical type ${physical}, which Parquet does not define`,
+      name,
+    );
+  }
 
-function convertedAnnotationName(annotation: Annotation): string {
-  switch (annotation) {
-    case "string": {
-      return "STRING";
-    }
-    case "json": {
-      return "JSON";
-    }
-    case "timestamp-millis": {
-      return "TIMESTAMP(MILLIS)";
-    }
-    default: {
-      return "INT_64";
+  let typeLength: number | undefined;
+  if (kind === "fixed") {
+    typeLength = element.typeLength;
+    if (typeLength === undefined || !Number.isSafeInteger(typeLength) || typeLength < 1) {
+      throw malformed(
+        `Column "${name}" is a FIXED_LEN_BYTE_ARRAY whose type_length is ${describe(element.typeLength)}`,
+        name,
+      );
     }
   }
+
+  const optional = element.repetition === FieldRepetitionType.OPTIONAL;
+  const annotation = annotationOf(element);
+  const adapter = claimedBy(element, kind, typeLength, annotation, types);
+  if (adapter !== undefined) {
+    return Object.freeze({
+      name,
+      type: adapter,
+      optional,
+      ...(typeLength === undefined ? {} : { typeLength }),
+    });
+  }
+
+  const builtin = builtinTypeOf(kind, annotation);
+  if (builtin !== undefined) return Object.freeze({ name, type: builtin, optional });
+
+  // Nothing claimed it, and tavolato will not guess which JavaScript type an
+  // annotation ought to become — so it says what it found, in full.
+  const found = `${physicalTypeName(physical)}${typeLength === undefined ? "" : `(${typeLength})`}`;
+  throw unsupported(
+    annotation.kind === "none"
+      ? `column "${name}", an unannotated ${found}`
+      : `column "${name}", a ${found} annotated ${annotationName(annotation)}`,
+    name,
+    TYPES_REMEDY,
+  );
 }
 
 /**
  * Turns the footer's depth-first schema list into a `ParquetSchema`, refusing
  * anything that is not one flat level of leaves under the root.
  */
-function toSchema(elements: readonly SchemaElement[]): ParquetSchema {
+function toSchema(
+  elements: readonly SchemaElement[],
+  types: readonly AnyLogicalAdapter[],
+): ParquetSchema {
   const root = elements[0];
   if (root === undefined) throw malformed("The footer carries no schema");
   if (root.numChildren === 0) throw unsupported("a file whose schema declares no columns");
@@ -244,10 +266,11 @@ function toSchema(elements: readonly SchemaElement[]): ParquetSchema {
     if (Object.hasOwn(definition, element.name)) {
       throw malformed(`The schema declares the column "${element.name}" twice`, element.name);
     }
-    const type = columnTypeOf(element);
-    const optional = element.repetition === FieldRepetitionType.OPTIONAL;
-    columns.push(Object.freeze({ name: element.name, type, optional }));
-    definition[element.name] = { type, optional };
+    const column = columnOf(element, types);
+    columns.push(column);
+    // An adapter column carries the adapter object itself, so the definition a
+    // file yields is still valid input to `createWriter`.
+    definition[element.name] = { type: column.type, optional: column.optional };
   }
 
   // Built directly rather than through `defineSchema` so that column order is
@@ -260,7 +283,9 @@ function toSchema(elements: readonly SchemaElement[]): ParquetSchema {
 }
 
 /** Converts one decoded PLAIN value into the type the column promises. */
-function toValue(type: ColumnType, values: ColumnValues, index: number): ReadValue {
+function toValue(column: SchemaColumn, values: ColumnValues, index: number): ReadValue {
+  const { type } = column;
+  if (typeof type !== "string") return adapt(column, type, values.items[index]);
   switch (values.kind) {
     case "bytes": {
       return decodeUtf8(values.items[index]);
@@ -272,6 +297,25 @@ function toValue(type: ColumnType, values: ColumnValues, index: number): ReadVal
     default: {
       return values.items[index];
     }
+  }
+}
+
+/**
+ * Runs an adapter's `read` on one raw physical value, turning anything it
+ * throws into a typed error carrying the original as `cause`.
+ *
+ * The value is cast on the way out: what an adapter returns is its own
+ * business, and `ReadRowOf` is where its real type comes back.
+ */
+function adapt(column: SchemaColumn, adapter: AnyLogicalAdapter, raw: unknown): ReadValue {
+  try {
+    return adapter.read(raw) as ReadValue;
+  } catch (cause) {
+    throw malformed(
+      `The column type ${adapter.name} failed on a value of column "${column.name}"`,
+      column.name,
+      cause,
+    );
   }
 }
 
@@ -395,12 +439,10 @@ function readPageBody(
 
   // Nulls take a definition level but no bytes, so the value cursor only moves
   // on the rows that are present.
-  const values = readPlain(body, plainKind(column.type), present);
+  const values = readPlain(body, columnPhysical(column.type), present, column.typeLength);
   let next = 0;
   for (let index = 0; index < page.numValues; index++) {
-    out.push(
-      levels !== undefined && levels[index] === 0 ? null : toValue(column.type, values, next++),
-    );
+    out.push(levels !== undefined && levels[index] === 0 ? null : toValue(column, values, next++));
   }
 }
 
@@ -468,7 +510,7 @@ function readColumnChunk(
       column.name,
     );
   }
-  const expected = physicalMapping(column.type).physical;
+  const expected = physicalTypeId(columnPhysical(column.type));
   if (chunk.physical !== undefined && chunk.physical !== expected) {
     throw malformed(
       `Column "${column.name}" is a ${physicalTypeName(expected)} in the schema but a ${physicalTypeName(chunk.physical)} in a row group`,
@@ -552,11 +594,17 @@ function readRowGroup(
  * `ERR_READ_UNSUPPORTED` naming what it found. Bytes that are not a well-formed
  * Parquet file raise `ERR_READ_MALFORMED`.
  *
- * A compressed column chunk is refused the same way *unless* a decompressor for
- * its codec is registered in `options.codecs`, which is the one place the scope
- * opens up on purpose. Called without options, or with a synchronous
- * decompressor, this returns a `ParquetFile` outright; an asynchronous one is
- * what turns the result into a promise.
+ * Two refusals lift, and both lift the same way — by handing over the piece
+ * tavolato will not supply itself. A compressed column chunk is refused until a
+ * decompressor for its codec is registered in `options.codecs`; an annotated
+ * column is refused until a matching column type is passed in `options.types`,
+ * because which JavaScript type a `DECIMAL` or a `UUID` should become is a
+ * decision about your program, not about the file.
+ *
+ * `types` are tried in order and claim a column before the built-in types get
+ * to. Only a codec can make this defer: called without options, with `types`
+ * alone, or with a synchronous decompressor, it returns a `ParquetFile`
+ * outright.
  *
  * Memory is `O(rows declared in the footer)`, not `O(bytes)`: definition levels
  * are RLE compressed, so a six byte run can legitimately declare millions of
@@ -576,9 +624,16 @@ function readRowGroup(
  * const codecs = { GZIP: { decompress: (page: Uint8Array) => gunzipSync(page) } };
  * const { rows } = readParquet(bytes, { codecs });
  *
- * @throws {TavolatoError} `ERR_READ_MALFORMED` or `ERR_READ_UNSUPPORTED`.
+ * @example
+ * const { rows } = readParquet(bytes, { types: [uuid(), decimal({ precision: 12, scale: 2 })] });
+ *
+ * @throws {TavolatoError} `ERR_READ_MALFORMED`, `ERR_READ_UNSUPPORTED` or
+ * `ERR_READ_OPTION_INVALID`.
  */
-export function readParquet(bytes: Uint8Array): ParquetFile;
+export function readParquet(
+  bytes: Uint8Array,
+  options?: ReadOptions & { codecs?: undefined },
+): ParquetFile;
 export function readParquet(
   bytes: Uint8Array,
   options: ReadOptions,
@@ -588,7 +643,7 @@ export function readParquet(
   options?: ReadOptions,
 ): ParquetFile | Promise<ParquetFile> {
   const metadata = decodeFileMetadata(locateFooter(bytes));
-  const schema = toSchema(metadata.schema);
+  const schema = toSchema(metadata.schema, registeredTypes(options));
   const input = new ByteReader(bytes);
   const rows: ReadRow[] = [];
 
@@ -618,10 +673,32 @@ export function readParquet(
  *
  * Useful to check what a file holds before deciding to read it — and it
  * rejects an unsupported *schema* just as `readParquet` would, though an
- * unsupported *encoding* only surfaces once pages are read.
+ * unsupported *encoding* only surfaces once pages are read. `types` claim
+ * columns here exactly as they do there, since claiming happens in the footer.
  *
- * @throws {TavolatoError} `ERR_READ_MALFORMED` or `ERR_READ_UNSUPPORTED`.
+ * @throws {TavolatoError} `ERR_READ_MALFORMED`, `ERR_READ_UNSUPPORTED` or
+ * `ERR_READ_OPTION_INVALID`.
  */
-export function readSchema(bytes: Uint8Array): ParquetSchema {
-  return toSchema(decodeFileMetadata(locateFooter(bytes)).schema);
+export function readSchema(bytes: Uint8Array, options?: ReadOptions): ParquetSchema {
+  return toSchema(decodeFileMetadata(locateFooter(bytes)).schema, registeredTypes(options));
+}
+
+/**
+ * Validates `options.types` once, before a footer is looked at.
+ *
+ * An entry that is not a column type would otherwise surface as a `TypeError`
+ * from somewhere inside a column, breaking the one promise that holds
+ * everywhere else: everything this library throws is a `TavolatoError`.
+ */
+function registeredTypes(options: ReadOptions | undefined): readonly AnyLogicalAdapter[] {
+  const types = options?.types;
+  if (types === undefined) return [];
+  if (!Array.isArray(types)) {
+    throw badOption(`ReadOptions.types must be an array, received ${describe(types)}`);
+  }
+  for (const [index, adapter] of types.entries()) {
+    const problem = adapterProblem(adapter);
+    if (problem !== undefined) throw badOption(`ReadOptions.types[${index}] ${problem}`);
+  }
+  return types;
 }
