@@ -34,9 +34,7 @@ export function writeDataPage(
   values: readonly bigint[],
   compress?: (body: Uint8Array) => Uint8Array,
 ): WrittenPage {
-  const body = new ByteWriter(64);
-  writePlain(body, { kind: "i64", items: [...values] });
-  const raw = body.toBytes();
+  const raw = plainBody(values);
   const stored = compress === undefined ? raw : compress(raw);
   const header = encodeDataPageHeader(raw.length, stored.length, values.length);
   out.raw(header);
@@ -45,6 +43,13 @@ export function writeDataPage(
     uncompressedSize: header.length + raw.length,
     compressedSize: header.length + stored.length,
   };
+}
+
+/** The PLAIN bytes of required `INT64` values: what a data page body holds. */
+export function plainBody(values: readonly bigint[]): Uint8Array {
+  const body = new ByteWriter(64);
+  writePlain(body, { kind: "i64", items: [...values] });
+  return body.toBytes();
 }
 
 /** Closes a hand-built file: the footer, its length, and the trailing magic. */

@@ -486,7 +486,14 @@ export class ParquetWriter<TDefinition extends SchemaDefinition = SchemaDefiniti
     for (let index = 0; index < this.#states.length; index++) {
       const state = this.#states[index];
       const { name } = state.column;
-      staged[index] = stage(state, record[name], Object.hasOwn(record, name));
+      // Only read the key the row actually has. `record.__proto__` on a row
+      // that carries no such column is `Object.prototype` rather than
+      // `undefined` — a column a caller left out would otherwise arrive as a
+      // value, and be refused for being the wrong type instead of for being
+      // missing. `Object.hasOwn` is the question that has always been asked
+      // here; this only stops the answer being ignored.
+      const present = Object.hasOwn(record, name);
+      staged[index] = stage(state, present ? record[name] : undefined, present);
     }
 
     // Page sizes are i32 fields, so no column chunk may grow past

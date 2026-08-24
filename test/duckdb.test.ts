@@ -862,6 +862,28 @@ describe("file structure", () => {
     ).toEqual(["città", "n°"]);
   });
 
+  it("round-trips a column named __proto__, which only JavaScript finds special", () => {
+    // Parquet reserves no column names. DuckDB is the witness that the value is
+    // really in the file, so a reader that loses it is losing data rather than
+    // reading a file that never had it.
+    const schema = defineSchema({ ["__proto__"]: { type: "i64" }, n: { type: "i64" } });
+    const writer = createWriter(schema);
+    writer.append({ ["__proto__"]: 7n, n: 1n });
+    const path = emit("proto-column.parquet", writer.finish());
+
+    // A computed key on this side too: an object literal spelling `__proto__`
+    // declares a prototype, not a property, so the expectation would otherwise
+    // be an empty-handed `{ n: 1 }`.
+    expect(duckdb(`SELECT "__proto__", n FROM read_parquet(${path});`)).toEqual([
+      { ["__proto__"]: 7, n: 1 },
+    ]);
+    expect(
+      duckdb<{ name: string }>(
+        `SELECT name FROM parquet_schema(${path}) WHERE num_children IS NULL;`,
+      ).map((row) => row.name),
+    ).toEqual(["__proto__", "n"]);
+  });
+
   it("records created_by", () => {
     const schema = defineSchema({ n: { type: "i64" } });
     const path = emit("created-by.parquet", createWriter(schema).finish());

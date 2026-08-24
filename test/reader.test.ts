@@ -5,14 +5,17 @@ import {
   defineSchema,
   isTavolatoError,
   readParquet,
+  readRowGroups,
   readSchema,
   TavolatoError,
   timestamp,
   uuid,
 } from "../src/index.ts";
-import { PhysicalType } from "../src/internal/format.ts";
+import type { ReadRow } from "../src/index.ts";
+import type { ByteWriter } from "../src/internal/bytes.ts";
+import { Encoding, PageType, PhysicalType } from "../src/internal/format.ts";
 import { CompactWriter, ThriftType } from "../src/internal/thrift.ts";
-import { sealFile, startFile, writeDataPage } from "./_build.ts";
+import { plainBody, sealFile, startFile, writeDataPage } from "./_build.ts";
 import { expectError } from "./_errors.ts";
 import { sync } from "./_sync.ts";
 
@@ -369,6 +372,33 @@ describe("truncation", () => {
  * missing value, with the column named.
  */
 describe("a footer whose fields are the wrong Thrift type", () => {
+  /** Writes one `7n` page whose header is spelled out by `header`, wrong types and all. */
+  function writeDoctoredPage(
+    out: ByteWriter,
+    header: (writer: CompactWriter) => void,
+  ): { readonly uncompressedSize: number; readonly compressedSize: number } {
+    const writer = new CompactWriter();
+    writer.structBegin();
+    header(writer);
+    writer.structEnd();
+    const encoded = writer.toBytes();
+    const body = plainBody([7n]);
+    out.raw(encoded);
+    out.raw(body);
+    const size = encoded.length + body.length;
+    return { uncompressedSize: size, compressedSize: size };
+  }
+
+  /** The `DataPageHeader` a correct page carries, for a header being doctored elsewhere. */
+  function dataPageHeader(writer: CompactWriter, numValues: (writer: CompactWriter) => void): void {
+    writer.fieldStructBegin(5);
+    numValues(writer);
+    writer.fieldI32(2, Encoding.PLAIN);
+    writer.fieldI32(3, Encoding.RLE); // definition_level_encoding
+    writer.fieldI32(4, Encoding.RLE); // repetition_level_encoding
+    writer.structEnd();
+  }
+
   /**
    * A one row `INT64` file, written field by field so that a single field can
    * be given the wrong type. Each hook replaces exactly the field it names.
@@ -380,11 +410,15 @@ describe("a footer whose fields are the wrong Thrift type", () => {
       path?: (writer: CompactWriter) => void;
       codec?: (writer: CompactWriter) => void;
       numValues?: (writer: CompactWriter) => void;
+      pageHeader?: (writer: CompactWriter) => void;
     } = {},
   ): Uint8Array {
     const out = startFile();
     const dataPageOffset = out.length;
-    const page = writeDataPage(out, [7n]);
+    const page =
+      doctored.pageHeader === undefined
+        ? writeDataPage(out, [7n])
+        : writeDoctoredPage(out, doctored.pageHeader);
 
     const writer = new CompactWriter();
     writer.structBegin(); // FileMetaData
@@ -478,6 +512,35 @@ describe("a footer whose fields are the wrong Thrift type", () => {
     expect(error.message).toContain("declares 0 values");
   });
 
+  it("does not read past a page type that is not an i32", () => {
+    // The page header is the last decoder that was outside the rule. Skipping
+    // the field it cannot trust leaves every size and every count after it
+    // where it belongs — and the page really is a data page, so it reads.
+    const bytes = handBuilt({
+      pageHeader: (writer) => {
+        writer.fieldString(1, "data"); // type, which is an i32
+        writer.fieldI32(2, 8); // uncompressed_page_size
+        writer.fieldI32(3, 8); // compressed_page_size
+        dataPageHeader(writer, (inner) => inner.fieldI32(1, 1));
+      },
+    });
+    expect(readParquet(bytes).rows).toEqual([{ n: 7n }]);
+  });
+
+  it("refuses a page's num_values that is not an i32", () => {
+    const bytes = handBuilt({
+      pageHeader: (writer) => {
+        writer.fieldI32(1, PageType.DATA_PAGE);
+        writer.fieldI32(2, 8);
+        writer.fieldI32(3, 8);
+        dataPageHeader(writer, (inner) => inner.fieldString(1, "one"));
+      },
+    });
+    const error = expectError("ERR_READ_MALFORMED", () => readParquet(bytes));
+    expect(error.column).toBe("n");
+    expect(error.message).toContain("declares 0 values");
+  });
+
   it("does not read past a codec id that is not an i32", () => {
     // Skipped rather than parsed, so the page — which really is uncompressed —
     // is still there to be read, at the offset the rest of the footer gives.
@@ -488,6 +551,103 @@ describe("a footer whose fields are the wrong Thrift type", () => {
       },
     });
     expect(readParquet(bytes).rows).toEqual([{ n: 7n }]);
+  });
+});
+
+/**
+ * `__proto__` is a column name like any other.
+ *
+ * Parquet names columns with UTF-8 strings and reserves none of them, so a file
+ * may carry one called `__proto__` — and JavaScript is the only party here that
+ * finds the name special. `record.__proto__ = value` creates no property at
+ * all: it runs `Object.prototype`'s setter, which drops a primitive on the
+ * floor and, handed an object, replaces the row's prototype with it. Every
+ * value a file states has to come back as an own property, and none of them may
+ * reach a prototype slot.
+ */
+describe("a column named __proto__", () => {
+  // Computed keys throughout: `{ __proto__: x }` in a literal sets the
+  // prototype rather than declaring a property, which is the problem itself.
+  const schema = defineSchema({
+    ["__proto__"]: { type: "i64" },
+    n: { type: "i64" },
+    maybe: { type: "string", optional: true },
+  });
+
+  /** Two rows whose `__proto__` column holds a value like any other. */
+  function written(): Uint8Array {
+    const writer = createWriter(schema);
+    writer.append({ ["__proto__"]: 1n, n: 10n, maybe: "a" });
+    writer.append({ ["__proto__"]: 2n, n: 20n, maybe: null });
+    return sync(writer.finish());
+  }
+
+  /** Asserts one row carries every column as its own, enumerable property. */
+  function expectOwnColumns(row: ReadRow, proto: bigint, n: bigint): void {
+    expect(Object.hasOwn(row, "__proto__")).toBe(true);
+    expect(Object.getPrototypeOf(row)).toBe(Object.prototype);
+    expect(Object.keys(row).sort()).toEqual(["__proto__", "maybe", "n"]);
+    expect(row["__proto__"]).toBe(proto);
+    expect(row.n).toBe(n);
+  }
+
+  it("reads the column back as an own property of every row", () => {
+    const { rows } = readParquet(written());
+    expect(rows).toHaveLength(2);
+    expectOwnColumns(rows[0], 1n, 10n);
+    expectOwnColumns(rows[1], 2n, 20n);
+    expect(rows[0].maybe).toBe("a");
+    expect(rows[1].maybe).toBe(null);
+  });
+
+  it("reads it back the same way one row group at a time", () => {
+    const groups = [...readRowGroups(written())];
+    expect(groups).toHaveLength(1);
+    const rows = sync(groups[0]);
+    expectOwnColumns(rows[0], 1n, 10n);
+    expectOwnColumns(rows[1], 2n, 20n);
+  });
+
+  it("keeps the returned definition a plain object with the column on it", () => {
+    const { definition, columns } = readParquet(written()).schema;
+    expect(Object.getPrototypeOf(definition)).toBe(Object.prototype);
+    expect(Object.hasOwn(definition, "__proto__")).toBe(true);
+    expect(Object.keys(definition)).toEqual(["__proto__", "n", "maybe"]);
+    expect(columns.map((column) => column.name)).toEqual(["__proto__", "n", "maybe"]);
+  });
+
+  it("never lets a column's value become a row's prototype", () => {
+    // A `Date` is the value that would actually take: assigned to `__proto__`
+    // it replaces the prototype instead of being dropped.
+    const dated = defineSchema({ ["__proto__"]: { type: "timestamp" } });
+    const writer = createWriter(dated);
+    writer.append({ ["__proto__"]: 1_700_000_000_000 });
+    const { rows } = readParquet(sync(writer.finish()));
+
+    expect(Object.getPrototypeOf(rows[0])).toBe(Object.prototype);
+    expect(Object.hasOwn(rows[0], "__proto__")).toBe(true);
+    expect(rows[0]["__proto__"]).toEqual(new Date(1_700_000_000_000));
+  });
+
+  it("treats an absent __proto__ column as absent, not as Object.prototype", () => {
+    // `row["__proto__"]` on a row that carries none hands back
+    // Object.prototype, which is neither a value nor a missing column unless
+    // the writer asks whether the key is really there.
+    const optional = defineSchema({
+      ["__proto__"]: { type: "string", optional: true },
+      n: { type: "i64" },
+    });
+    const writer = createWriter(optional);
+    writer.append({ n: 1n });
+    const { rows } = readParquet(sync(writer.finish()));
+    expect(rows[0]["__proto__"]).toBe(null);
+
+    // And a required one that is missing is missing, named as such.
+    const error = expectError("ERR_ROW_VALUE_MISSING", () =>
+      // @ts-expect-error the column is deliberately omitted
+      createWriter(schema).append({ n: 1n, maybe: null }),
+    );
+    expect(error.column).toBe("__proto__");
   });
 });
 

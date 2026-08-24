@@ -87,6 +87,45 @@ interface FileSchema {
   readonly columns: readonly ReadColumn[];
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * `__proto__`, the one column name JavaScript reserves and Parquet does not.
+ *
+ * Column names in the format are UTF-8 strings with nothing held back, so a
+ * file may legitimately carry a column called `__proto__` — and there, and only
+ * there, `target[name] = value` is not an assignment at all. It runs
+ * `Object.prototype`'s setter, which silently drops a primitive and, handed an
+ * object, makes it the target's prototype instead. A reader that does it loses
+ * a value the file states plainly, and hands back a row whose prototype came
+ * out of somebody's data.
+ *
+ * So wherever a column name becomes an object key, the property is *defined*
+ * rather than assigned. On the row path defining every value would cost a call
+ * per cell, so the property is defined once on the empty row and the plain
+ * store then writes to it like any other — which leaves the loop that runs for
+ * every file anybody has ever written exactly as it was.
+ * ---------------------------------------------------------------------------
+ */
+
+const PROTO_KEY = "__proto__";
+
+/** Puts `value` on `target` as an own, enumerable property, whatever it is called. */
+function define(target: object, key: string, value: unknown): void {
+  Object.defineProperty(target, key, {
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+}
+
+/** An empty row carrying `__proto__` already, for the schemas that declare one. */
+function protoRow(): ReadRow {
+  const record: ReadRow = {};
+  define(record, PROTO_KEY, null);
+  return record;
+}
+
 function hasMagic(bytes: Uint8Array, offset: number): boolean {
   for (let index = 0; index < MAGIC.length; index++) {
     if (bytes[offset + index] !== MAGIC[index]) return false;
@@ -304,7 +343,7 @@ function toSchema(
     declared.push(publicColumn(column));
     // An adapter column carries the adapter object itself, so the definition a
     // file yields is still valid input to `createWriter`.
-    definition[element.name] = { type: column.type, optional: column.optional };
+    define(definition, element.name, { type: column.type, optional: column.optional });
   }
 
   // Built directly rather than through `defineSchema` so that column order is
@@ -647,8 +686,12 @@ function readRowGroup(
       ),
     ),
     () => {
+      // Decided once per group, never per value: a row only needs seeding when
+      // the schema declares the one name a plain store cannot create, and the
+      // fast path below is then the loop it has always been.
+      const seeded = columns.some((column) => column.name === PROTO_KEY);
       for (let row = 0; row < group.numRows; row++) {
-        const record: ReadRow = {};
+        const record: ReadRow = seeded ? protoRow() : {};
         for (const [index, column] of columns.entries()) {
           record[column.name] = values[index][row];
         }

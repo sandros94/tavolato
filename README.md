@@ -118,6 +118,15 @@ stream, a length that does not fit, a footer that contradicts itself — raise
 `ERR_READ_MALFORMED` instead. Neither ever crashes ungracefully: malformed input
 is a typed throw, not a hang or a `RangeError`.
 
+That promise covers the _contents_ of any real `Uint8Array`, however hostile.
+What it does not cover is a `Uint8Array` **subclass that lies about itself** — one
+whose `byteLength` or `length` getter returns something other than the memory it
+has. Nothing can be validated before such an object is measured, and the
+measurement is the lie, so it may surface as a bare `RangeError` from the
+platform rather than as a `TavolatoError`. Pass the bytes you were given, not a
+proxy for them, and this cannot arise. (The [codec hooks](#what-the-guarantee-is-worth)
+carry a similar caveat, for the same reason: code that is not `tavolato`'s.)
+
 Two leniencies are allowed, and neither changes a single value: an `INT32` or
 `INT64` annotated `INT_32` / `INT_64` (or the equivalent `INTEGER(32, signed)`)
 reads as `i32` and `i64`, because that annotation says nothing the bare physical
@@ -414,8 +423,11 @@ in the table [above](#the-types-in-the-box).
 `i64` is **always** a `bigint`, even for values a `number` would hold exactly.
 The writer's `bigint | number` is a convenience on the way in; on the way out
 consistency wins, because a column whose type depended on its values would be
-unusable. `timestamp` is likewise always a `Date` — millis beyond the range
-`Date` can represent come back as an invalid one.
+unusable. `timestamp` is likewise always a `Date` — and because it always is, a
+count beyond the range a `Date` can represent is
+[refused by name](#what-the-reader-refuses) rather than handed back as an
+Invalid Date, with `timestamp({ unit: "millis" })` there to read the count
+itself.
 
 A null in an optional column reads back as `null`, and the key is always
 present: a row that omitted an optional column entirely still comes back with

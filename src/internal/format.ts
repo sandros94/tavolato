@@ -1335,17 +1335,25 @@ export function decodePageHeader(input: ByteReader): PageHeaderInfo {
   let encoding: number = Encoding.PLAIN;
   let definitionLevelEncoding: number = Encoding.RLE;
 
+  // Under the same rule as the footer: a field is read only as the type it is
+  // declared to be, so a header that gets one wrong describes a page with a
+  // value missing rather than sending the reader off into the page body. Every
+  // value below is checked before it is acted on — the sizes here, the count
+  // and the encodings where the page is read.
   eachField(reader, (field) => {
     switch (field.id) {
       case 1: {
+        if (field.type !== ThriftType.I32) return false;
         pageType = reader.i32();
         return true;
       }
       case 2: {
+        if (field.type !== ThriftType.I32) return false;
         uncompressedSize = reader.i32();
         return true;
       }
       case 3: {
+        if (field.type !== ThriftType.I32) return false;
         compressedSize = reader.i32();
         return true;
       }
@@ -1354,14 +1362,17 @@ export function decodePageHeader(input: ByteReader): PageHeaderInfo {
         eachField(reader, (inner) => {
           switch (inner.id) {
             case 1: {
+              if (inner.type !== ThriftType.I32) return false;
               numValues = reader.i32();
               return true;
             }
             case 2: {
+              if (inner.type !== ThriftType.I32) return false;
               encoding = reader.i32();
               return true;
             }
             case 3: {
+              if (inner.type !== ThriftType.I32) return false;
               definitionLevelEncoding = reader.i32();
               return true;
             }
