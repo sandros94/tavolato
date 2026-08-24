@@ -15,21 +15,12 @@ import { sync } from "./_sync.ts";
  * mocked on tavolato's side: what is being tested is that the parameters the
  * store builds are the parameters `uns3` knows what to do with.
  *
- * It also pins the one place where they are not, and it is `uns3`'s side:
- *
- *   `S3Client.get` checks every response against a hard-coded `[200, 304]` and
- *   throws an `S3Error` for anything else, so a `206 Partial Content` — the
- *   *correct* answer to the `Range` header it just sent — is thrown away before
- *   the caller sees it. `params.expectedStatus` exists in `ObjectRequest` and
- *   is documented as "expected HTTP status code(s)", but `execute` passes the
- *   method's own literal instead, so a caller cannot widen it either. The fix
- *   is one line per method: `expectedStatus: params.expectedStatus ?? [...]`,
- *   with `206` in `get`'s default.
- *
- * Until that lands, the store's ranged reads — `head`, and any `get` with
- * `columns` or `groups` — cannot run on `uns3` 0.0.7's client, and the two
- * tests at the bottom say so out loud. They fail the day it is fixed, which is
- * the point: that is when this file should start asserting the opposite.
+ * Two of the tests below were deliberately red until `uns3` 0.0.8: its `get`
+ * checked every response against a hard-coded status list and threw away the
+ * `206 Partial Content` it had itself asked for, so the store's ranged reads
+ * could not run on the real client at all. Since 0.0.8 the client honors
+ * `params.expectedStatus` — the store sends `[200, 206]` — and the ranged path
+ * below runs unpatched.
  * ---------------------------------------------------------------------------
  */
 
@@ -118,7 +109,7 @@ function listXml(result: Awaited<ReturnType<FakeS3["list"]>>): string {
   }</ListBucketResult>`;
 }
 
-function realStore() {
+function realStore(options?: { tailBytes?: number }) {
   const s3 = new FakeS3();
   const client = new S3Client({
     endpoint: "http://s3.test",
@@ -128,7 +119,7 @@ function realStore() {
     credentials: { accessKeyId: "key", secretAccessKey: "secret" },
     fetch: transport(s3),
   });
-  return { s3, store: createParquetStore(client, { bucket: "b" }) };
+  return { s3, store: createParquetStore(client, { bucket: "b", ...options }) };
 }
 
 const schema = defineSchema({ n: { type: "i64" }, s: { type: "string" } });
@@ -190,77 +181,35 @@ describe("the store on uns3's own client", () => {
   });
 
   /*
-   * The two below are the upstream gap, pinned. They assert what `uns3` 0.0.7
-   * does — not what it should do — so that fixing it turns them red.
+   * These two were red until `uns3` 0.0.8 — see the note at the top. A small
+   * `tailBytes` keeps the footer fetch from swallowing the whole test file, so
+   * the ranged path is exercised for real.
    */
 
-  it("cannot range-read yet: uns3 0.0.7 throws away the 206 it asked for", async () => {
-    const { store } = realStore();
-    await store.put("events/a.parquet", file());
-
-    const failure = await store
-      .get("events/a.parquet", { columns: ["n"] })
-      .catch((error: unknown) => error);
-
-    expect(failure).toBeInstanceOf(S3Error);
-    expect((failure as S3Error).status).toBe(206);
-  });
-
-  it("cannot head yet, for the same reason", async () => {
-    const { store } = realStore();
-    await store.put("events/a.parquet", file());
-
-    const failure = await store.head("events/a.parquet").catch((error: unknown) => error);
-
-    expect(failure).toBeInstanceOf(S3Error);
-    expect((failure as S3Error).status).toBe(206);
-  });
-
-  it("range-reads the moment a client accepts a partial answer", async () => {
-    // The same real client, with the one line `uns3` is missing bolted on from
-    // outside: a `get` that treats a 206 as the answer it asked for. Everything
-    // else — signing, URL building, the `Range` header — is still `uns3`'s.
-    const s3 = new FakeS3();
-    const client = new S3Client({
-      endpoint: "http://s3.test",
-      bucketStyle: "path",
-      defaultBucket: "b",
-      credentials: { accessKeyId: "key", secretAccessKey: "secret" },
-      fetch: transport(s3),
-    });
-    const patched = {
-      get: async (params: Parameters<S3Client["get"]>[0]) => {
-        try {
-          return await client.get(params);
-        } catch (error) {
-          if (!(error instanceof S3Error) || error.status !== 206) throw error;
-          // Ask again without the client's status check in the way. The fake is
-          // right here, so this stands in for the missing line rather than for
-          // a second round trip — which does mean every ranged request below is
-          // served twice, and the byte count is twice what the fix would cost.
-          return await s3.get(params);
-        }
-      },
-      head: async (params: Parameters<S3Client["head"]>[0]) => await client.head(params),
-      put: async (params: Parameters<S3Client["put"]>[0]) => await client.put(params),
-      del: async (params: Parameters<S3Client["del"]>[0]) => await client.del(params),
-      list: async (params: Parameters<S3Client["list"]>[0]) => await client.list(params),
-    };
-    const store = createParquetStore(patched, { bucket: "b", tailBytes: 256 });
-
+  it("range-reads through the real client", async () => {
+    const { s3, store } = realStore({ tailBytes: 256 });
     await store.put("events/a.parquet", file());
     s3.reset();
 
     const read = await store.get("events/a.parquet", { columns: ["n"], groups: [1] });
 
     expect(read.rows).toEqual(rows.slice(100, 200).map((row) => ({ n: row.n })));
-    // Under the object's size even at twice the price, and every request after
-    // the first carried a range `uns3` itself serialized.
+    // Fewer bytes than the object holds, and every request carried a range
+    // `uns3` itself serialized.
     expect(s3.bytesServed).toBeLessThan((s3.stored("events/a.parquet") as Uint8Array).length);
     expect(s3.ranges.every((range) => range !== undefined)).toBe(true);
+  });
+
+  it("heads without reading a page", async () => {
+    const { s3, store } = realStore({ tailBytes: 256 });
+    await store.put("events/a.parquet", file());
+    s3.reset();
 
     const head = await store.head("events/a.parquet");
+
     expect(head.rowCount).toBe(300);
     expect(head.groupCount).toBe(3);
+    expect(head.size).toBe((s3.stored("events/a.parquet") as Uint8Array).length);
+    expect(s3.bytesServed).toBeLessThan((s3.stored("events/a.parquet") as Uint8Array).length);
   });
 });

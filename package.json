@@ -59,11 +59,11 @@
     "oxlint-tsgolint": "^7.0.2001",
     "simple-git-hooks": "^2.13.1",
     "typescript": "^7.0.2",
-    "uns3": "^0.0.7",
+    "uns3": "^0.0.8",
     "vitest": "^4.1.10"
   },
   "peerDependencies": {
-    "uns3": ">=0.0.7"
+    "uns3": "^0.0.8"
   },
   "peerDependenciesMeta": {
     "uns3": {
