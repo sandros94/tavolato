@@ -63,7 +63,7 @@
     "vitest": "^4.1.10"
   },
   "peerDependencies": {
-    "uns3": "^0.0.7"
+    "uns3": ">=0.0.7"
   },
   "peerDependenciesMeta": {
     "uns3": {

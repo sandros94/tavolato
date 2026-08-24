@@ -5,6 +5,7 @@
  *   ERR_ROW_*    — problems with a row handed to `append` / `appendAll`
  *   ERR_WRITER_* — problems with how the writer itself is being driven
  *   ERR_READ_*   — problems with the bytes handed to `readParquet` / `readSchema`
+ *   ERR_STORE_*  — problems a `tavolato/uns3` store hits talking to object storage
  */
 export type TavolatoErrorCode =
   // Schema definition
@@ -24,6 +25,10 @@ export type TavolatoErrorCode =
   | "ERR_READ_OPTION_INVALID" // bad `readParquet` option
   | "ERR_READ_MALFORMED" // the bytes are not a well-formed Parquet file
   | "ERR_READ_UNSUPPORTED" // well-formed Parquet, but outside the subset tavolato writes
+  // Object storage, through `tavolato/uns3`
+  | "ERR_STORE_INPUT_INVALID" // `store.put` was handed something it cannot upload
+  | "ERR_STORE_OBJECT_CHANGED" // the object was replaced between two of a read's requests
+  | "ERR_STORE_RANGE_UNSATISFIED" // a ranged read came back with bytes other than the ones asked for
   | (string & {}); // forward-compatible escape hatch
 
 /**

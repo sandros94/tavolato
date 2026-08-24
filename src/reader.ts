@@ -93,15 +93,22 @@ interface ReadColumn {
  * The two are the same number for an unprojected read and deliberately are not
  * for a projected one: `columns` is what the rows will hold, `columnCount` is
  * what a row group's chunk list has to match for `index` to mean anything.
+ *
+ * @internal
  */
-interface FileColumns {
+export interface FileColumns {
   readonly columns: readonly ReadColumn[];
   /** Columns the file declares, projected away or not. */
   readonly columnCount: number;
 }
 
-/** A file's schema, in both the shape callers see and the shape pages are read with. */
-interface FileSchema extends FileColumns {
+/**
+ * A file's schema, in both the shape callers see and the shape pages are read
+ * with.
+ *
+ * @internal
+ */
+export interface FileSchema extends FileColumns {
   readonly schema: ParquetSchema;
 }
 
@@ -747,8 +754,15 @@ function readColumnChunk(
  * The one place a row group is decoded: `readParquet` runs it over every group
  * into a single array, and `readRowGroups` runs it one group at a time into an
  * array of its own. There is no second decoding path, and never should be.
+ *
+ * Exported for `tavolato/uns3`, whose store decodes a group out of bytes it
+ * fetched piecemeal — which is the same decode over a different buffer, and
+ * would be a second decoding path if it were written again there. Not part of
+ * the public API.
+ *
+ * @internal
  */
-function readRowGroup(
+export function readRowGroup(
   input: ByteReader,
   file: FileColumns,
   group: RowGroupInfo,
@@ -796,8 +810,14 @@ function readRowGroup(
  * the invariant that makes a column's position in the schema its chunk's
  * position in the group, and a projection depends on it far more than a whole
  * read does.
+ *
+ * Exported for `tavolato/uns3`, which has to index a group's chunks to work out
+ * which bytes to fetch, and therefore has to know the count holds before
+ * `readRowGroup` gets to say so. Not part of the public API.
+ *
+ * @internal
  */
-function assertChunkCount(file: FileColumns, group: RowGroupInfo): void {
+export function assertChunkCount(file: FileColumns, group: RowGroupInfo): void {
   if (group.columns.length !== file.columnCount) {
     throw malformed(
       `A row group holds ${group.columns.length} column chunks but the schema declares ${file.columnCount} columns`,
@@ -808,8 +828,10 @@ function assertChunkCount(file: FileColumns, group: RowGroupInfo): void {
 /**
  * Everything the footer says, validated: the schema, the row groups, and the
  * counts they have to agree on. No page byte is touched here.
+ *
+ * @internal
  */
-interface FooterInfo extends FileSchema {
+export interface FooterInfo extends FileSchema {
   readonly rowGroups: readonly RowGroupInfo[];
   readonly rowCount: number;
 }
@@ -817,8 +839,14 @@ interface FooterInfo extends FileSchema {
 /**
  * Reads and validates the footer — the envelope, the metadata, the schema — and
  * nothing else. The entry point every read shares, eager or lazy.
+ *
+ * Exported for `tavolato/uns3`, which reads a footer out of the tail of a
+ * remote object before it knows which bytes the rest of the read will need.
+ * Not part of the public API.
+ *
+ * @internal
  */
-function readFooter(bytes: Uint8Array, options: ReadOptions | undefined): FooterInfo {
+export function readFooter(bytes: Uint8Array, options: ReadOptions | undefined): FooterInfo {
   // Both option validators run before a byte of the file is looked at: an
   // option that cannot be used is the caller's mistake whatever the file holds.
   const types = registeredTypes(options);

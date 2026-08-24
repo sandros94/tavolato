@@ -853,6 +853,17 @@ export interface ColumnChunkInfo {
   readonly numValues: number;
   readonly dataPageOffset: number;
   readonly dictionaryPageOffset?: number;
+  /**
+   * Bytes the chunk occupies in the file, page headers included — which is to
+   * say where it *ends*: the one thing a reader holding nothing but the footer
+   * cannot work out for itself.
+   *
+   * Only a read that fetches a chunk without the rest of the file around it has
+   * any use for that, so this is decoded leniently and is `undefined` wherever
+   * the file leaves it out or states something no byte count could be. A local
+   * read never looks at it, and a file is never refused over it.
+   */
+  readonly totalCompressedSize?: number;
 }
 
 export interface RowGroupInfo {
@@ -1201,6 +1212,17 @@ function decodeColumnMetaData(reader: CompactReader, chunk: MutableChunk): void 
         chunk.numValues = toCount(reader.i64(), "A column chunk's num_values");
         return true;
       }
+      case 7: {
+        if (field.type !== ThriftType.I64) return false;
+        // Read, but never enforced: see `ColumnChunkInfo.totalCompressedSize`.
+        // A value that is not a byte count makes the chunk unfetchable on its
+        // own, which is a remote read's problem to raise where it needs one —
+        // and no reason at all to refuse a file whose pages are right there.
+        const size = reader.i64();
+        chunk.totalCompressedSize =
+          size >= 0n && size <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(size) : undefined;
+        return true;
+      }
       case 9: {
         if (field.type !== ThriftType.I64) return false;
         chunk.dataPageOffset = toCount(reader.i64(), "A column chunk's data_page_offset");
@@ -1228,6 +1250,7 @@ interface MutableChunk {
   numValues: number;
   dataPageOffset: number;
   dictionaryPageOffset?: number;
+  totalCompressedSize?: number;
 }
 
 function decodeColumnChunk(reader: CompactReader): ColumnChunkInfo {
