@@ -122,7 +122,7 @@ describe("row validation", () => {
     opt: { type: "string", optional: true },
   });
 
-  const valid = { s: "x", j: "{}", f: 1, g: 1, i: 1n, n: 1, b: true, t: 0 } as const;
+  const valid = { s: "x", j: { ok: true }, f: 1, g: 1, i: 1n, n: 1, b: true, t: 0 } as const;
 
   it("accepts a well-formed row", () => {
     const writer = createWriter(schema);
@@ -161,10 +161,12 @@ describe("row validation", () => {
 
   it.each([
     ["s", 1],
-    // A json column takes a string, and only a string: tavolato stores the text
-    // it is handed and never serializes an object for you.
-    ["j", { a: 1 }],
-    ["j", 1],
+    // A json column takes any JSON document — the objects and arrays included —
+    // so what it refuses is what JSON itself has no spelling for.
+    ["j", 1n],
+    ["j", { big: 1n }],
+    ["j", () => 1],
+    ["j", Symbol("nope")],
     ["f", "1"],
     ["f", 1n],
     ["g", "1"],

@@ -59,7 +59,7 @@ const schema = defineSchema({
 function row(index: number): Record<string, ReadValue> {
   return {
     s: index % 3 === 0 ? null : `row-${index}`,
-    j: `{"i":${index}}`,
+    j: { i: index },
     f: index + 0.5,
     g: index * 0.5,
     i: BigInt(index),
@@ -527,15 +527,40 @@ describe("equivalence with readParquet", () => {
     { what: "compressed", bytes: sample(5, 2, gzip) },
   ];
 
-  for (const { what, bytes } of cases) {
-    it(`reads the same rows as readParquet: ${what}`, () => {
-      const options = { types: TYPES, codecs: syncCodecs };
-      const eager = sync(readParquet(bytes, options));
-      const lazy = readRowGroups(bytes, options);
+  /**
+   * The whole file, and a projection of it. The lazy read has to be the eager
+   * read either way — same rows, same schema, same fast path — which is the one
+   * thing a second decoding path could never be relied on for.
+   */
+  const projections: readonly {
+    readonly what: string;
+    readonly columns?: readonly string[];
+    /** The keys every row must carry, which is `columns` back in file order. */
+    readonly keys: readonly string[];
+  }[] = [
+    { what: "whole", keys: ["s", "j", "f", "g", "i", "n", "b", "t", "p", "u"] },
+    { what: "projected", columns: ["u", "j", "i"], keys: ["j", "i", "u"] },
+  ];
 
-      expect(lazy.schema).toEqual(eager.schema);
-      expect(lazy.rowCount).toBe(eager.rows.length);
-      expect(walk(lazy).flat()).toEqual(eager.rows);
-    });
+  for (const { what, bytes } of cases) {
+    for (const projection of projections) {
+      it(`reads the same rows as readParquet: ${what}, ${projection.what}`, () => {
+        const options = {
+          types: TYPES,
+          codecs: syncCodecs,
+          ...(projection.columns === undefined ? {} : { columns: projection.columns }),
+        };
+        const eager = sync(readParquet(bytes, options));
+        const lazy = readRowGroups(bytes, options);
+
+        expect(lazy.schema).toEqual(eager.schema);
+        expect(lazy.rowCount).toBe(eager.rows.length);
+        expect(walk(lazy).flat()).toEqual(eager.rows);
+        // Every row carries the projected columns, in the file's order.
+        expect(eager.rows.map((row) => Object.keys(row))).toEqual(
+          eager.rows.map(() => projection.keys),
+        );
+      });
+    }
   }
 });

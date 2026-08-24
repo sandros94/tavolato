@@ -15,7 +15,7 @@ import type { ReadRow } from "../src/index.ts";
 import type { ByteWriter } from "../src/internal/bytes.ts";
 import { Encoding, PageType, PhysicalType } from "../src/internal/format.ts";
 import { CompactWriter, ThriftType } from "../src/internal/thrift.ts";
-import { plainBody, sealFile, startFile, writeDataPage } from "./_build.ts";
+import { plainBody, sealFile, startFile, withPhysicalType, writeDataPage } from "./_build.ts";
 import { expectError } from "./_errors.ts";
 import { sync } from "./_sync.ts";
 
@@ -197,28 +197,6 @@ describe("unsupported features", () => {
     expect(error.message).toContain("tavolato only reads the files it writes");
   });
 });
-
-/**
- * Rewrites the physical type of `minimal()`'s single column, standing in for a
- * file no writer here can produce.
- *
- * The leaf's `SchemaElement` is `15 04 25 00 18 01 6e`: type INT64
- * (zigzag 2 = 4), repetition REQUIRED, then the name. Only the schema element
- * spells the type that way — the column chunk's copy is followed by its
- * encodings list — so the pattern is unambiguous.
- */
-function withPhysicalType(bytes: Uint8Array, physical: number): Uint8Array {
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const footer = bytes.length - 8 - view.getUint32(bytes.length - 8, true);
-  for (let offset = footer; offset < bytes.length - 8; offset++) {
-    if (bytes[offset] === 0x15 && bytes[offset + 1] === 0x04 && bytes[offset + 2] === 0x25) {
-      const copy = bytes.slice();
-      copy[offset + 1] = physical * 2; // zigzag of a small positive number
-      return copy;
-    }
-  }
-  throw new Error("no INT64 schema element found");
-}
 
 describe("types the reader refuses outright", () => {
   it("refuses INT96 permanently, and says why", () => {

@@ -7,12 +7,13 @@ import {
   defineSchema,
   float16,
   integer,
+  readParquet,
   TavolatoError,
   time,
   timestamp,
   uuid,
 } from "../src/index.ts";
-import type { WriterCodec } from "../src/index.ts";
+import type { JsonValue, WriterCodec } from "../src/index.ts";
 import { cleanupTempDir, duckdb, duckdbRow, sqlPath, writeParquet } from "./_duckdb.ts";
 import { sync } from "./_sync.ts";
 
@@ -332,9 +333,12 @@ describe("json columns", () => {
     const writer = createWriter(schema);
     for (let index = 0; index < 5; index++) {
       writer.append({
+        // Structures in, and the file DuckDB then reads holds the JSON text
+        // they serialize to: the value is the document, the wire format is
+        // still a string in a BYTE_ARRAY annotated JSON.
         k: BigInt(index),
-        doc: `{"id":${index},"tag":"t${index}","tags":[${index},${index + 1}]}`,
-        maybe: index % 2 === 0 ? null : `{"odd":${index}}`,
+        doc: { id: index, tag: `t${index}`, tags: [index, index + 1] },
+        maybe: index % 2 === 0 ? null : { odd: index },
       });
     }
     return emit("json.parquet", writer.finish());
@@ -370,6 +374,49 @@ describe("json columns", () => {
     expect(duckdbRow(`SELECT count(maybe) AS present FROM read_parquet(${path()});`)).toEqual({
       present: 2,
     });
+  });
+
+  it("carries nested, array and unicode documents past DuckDB and back", () => {
+    // The oracle in both directions over one file: DuckDB reads the documents
+    // with its own JSON operators, and tavolato reads the very same bytes back
+    // into the structures they were written from.
+    const documents: JsonValue[] = [
+      { nested: { deep: [1, 2, 3] } },
+      { unicode: "日本語", emoji: "🎉", ключ: "значение" },
+      { list: [1, "two", null, true, {}, []] },
+      { escapes: 'quote " backslash \\ newline \n tab \t' },
+      "a bare string",
+      42,
+      true,
+      [],
+    ];
+    const wide = defineSchema({ k: { type: "i64" }, doc: { type: "json" } });
+    const writer = createWriter(wide);
+    documents.forEach((doc, index) => writer.append({ k: BigInt(index), doc }));
+    const bytes = sync(writer.finish());
+    const file = emit("json-shapes.parquet", bytes);
+
+    // DuckDB's reading. `->>` yields text, so the expectations are DuckDB's own
+    // rendering of what it found rather than tavolato's.
+    expect(
+      duckdb(`
+      SELECT doc->>'$.nested.deep[2]' AS deep, doc->>'$.unicode' AS unicode,
+             doc->>'$.list[1]' AS second, json_type(doc) AS kind
+      FROM read_parquet(${file}) ORDER BY k;
+    `),
+    ).toEqual([
+      { deep: "3", unicode: null, second: null, kind: "OBJECT" },
+      { deep: null, unicode: "日本語", second: null, kind: "OBJECT" },
+      { deep: null, unicode: null, second: "two", kind: "OBJECT" },
+      { deep: null, unicode: null, second: null, kind: "OBJECT" },
+      { deep: null, unicode: null, second: null, kind: "VARCHAR" },
+      { deep: null, unicode: null, second: null, kind: "UBIGINT" },
+      { deep: null, unicode: null, second: null, kind: "BOOLEAN" },
+      { deep: null, unicode: null, second: null, kind: "ARRAY" },
+    ]);
+
+    // And tavolato's, from the same bytes.
+    expect(readParquet(bytes).rows.map((row) => row.doc)).toEqual(documents);
   });
 });
 

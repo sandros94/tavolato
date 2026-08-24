@@ -25,7 +25,7 @@ import {
   type RowGroupInfo,
   type SchemaElement,
 } from "./internal/format.ts";
-import { adapterProblem } from "./adapters.ts";
+import { adapterProblem, jsonValueOf } from "./adapters.ts";
 import {
   badOption,
   describe,
@@ -79,12 +79,30 @@ interface ReadColumn {
   readonly typeLength: number | undefined;
   /** Where the values are read from. */
   readonly physical: PhysicalKind;
+  /**
+   * Position among the file's columns, which is the position of this column's
+   * chunk in every row group. Kept because a projection makes it stop being the
+   * column's position in {@link FileColumns.columns}.
+   */
+  readonly index: number;
+}
+
+/**
+ * The columns a read decodes, and the count that says where their chunks are.
+ *
+ * The two are the same number for an unprojected read and deliberately are not
+ * for a projected one: `columns` is what the rows will hold, `columnCount` is
+ * what a row group's chunk list has to match for `index` to mean anything.
+ */
+interface FileColumns {
+  readonly columns: readonly ReadColumn[];
+  /** Columns the file declares, projected away or not. */
+  readonly columnCount: number;
 }
 
 /** A file's schema, in both the shape callers see and the shape pages are read with. */
-interface FileSchema {
+interface FileSchema extends FileColumns {
   readonly schema: ParquetSchema;
-  readonly columns: readonly ReadColumn[];
 }
 
 /*
@@ -243,8 +261,18 @@ function claimedBy(
   return undefined;
 }
 
-/** Maps one leaf `SchemaElement` onto a column, or refuses it by name. */
-function columnOf(element: SchemaElement, types: readonly AnyLogicalAdapter[]): ReadColumn {
+/**
+ * Maps one leaf `SchemaElement` onto a column, or refuses it by name.
+ *
+ * Only ever called for a column the read actually wants: every refusal below is
+ * a *column's*, and a projection that leaves the column out is entitled to
+ * leave its refusal out with it.
+ */
+function columnOf(
+  element: SchemaElement,
+  types: readonly AnyLogicalAdapter[],
+  index: number,
+): ReadColumn {
   const { name, physical } = element;
   if (physical === undefined) {
     throw malformed(`Column "${name}" declares no physical type`, name);
@@ -280,12 +308,12 @@ function columnOf(element: SchemaElement, types: readonly AnyLogicalAdapter[]): 
   const annotation = annotationOf(element);
   const adapter = claimedBy(element, kind, typeLength, annotation, types);
   if (adapter !== undefined) {
-    return { name, type: adapter, optional, typeLength, physical: kind };
+    return { name, type: adapter, optional, typeLength, physical: kind, index };
   }
 
   const builtin = builtinTypeOf(kind, annotation);
   if (builtin !== undefined) {
-    return { name, type: builtin, optional, typeLength: undefined, physical: kind };
+    return { name, type: builtin, optional, typeLength: undefined, physical: kind, index };
   }
 
   // Nothing claimed it, and tavolato will not guess which JavaScript type an
@@ -303,10 +331,19 @@ function columnOf(element: SchemaElement, types: readonly AnyLogicalAdapter[]): 
 /**
  * Turns the footer's depth-first schema list into a `ParquetSchema`, refusing
  * anything that is not one flat level of leaves under the root.
+ *
+ * `selection`, when there is one, narrows the result to those columns — and it
+ * narrows it *early*, before any column is resolved. The refusals in
+ * `columnOf` are per column, so a column left out of the projection cannot
+ * raise one; the refusals here are about the shape of the schema itself, and a
+ * projection has no business lifting those. A nested field means the flat
+ * mapping from schema element to column chunk is gone, which is precisely what
+ * a projection walks.
  */
 function toSchema(
   elements: readonly SchemaElement[],
   types: readonly AnyLogicalAdapter[],
+  selection: ReadonlySet<string> | undefined,
 ): FileSchema {
   const root = elements[0];
   if (root === undefined) throw malformed("The footer carries no schema");
@@ -330,19 +367,35 @@ function toSchema(
     );
   }
 
+  // Every name, before any column is resolved: a projection is checked against
+  // what the file declares, and a name declared twice is the file contradicting
+  // itself whether or not this read wanted that column.
+  const names = new Set<string>();
+  for (const element of leaves) {
+    if (element.name === "") throw malformed("A column in the schema has an empty name");
+    if (names.has(element.name)) {
+      throw malformed(`The schema declares the column "${element.name}" twice`, element.name);
+    }
+    names.add(element.name);
+  }
+  assertSelectable(selection, names);
+
   const columns: ReadColumn[] = [];
   const declared: SchemaColumn[] = [];
   const definition: SchemaDefinition = {};
-  for (const element of leaves) {
-    if (element.name === "") throw malformed("A column in the schema has an empty name");
-    if (Object.hasOwn(definition, element.name)) {
-      throw malformed(`The schema declares the column "${element.name}" twice`, element.name);
-    }
-    const column = columnOf(element, types);
+  for (const [index, element] of leaves.entries()) {
+    // The projection is applied here and nowhere later, which is what lets it
+    // rescue a file rather than merely narrow one: a column nobody asked for
+    // never reaches `columnOf`, so an INT96, an unclaimed annotation or a
+    // physical type with no reading cannot refuse a read that was never going
+    // to touch it.
+    if (selection !== undefined && !selection.has(element.name)) continue;
+    const column = columnOf(element, types, index);
     columns.push(column);
     declared.push(publicColumn(column));
     // An adapter column carries the adapter object itself, so the definition a
-    // file yields is still valid input to `createWriter`.
+    // file yields is still valid input to `createWriter` — a projected one
+    // included, which legitimately writes the narrower file.
     define(definition, element.name, { type: column.type, optional: column.optional });
   }
 
@@ -353,7 +406,33 @@ function toSchema(
     columns: Object.freeze(declared) as readonly SchemaColumn[],
     definition: Object.freeze(definition),
   });
-  return { schema, columns };
+  return { schema, columns, columnCount: leaves.length };
+}
+
+/**
+ * Checks a projection against the columns the file declares, naming both the
+ * miss and the alternatives.
+ *
+ * A name that is not there is refused rather than skipped: a read that quietly
+ * returns fewer columns than it was asked for is a typo that surfaces as
+ * missing data somewhere much further along.
+ */
+function assertSelectable(
+  selection: ReadonlySet<string> | undefined,
+  declared: ReadonlySet<string>,
+): void {
+  if (selection === undefined) return;
+  for (const name of selection) {
+    if (declared.has(name)) continue;
+    throw badOption(
+      `ReadOptions.columns names ${JSON.stringify(name)}, which this file does not declare; it holds ${[
+        ...declared,
+      ]
+        .map((column) => JSON.stringify(column))
+        .join(", ")}`,
+      name,
+    );
+  }
 }
 
 /** The half of a column a caller sees: the resolved physical type stays inside. */
@@ -373,7 +452,11 @@ function toValue(column: ReadColumn, values: ColumnValues, index: number): ReadV
   if (typeof type !== "string") return adapt(column, type, values.items[index]);
   switch (values.kind) {
     case "bytes": {
-      return decodeUtf8(values.items[index]);
+      const text = decodeUtf8(values.items[index]);
+      // A `string` column is the text; a `json` column is the document it
+      // spells. Parsed with the default reviver, so what comes back is a
+      // `JsonValue` — the cast is that, and only that.
+      return type === "json" ? (jsonValueOf(text, column.name) as ReadValue) : text;
     }
     case "i64": {
       const value = values.items[index];
@@ -667,24 +750,29 @@ function readColumnChunk(
  */
 function readRowGroup(
   input: ByteReader,
-  columns: readonly ReadColumn[],
+  file: FileColumns,
   group: RowGroupInfo,
   rows: ReadRow[],
   codecs: ReadOptions["codecs"],
 ): void | Promise<void> {
-  assertChunkCount(columns, group);
+  assertChunkCount(file, group);
 
-  // Chunks share one cursor over the file, so they are read strictly in order.
+  // Chunks share one cursor over the file, so they are read strictly in order —
+  // and a projection simply reads fewer of them. An unselected chunk is skipped
+  // whole: its pages are never touched, which is why a cursor that seeks to
+  // each chunk's own offset is what makes the skipping free.
+  const { columns } = file;
   const values: ReadValue[][] = [];
   return chain(
-    chainEach(columns.length, (index) =>
-      chain(
-        readColumnChunk(input, columns[index], group.columns[index], group.numRows, codecs),
-        (column) => {
-          values[index] = column;
+    chainEach(columns.length, (index) => {
+      const column = columns[index];
+      return chain(
+        readColumnChunk(input, column, group.columns[column.index], group.numRows, codecs),
+        (decoded) => {
+          values[index] = decoded;
         },
-      ),
-    ),
+      );
+    }),
     () => {
       // Decided once per group, never per value: a row only needs seeding when
       // the schema declares the one name a plain store cannot create, and the
@@ -701,11 +789,18 @@ function readRowGroup(
   );
 }
 
-/** A row group holds one chunk per column, and the footer has to say so twice. */
-function assertChunkCount(columns: readonly ReadColumn[], group: RowGroupInfo): void {
-  if (group.columns.length !== columns.length) {
+/**
+ * A row group holds one chunk per column, and the footer has to say so twice.
+ *
+ * Counted against the *file's* columns rather than the projected ones: this is
+ * the invariant that makes a column's position in the schema its chunk's
+ * position in the group, and a projection depends on it far more than a whole
+ * read does.
+ */
+function assertChunkCount(file: FileColumns, group: RowGroupInfo): void {
+  if (group.columns.length !== file.columnCount) {
     throw malformed(
-      `A row group holds ${group.columns.length} column chunks but the schema declares ${columns.length} columns`,
+      `A row group holds ${group.columns.length} column chunks but the schema declares ${file.columnCount} columns`,
     );
   }
 }
@@ -724,8 +819,12 @@ interface FooterInfo extends FileSchema {
  * nothing else. The entry point every read shares, eager or lazy.
  */
 function readFooter(bytes: Uint8Array, options: ReadOptions | undefined): FooterInfo {
+  // Both option validators run before a byte of the file is looked at: an
+  // option that cannot be used is the caller's mistake whatever the file holds.
+  const types = registeredTypes(options);
+  const selection = requestedColumns(options);
   const metadata = decodeFileMetadata(locateFooter(bytes));
-  const { schema, columns } = toSchema(metadata.schema, registeredTypes(options));
+  const { schema, columns, columnCount } = toSchema(metadata.schema, types, selection);
 
   // Cross-checked before a single page is touched: the row groups must account
   // for exactly the rows the footer promises, so a count corrupted in one place
@@ -738,7 +837,13 @@ function readFooter(bytes: Uint8Array, options: ReadOptions | undefined): Footer
     );
   }
 
-  return { schema, columns, rowGroups: metadata.rowGroups, rowCount: metadata.numRows };
+  return {
+    schema,
+    columns,
+    columnCount,
+    rowGroups: metadata.rowGroups,
+    rowCount: metadata.numRows,
+  };
 }
 
 /**
@@ -767,6 +872,14 @@ function readFooter(bytes: Uint8Array, options: ReadOptions | undefined): Footer
  * alone, or with a synchronous decompressor, it returns a `ParquetFile`
  * outright.
  *
+ * `columns` narrows the read to a projection: only those chunks are decoded,
+ * the rows and the returned `schema` carry only those columns, and both keep
+ * the **file's** column order rather than the order asked for. Because an
+ * unselected column is never resolved, a projection also lifts that column's
+ * refusals — an `INT96`, a dictionary-encoded chunk, an unregistered codec or
+ * an annotation nothing claims stops mattering once the column is projected
+ * away. `rowCount` is unaffected: a projection narrows columns, never rows.
+ *
  * Memory is `O(rows declared in the footer)`, not `O(bytes)`: definition levels
  * are RLE compressed, so a six byte run can legitimately declare millions of
  * nulls, and a file that does so is indistinguishable from a sparse one someone
@@ -789,6 +902,10 @@ function readFooter(bytes: Uint8Array, options: ReadOptions | undefined): Footer
  * @example
  * const { rows } = readParquet(bytes, { types: [uuid(), decimal({ precision: 12, scale: 2 })] });
  *
+ * @example
+ * // Two columns of a wide file; the rest are not decoded, or even looked at.
+ * const { schema, rows } = readParquet(bytes, { columns: ["at", "n"] });
+ *
  * @throws {TavolatoError} `ERR_READ_MALFORMED`, `ERR_READ_UNSUPPORTED` or
  * `ERR_READ_OPTION_INVALID`.
  */
@@ -804,7 +921,8 @@ export function readParquet(
   bytes: Uint8Array,
   options?: ReadOptions,
 ): ParquetFile | Promise<ParquetFile> {
-  const { schema, columns, rowGroups } = readFooter(bytes, options);
+  const file = readFooter(bytes, options);
+  const { rowGroups } = file;
   const input = new ByteReader(bytes);
   const rows: ReadRow[] = [];
   const codecs = options?.codecs;
@@ -813,9 +931,9 @@ export function readParquet(
   // decode, every group's rows into one array.
   return chain(
     chainEach(rowGroups.length, (index) =>
-      readRowGroup(input, columns, rowGroups[index], rows, codecs),
+      readRowGroup(input, file, rowGroups[index], rows, codecs),
     ),
-    () => ({ schema, rows }),
+    () => ({ schema: file.schema, rows }),
   );
 }
 
@@ -838,6 +956,14 @@ export function readParquet(
  * wait for the step that reaches them. This is lazy *decoding* over bytes you
  * already hold, not streaming input: `bytes` is referenced for as long as the
  * result is used.
+ *
+ * `ReadOptions.columns` narrows every step to a projection, exactly as it does
+ * for {@link readParquet} — and it narrows this eager sweep with it. Only the
+ * selected columns' chunks are checked when the file is opened, so an
+ * unselected column compressed with a codec nobody registered no longer refuses
+ * the read: its pages are never reached, and a check that outlived the
+ * projection would be the one thing pretending otherwise. `rowCount` and
+ * `groupCount` are the whole file's either way.
  *
  * Each step yields that group's rows, under the same rule the codec hooks
  * follow everywhere else: with no codec or a synchronous one the value is the
@@ -876,21 +1002,28 @@ export function readRowGroups(
 ): SyncParquetRowGroups;
 export function readRowGroups(bytes: Uint8Array, options: ReadOptions): ParquetRowGroups;
 export function readRowGroups(bytes: Uint8Array, options?: ReadOptions): ParquetRowGroups {
-  const { schema, columns, rowGroups, rowCount } = readFooter(bytes, options);
+  const file = readFooter(bytes, options);
+  const { rowGroups, rowCount } = file;
   const codecs = options?.codecs;
 
   // Every chunk-level check the footer can answer runs here, over every group:
   // a file that cannot be read at all should say so when it is opened, not
   // three steps into a walk that has already handed back rows.
+  //
+  // Over every *selected* column, though. An unselected chunk is not checked
+  // because it is not read: its codec need not be registered, its dictionary
+  // page is not held against it, and its value count is not asked to agree with
+  // anything. Projecting a column away means it stops existing for this read,
+  // and a check that survived would be the one place it still did.
   for (const group of rowGroups) {
-    assertChunkCount(columns, group);
-    for (const [index, column] of columns.entries()) {
-      prepareColumnChunk(column, group.columns[index], group.numRows, codecs);
+    assertChunkCount(file, group);
+    for (const column of file.columns) {
+      prepareColumnChunk(column, group.columns[column.index], group.numRows, codecs);
     }
   }
 
   return Object.freeze({
-    schema,
+    schema: file.schema,
     rowCount,
     groupCount: rowGroups.length,
     [Symbol.iterator](): IterableIterator<ReadRow[] | Promise<ReadRow[]>> {
@@ -918,7 +1051,7 @@ export function readRowGroups(bytes: Uint8Array, options?: ReadOptions): Parquet
           const rows: ReadRow[] = [];
           return {
             done: false,
-            value: chain(readRowGroup(input, columns, group, rows, codecs), () => rows),
+            value: chain(readRowGroup(input, file, group, rows, codecs), () => rows),
           };
         },
         [Symbol.iterator](): IterableIterator<ReadRow[] | Promise<ReadRow[]>> {
@@ -939,11 +1072,18 @@ export function readRowGroups(bytes: Uint8Array, options?: ReadOptions): Parquet
  * unsupported *encoding* only surfaces once pages are read. `types` claim
  * columns here exactly as they do there, since claiming happens in the footer.
  *
+ * `columns` is the one option this ignores. A projection is a property of a
+ * *read* — which chunks to decode — and asking what a file holds is exactly the
+ * case where the answer should not have been narrowed beforehand. A schema
+ * narrowed to what you already named tells you nothing you did not already
+ * know, and hides the column you were about to discover.
+ *
  * @throws {TavolatoError} `ERR_READ_MALFORMED`, `ERR_READ_UNSUPPORTED` or
  * `ERR_READ_OPTION_INVALID`.
  */
 export function readSchema(bytes: Uint8Array, options?: ReadOptions): ParquetSchema {
-  return toSchema(decodeFileMetadata(locateFooter(bytes)).schema, registeredTypes(options)).schema;
+  const types = registeredTypes(options);
+  return toSchema(decodeFileMetadata(locateFooter(bytes)).schema, types, undefined).schema;
 }
 
 /**
@@ -968,4 +1108,50 @@ function registeredTypes(options: ReadOptions | undefined): readonly AnyLogicalA
     Object.freeze(adapter);
   }
   return types;
+}
+
+/**
+ * Validates `options.columns` as a projection request and reduces it to a set.
+ *
+ * Everything checkable without the file is checked here: that it is a list, of
+ * names, of at least one, each named once. Whether those names are *in* the
+ * file is a question only the footer can answer, and `assertSelectable` asks it
+ * there.
+ *
+ * A set, because a projection is one: order comes from the file, and the
+ * membership test runs once per column of the schema.
+ */
+function requestedColumns(options: ReadOptions | undefined): ReadonlySet<string> | undefined {
+  const columns = options?.columns;
+  if (columns === undefined) return undefined;
+  if (!Array.isArray(columns)) {
+    throw badOption(
+      `ReadOptions.columns must be an array of column names, received ${describe(columns)}`,
+    );
+  }
+  if (columns.length === 0) {
+    throw badOption(
+      "ReadOptions.columns is empty: a read that reads no column at all is a mistake rather than a request",
+    );
+  }
+  const requested: readonly unknown[] = columns;
+  const wanted = new Set<string>();
+  for (const [index, name] of requested.entries()) {
+    if (typeof name !== "string") {
+      throw badOption(
+        `ReadOptions.columns[${index}] must be a column name, received ${describe(name)}`,
+      );
+    }
+    // Refused rather than deduplicated, for the same reason a name the file
+    // does not have is: both are a caller saying something they did not mean,
+    // and tavolato would rather say so than quietly do the sensible thing.
+    if (wanted.has(name)) {
+      throw badOption(
+        `ReadOptions.columns names ${JSON.stringify(name)} twice; a column is read once or not at all`,
+        name,
+      );
+    }
+    wanted.add(name);
+  }
+  return wanted;
 }

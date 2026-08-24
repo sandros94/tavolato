@@ -24,6 +24,26 @@
  */
 export type ColumnType = "string" | "json" | "f64" | "f32" | "i64" | "i32" | "bool" | "timestamp";
 
+/**
+ * Anything `JSON.stringify` produces and `JSON.parse` gives back: the value a
+ * `json` column holds on both sides.
+ *
+ * A `json` column is stored as a JSON *string* in a `BYTE_ARRAY` annotated
+ * `JSON` — that is the wire format and it does not move — but the JavaScript
+ * value is the structure, serialized on the way in and parsed on the way out.
+ *
+ * `undefined` is deliberately absent: it is not a JSON value. At the top level
+ * of a column it means the column is null, which is what `optional` is for;
+ * inside an object it simply vanishes, exactly as `JSON.stringify` drops it.
+ */
+export type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | readonly JsonValue[]
+  | { readonly [key: string]: JsonValue };
+
 /*
  * ---------------------------------------------------------------------------
  * Annotations
@@ -187,17 +207,19 @@ export interface ParquetSchema<TDefinition extends SchemaDefinition = SchemaDefi
 export type ColumnInput<TType extends ColumnType | AnyLogicalAdapter> =
   TType extends LogicalAdapter<infer TIn, unknown>
     ? TIn
-    : TType extends "string" | "json"
-      ? string
-      : TType extends "f64" | "f32" | "i32"
-        ? number
-        : TType extends "i64"
-          ? bigint | number
-          : TType extends "bool"
-            ? boolean
-            : TType extends "timestamp"
-              ? Date | number
-              : never;
+    : TType extends "json"
+      ? JsonValue
+      : TType extends "string"
+        ? string
+        : TType extends "f64" | "f32" | "i32"
+          ? number
+          : TType extends "i64"
+            ? bigint | number
+            : TType extends "bool"
+              ? boolean
+              : TType extends "timestamp"
+                ? Date | number
+                : never;
 
 type OptionalColumns<TDefinition extends SchemaDefinition> = {
   [K in keyof TDefinition]: TDefinition[K] extends { optional: true } ? K : never;
@@ -226,7 +248,7 @@ export type Row<TDefinition extends SchemaDefinition> = {
  * | tavolato    | read back as |
  * | ----------- | ------------ |
  * | `string`    | `string`     |
- * | `json`      | `string`     |
+ * | `json`      | `JsonValue`  |
  * | `f64`       | `number`     |
  * | `f32`       | `number`     |
  * | `i64`       | `bigint`     |
@@ -239,21 +261,27 @@ export type Row<TDefinition extends SchemaDefinition> = {
 export type ColumnOutput<TType extends ColumnType | AnyLogicalAdapter> =
   TType extends LogicalAdapter<never, infer TOut>
     ? TOut
-    : TType extends "string" | "json"
-      ? string
-      : TType extends "f64" | "f32" | "i32"
-        ? number
-        : TType extends "i64"
-          ? bigint
-          : TType extends "bool"
-            ? boolean
-            : TType extends "timestamp"
-              ? Date
-              : never;
+    : TType extends "json"
+      ? JsonValue
+      : TType extends "string"
+        ? string
+        : TType extends "f64" | "f32" | "i32"
+          ? number
+          : TType extends "i64"
+            ? bigint
+            : TType extends "bool"
+              ? boolean
+              : TType extends "timestamp"
+                ? Date
+                : never;
 
 /**
  * Any value the reader can produce for a **built-in** column type; `null` for a
  * null in an optional column.
+ *
+ * {@link JsonValue} carries the scalars — `string`, `number`, `boolean` and
+ * `null` — and brings the objects and arrays a `json` column parses to along
+ * with them.
  *
  * `Uint8Array` is reserved for a future raw-binary column type and is listed
  * here so that adding one is not a breaking change to every `switch` over a
@@ -264,9 +292,14 @@ export type ColumnOutput<TType extends ColumnType | AnyLogicalAdapter> =
  * `read` returns, which the in-box adapters keep inside this union. One of your
  * own is free not to; {@link ReadRowOf} is where its real type is recovered.
  */
-export type ReadValue = string | number | bigint | boolean | Date | Uint8Array | null;
+export type ReadValue = JsonValue | bigint | Date | Uint8Array;
 
-/** One row produced by the reader, keyed by column name in file order. */
+/**
+ * One row produced by the reader, keyed by column name in file order.
+ *
+ * With `ReadOptions.columns` the keys are the projected columns only, still in
+ * the file's order rather than the order they were asked for.
+ */
 export type ReadRow = Record<string, ReadValue>;
 
 /**
@@ -284,7 +317,11 @@ export type ReadRowOf<TDefinition extends SchemaDefinition> = {
 
 /** What `readParquet` returns: the file's schema and every row it holds. */
 export interface ParquetFile {
-  /** Derived from the file, in the same shape `defineSchema` produces. */
+  /**
+   * Derived from the file, in the same shape `defineSchema` produces — and
+   * narrowed to `ReadOptions.columns` when a projection was asked for, so that
+   * the schema always describes exactly the rows beside it.
+   */
   readonly schema: ParquetSchema;
   /** Every row, in row group order and, within a group, in file order. */
   readonly rows: ReadRow[];
@@ -303,9 +340,15 @@ export interface ParquetFile {
  * {@link SyncParquetRowGroups}.
  */
 export interface ParquetRowGroups<TStep = ReadRow[] | Promise<ReadRow[]>> {
-  /** Derived from the file, in the same shape `defineSchema` produces. */
+  /**
+   * Derived from the file, in the same shape `defineSchema` produces, and
+   * narrowed to `ReadOptions.columns` when a projection was asked for.
+   */
   readonly schema: ParquetSchema;
-  /** Total rows the footer declares, across every group. */
+  /**
+   * Total rows the footer declares, across every group. A projection narrows
+   * the columns, never the rows, so this is the whole file's count either way.
+   */
   readonly rowCount: number;
   /** Number of row groups in the file. */
   readonly groupCount: number;
@@ -419,4 +462,34 @@ export interface ReadOptions {
    * `bool`.
    */
   types?: readonly AnyLogicalAdapter[];
+  /**
+   * Column projection: the names to read, and the only ones the rows and the
+   * returned schema will carry.
+   *
+   * A column chunk is independently seekable, so an unselected column is not
+   * decoded, not decompressed, and not even *looked at* — the reader skips
+   * straight past its pages. That is the whole point, and it is why projection
+   * lifts refusals rather than merely hiding columns: a file with an `INT96`
+   * column, a dictionary-encoded one, or one annotated in a way nothing claims
+   * is readable as long as those columns are projected away. The same goes for
+   * codecs — an unselected chunk's codec never has to be registered.
+   *
+   * What projection does **not** lift is the shape of the schema itself. A
+   * nested or repeated field means the file is not one flat level of columns,
+   * and the mapping from schema to column chunks that projection walks is gone
+   * with it; those are still refused whole-file.
+   *
+   * Column order is the **file's**, not the order asked for, in the rows and in
+   * the schema alike — a projection is a set, and a deterministic order is
+   * worth more than honouring an accident of argument order.
+   *
+   * Every name has to be a column the file declares, listed once: an unknown
+   * name, a duplicate, or an empty list is `ERR_READ_OPTION_INVALID` rather
+   * than a read that quietly does less than it was asked to.
+   *
+   * Honoured by `readParquet` and `readRowGroups`. `readSchema` ignores it:
+   * projection is a property of a *read*, and inspecting what a file holds is
+   * exactly the case where the answer should not have been narrowed first.
+   */
+  columns?: readonly string[];
 }

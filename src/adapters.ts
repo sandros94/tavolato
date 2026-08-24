@@ -1,5 +1,6 @@
-import { describe, TavolatoError } from "./error.ts";
-import type { Annotation, LogicalAdapter, PhysicalKind, TimeUnitName } from "./types.ts";
+import { decodeUtf8, utf8 } from "./internal/bytes.ts";
+import { describe, malformed, TavolatoError } from "./error.ts";
+import type { Annotation, JsonValue, LogicalAdapter, PhysicalKind, TimeUnitName } from "./types.ts";
 
 /*
  * ---------------------------------------------------------------------------
@@ -669,4 +670,197 @@ export function integer<TWidth extends IntegerWidth>(
           },
         });
   return adapter as LogicalAdapter<IntegerValue<TWidth>, IntegerValue<TWidth>>;
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * The JSON seam
+ *
+ * A `json` column is stored as a JSON *string* in a `BYTE_ARRAY` annotated
+ * `JSON` — that is the wire format, and it is the same one every other engine
+ * writes — while the JavaScript value is the structure. The serializing is
+ * `JSON.stringify`'s and the parsing is `JSON.parse`'s, so **the round-trip
+ * semantics are JSON's, not tavolato's**: see {@link jsonTextOf}.
+ *
+ * The two halves below are shared by the built-in `json` column type and by
+ * {@link json}, which is what keeps a hand-configured reviver an *override* of
+ * one behaviour rather than a second one.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * A `JSON.parse` reviver or a `JSON.stringify` replacer. One signature serves
+ * both, which is why {@link JsonOptions} spells it once.
+ */
+export type JsonHook = (key: string, value: unknown) => unknown;
+
+/** The three keys that can reach `Object.prototype` when a parsed object is used. */
+const isDangerousKey = (key: string): boolean =>
+  key === "__proto__" || key === "prototype" || key === "constructor";
+
+/**
+ * The reviver a `json` column is parsed with unless you supply your own: it
+ * drops `__proto__`, `prototype` and `constructor` keys from every object in
+ * the document.
+ *
+ * **Two different layers, and it is worth being exact about which is which.** A
+ * *column* named `__proto__` round-trips faithfully — the reader defines that
+ * property rather than assigning it, so a file may carry a column by that name
+ * and get it back untouched. A dangerous *key inside a json value* is a
+ * different thing entirely: it is somebody's document, parsed into an object
+ * your program will then use, and this reviver drops it.
+ *
+ * Exported so that a custom reviver can compose with it rather than replace it:
+ *
+ * @example
+ * import { json, jsonReviver } from "tavolato";
+ *
+ * const dated = json({
+ *   reviver: (key, value) => {
+ *     const safe = jsonReviver(key, value);
+ *     return typeof safe === "string" && ISO.test(safe) ? new Date(safe) : safe;
+ *   },
+ * });
+ */
+export const jsonReviver: JsonHook = (key, value) => (isDangerousKey(key) ? undefined : value);
+
+/**
+ * Serializes one `json` column value, naming the two ways `JSON.stringify` has
+ * of not producing a document.
+ *
+ * **The JSON round-trip semantics are JSON's, not tavolato's.** Everything
+ * `JSON.stringify` does quietly, it still does here: `NaN` and `±Infinity`
+ * become `null`, an `undefined` property vanishes along with a function or a
+ * symbol one, a `Date` becomes its ISO string and stays a string on the way
+ * back, a `Map` becomes `{}`, and a `toJSON()` method is honoured. tavolato
+ * refuses to invent a second JSON with different rules; what it does do is
+ * turn the two cases `JSON.stringify` cannot express at all into typed errors
+ * rather than a `TypeError` or a stored `undefined`.
+ *
+ * `column` names the column when the caller knows it — the built-in path does,
+ * an adapter does not and has its column added when the writer wraps this.
+ *
+ * @internal
+ */
+export function jsonTextOf(value: unknown, column?: string, replacer?: JsonHook): string {
+  let text: string | undefined;
+  try {
+    text = JSON.stringify(value, replacer);
+  } catch (cause) {
+    // A bigint anywhere in the document is the case that gets here: JSON has no
+    // spelling for one, and picking a string or a lossy number on somebody's
+    // behalf is exactly the guess tavolato refuses everywhere else.
+    throw new TavolatoError(
+      `A json value must be something JSON.stringify accepts, and ${describe(value)} is not: ${
+        cause instanceof Error ? cause.message : describe(cause)
+      }`,
+      "ERR_ROW_VALUE_INVALID",
+      column,
+      cause,
+    );
+  }
+  if (text === undefined) {
+    // `undefined`, a function or a symbol at the *top* level. Inside an object
+    // these vanish; as the whole value there is nothing left to store.
+    throw new TavolatoError(
+      `A json value must serialize to a JSON document, and ${describe(value)} serializes to nothing at all`,
+      "ERR_ROW_VALUE_INVALID",
+      column,
+    );
+  }
+  return text;
+}
+
+/**
+ * Parses one `json` column value, with {@link jsonReviver} unless the caller
+ * brought its own.
+ *
+ * A JSON-annotated column is only *claimed* to hold JSON. Any file may say so
+ * about any bytes, so a parse failure is the file being malformed rather than
+ * anything the caller did.
+ *
+ * @internal
+ */
+export function jsonValueOf(
+  text: string,
+  column?: string,
+  reviver: JsonHook = jsonReviver,
+): unknown {
+  try {
+    return JSON.parse(text, reviver) as unknown;
+  } catch (cause) {
+    throw malformed(
+      `A JSON-annotated column holds ${describe(text.length > 64 ? `${text.slice(0, 64)}…` : text)}, which is not valid JSON`,
+      column,
+      cause,
+    );
+  }
+}
+
+/** Options for {@link json}. */
+export interface JsonOptions {
+  /**
+   * Reviver handed to `JSON.parse`. **Replaces** {@link jsonReviver} rather
+   * than running after it: bringing your own means owning it, dangerous keys
+   * included. Composing is one call — `jsonReviver` is exported for exactly
+   * that.
+   */
+  reviver?: JsonHook;
+  /** Replacer handed to `JSON.stringify`. */
+  replacer?: JsonHook;
+}
+
+/**
+ * `JSON` ⇄ the parsed document, with a reviver and a replacer of your own.
+ *
+ * The built-in `json` column type already parses and serializes; this is the
+ * same column with the two hooks opened up, the way `ofetch` lets a caller
+ * take over response parsing without giving up the default. It claims the
+ * `JSON` annotation exactly as the built-in does, and writes the identical
+ * bytes — the difference is only which functions run either side of them.
+ *
+ * Registered in `ReadOptions.types` it wins over the built-in, because adapters
+ * are consulted first; in a schema it is chosen by declaring it as the column's
+ * `type`.
+ *
+ * `TValue` is what your hooks map to and from, and defaults to
+ * {@link JsonValue}. Name it when your documents have a shape — that is also
+ * the way out of `JsonValue`'s index-signature strictness, which an `interface`
+ * cannot satisfy.
+ *
+ * @example
+ * const schema = defineSchema({ payload: { type: json<Payload>() } });
+ *
+ * @example
+ * // Keeps the dangerous keys the default reviver drops:
+ * const raw = json({ reviver: (_key, value) => value });
+ *
+ * @throws {TavolatoError} `ERR_SCHEMA_COLUMN_INVALID` when a hook is not a function.
+ */
+/*
+ * Two overloads rather than one default type argument: a defaulted parameter
+ * does not survive `defineSchema`'s `const` inference, and a `json()` column
+ * would come back out of `ReadRowOf` as `any` instead of a `JsonValue`. The
+ * concrete signature is the one an unparameterized call picks; supplying a type
+ * argument skips it on arity and lands on the generic one.
+ */
+export function json(options?: JsonOptions): LogicalAdapter<JsonValue, JsonValue>;
+export function json<TValue>(options?: JsonOptions): LogicalAdapter<TValue, TValue>;
+export function json<TValue>(options: JsonOptions = {}): LogicalAdapter<TValue, TValue> {
+  const { reviver = jsonReviver, replacer } = options;
+  if (typeof reviver !== "function") {
+    throw invalid(`json reviver must be a function, received ${describe(reviver)}`);
+  }
+  if (replacer !== undefined && typeof replacer !== "function") {
+    throw invalid(`json replacer must be a function, received ${describe(replacer)}`);
+  }
+
+  return defineColumnType<TValue, TValue>({
+    name: "json",
+    physical: "bytes",
+    matches: (annotation) => annotation.kind === "json",
+    annotate: () => ({ kind: "json" }),
+    read: (raw) => jsonValueOf(decodeUtf8(raw as Uint8Array), undefined, reviver) as TValue,
+    write: (value) => utf8.encode(jsonTextOf(value, undefined, replacer)),
+  });
 }

@@ -15,6 +15,7 @@ import {
   type RowGroupMeta,
   snapshotColumn,
 } from "./internal/format.ts";
+import { jsonTextOf } from "./adapters.ts";
 import { describe, TavolatoError } from "./error.ts";
 import type {
   AnyLogicalAdapter,
@@ -170,13 +171,19 @@ function stage(state: ColumnState, value: unknown, present: boolean): StagedValu
   // back to the physical type it promised. Nulls never get this far.
   if (typeof type !== "string") return stageRaw(state, type, adapt(column, type, value));
   switch (type) {
-    case "string":
-    case "json": {
-      // A `json` value is a string end to end: tavolato never parses it, never
-      // re-serializes it, and stores exactly the bytes it was handed. The JSON
-      // annotation is metadata for whoever reads the file next.
+    case "string": {
       if (typeof value !== "string") throw invalid(column, value, "a string");
       return { kind: "bytes", value: utf8.encode(value) };
+    }
+    case "json": {
+      // A `json` column holds the *structure*, and the stored form is the JSON
+      // string that Parquet's JSON annotation describes. Which means the
+      // semantics of the round trip are `JSON.stringify`'s and `JSON.parse`'s
+      // rather than tavolato's — `jsonTextOf` is where that is written down.
+      //
+      // A top-level `null` never reaches here: it was handled above, with every
+      // other column type's, as the column being null.
+      return { kind: "bytes", value: utf8.encode(jsonTextOf(value, column.name)) };
     }
     case "f64": {
       if (typeof value !== "number") throw invalid(column, value, "a number");

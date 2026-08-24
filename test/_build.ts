@@ -59,3 +59,26 @@ export function sealFile(out: ByteWriter, footer: Uint8Array): Uint8Array {
   out.raw(MAGIC);
   return out.toBytes();
 }
+
+/**
+ * Rewrites the physical type of the file's **first `INT64` column**, standing
+ * in for a file no writer here can produce: an `INT96`, or a type Parquet never
+ * defined at all.
+ *
+ * The leaf's `SchemaElement` is `15 04 25 …`: type INT64 (zigzag 2 = 4), then
+ * the repetition, then the name. Only the schema element spells the type that
+ * way — the column chunk's copy is followed by its encodings list — so the
+ * pattern is unambiguous, and the schema is the first list the footer carries.
+ */
+export function withPhysicalType(bytes: Uint8Array, physical: number): Uint8Array {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const footer = bytes.length - 8 - view.getUint32(bytes.length - 8, true);
+  for (let offset = footer; offset < bytes.length - 8; offset++) {
+    if (bytes[offset] === 0x15 && bytes[offset + 1] === 0x04 && bytes[offset + 2] === 0x25) {
+      const copy = bytes.slice();
+      copy[offset + 1] = physical * 2; // zigzag of a small positive number
+      return copy;
+    }
+  }
+  throw new Error("no INT64 schema element found");
+}

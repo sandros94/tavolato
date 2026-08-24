@@ -104,7 +104,7 @@ back as an Invalid Date, and `timestamp({ unit: "millis" })` reads the count
 itself. `tavolato`'s own writer will not produce such a value in the first
 place.
 
-Some cases stay out of reach whatever you register:
+Some columns stay out of reach whatever you register:
 
 - **Dictionary-encoded columns.** `parquet-rs` writers — `celld`'s telemetry
   Parquet among them — dictionary-encode by default, so a codec hook alone does
@@ -112,6 +112,11 @@ Some cases stay out of reach whatever you register:
 - **Anything the Parquet format itself has deprecated.** `tavolato` may refuse
   it outright, with no hook and no way to opt in. **`INT96` is the named
   example**: deprecated in the format, never written here, permanently refused.
+
+What you can do is not read them. A refusal that belongs to one column is lifted
+by [projecting that column away](#reading-some-of-the-columns), because a column
+nobody asked for is never resolved — so a file whose _other_ columns are
+perfectly ordinary is readable after all.
 
 Bytes that are not a well-formed Parquet file at all — wrong magic, a truncated
 stream, a length that does not fit, a footer that contradicts itself — raise
@@ -178,7 +183,7 @@ groups, `num_rows = 0`.
 | `type`      | Accepts                | Parquet physical | Parquet logical          |
 | ----------- | ---------------------- | ---------------- | ------------------------ |
 | `string`    | `string`               | `BYTE_ARRAY`     | `STRING` (`UTF8`)        |
-| `json`      | `string`               | `BYTE_ARRAY`     | `JSON`                   |
+| `json`      | `JsonValue`            | `BYTE_ARRAY`     | `JSON`                   |
 | `f64`       | `number`               | `DOUBLE`         | —                        |
 | `f32`       | `number`               | `FLOAT`          | —                        |
 | `i64`       | `bigint`, safe integer | `INT64`          | —                        |
@@ -216,13 +221,23 @@ the bytes are.
 
 ```ts
 const schema = defineSchema({ at: { type: "timestamp" }, payload: { type: "json" } });
-writer.append({ at: Date.now(), payload: JSON.stringify({ user: 1, tags: ["a"] }) });
+writer.append({ at: Date.now(), payload: { user: 1, tags: ["a"] } });
 ```
 
-The value is a **string in and a string out**. `tavolato` never calls
-`JSON.parse` or `JSON.stringify` for you, never validates the document, and
-stores exactly the bytes you hand it — whitespace and key order included. You
-choose when to pay for parsing, and a round trip is byte-exact.
+The value is the **document itself**, in and out: `JSON.stringify` on the way in,
+`JSON.parse` on the way out, and the stored form is the JSON string that
+Parquet's `JSON` annotation describes. Which means the round-trip semantics are
+**JSON's, not `tavolato`'s** — `NaN` and the infinities become `null`, an
+`undefined` property vanishes, a `Date` becomes its ISO string and stays a
+string. The two things JSON cannot express at all are typed errors instead: a
+`bigint` anywhere in the document, and a value that serializes to nothing.
+
+Parsing uses a sanitizing reviver that drops `__proto__`, `prototype` and
+`constructor` keys from the documents it parses. That is a different layer from
+a **column** named `__proto__`, which round-trips faithfully. `jsonReviver` is
+exported to compose with, and `json({ reviver, replacer })` is the column type
+that takes both hooks — a custom reviver replaces the default rather than
+running after it.
 
 What the annotation buys is the other side. DuckDB reads the column as native
 `JSON`, so its operators just work:
@@ -277,17 +292,18 @@ Each maps by one rule — the value must survive the round trip unchanged. A
 where a JavaScript number would lie, and a `Date` only where the mapping is
 exact.
 
-| Column type                                    | JavaScript | Parquet                                    |
-| ---------------------------------------------- | ---------- | ------------------------------------------ |
-| `date()`                                       | `Date`     | `INT32` / `DATE`                           |
-| `decimal({ precision, scale })`                | `string`   | `INT32`, `INT64` or `FLBA(16)` / `DECIMAL` |
-| `uuid()`                                       | `string`   | `FLBA(16)` / `UUID`                        |
-| `time({ unit: "millis" })`                     | `number`   | `INT32` / `TIME(MILLIS)`                   |
-| `time({ unit: "micros" \| "nanos" })`          | `bigint`   | `INT64` / `TIME(…)`                        |
-| `timestamp({ unit })`                          | `bigint`   | `INT64` / `TIMESTAMP(UTC, …)`              |
-| `float16()`                                    | `number`   | `FLBA(2)` / `FLOAT16`                      |
-| `integer({ bitWidth: 8 \| 16 \| 32, signed })` | `number`   | `INT32` / `INTEGER(…)`                     |
-| `integer({ bitWidth: 64, signed })`            | `bigint`   | `INT64` / `INTEGER(64, …)`                 |
+| Column type                                    | JavaScript  | Parquet                                    |
+| ---------------------------------------------- | ----------- | ------------------------------------------ |
+| `date()`                                       | `Date`      | `INT32` / `DATE`                           |
+| `decimal({ precision, scale })`                | `string`    | `INT32`, `INT64` or `FLBA(16)` / `DECIMAL` |
+| `uuid()`                                       | `string`    | `FLBA(16)` / `UUID`                        |
+| `time({ unit: "millis" })`                     | `number`    | `INT32` / `TIME(MILLIS)`                   |
+| `time({ unit: "micros" \| "nanos" })`          | `bigint`    | `INT64` / `TIME(…)`                        |
+| `timestamp({ unit })`                          | `bigint`    | `INT64` / `TIMESTAMP(UTC, …)`              |
+| `float16()`                                    | `number`    | `FLBA(2)` / `FLOAT16`                      |
+| `integer({ bitWidth: 8 \| 16 \| 32, signed })` | `number`    | `INT32` / `INTEGER(…)`                     |
+| `integer({ bitWidth: 64, signed })`            | `bigint`    | `INT64` / `INTEGER(64, …)`                 |
+| `json({ reviver, replacer })`                  | `JsonValue` | `BYTE_ARRAY` / `JSON`                      |
 
 - **`date()`** takes a `Date` that is exactly UTC midnight, because a Parquet
   `DATE` has no time of day at all. A `Date` carrying one is refused rather than
@@ -324,6 +340,12 @@ exact.
   widths in an `INT32`, and the annotation says how much of it is meant. Values
   are range-checked on the way in, so an `INTEGER(8, true)` column cannot come to
   hold 300.
+- **`json()`** is the built-in [`json` column](#json-the-flat-schema-escape-valve)
+  with its reviver and replacer opened up. It writes the identical bytes and
+  claims the same annotation; registered in `ReadOptions.types` it wins over the
+  built-in, since adapters are consulted first. `json<Payload>()` names the
+  document's type — which is also the way out of `JsonValue`'s index signature,
+  since an `interface` cannot satisfy one.
 
 #### Who claims what
 
@@ -409,7 +431,7 @@ accepts two inputs, the reader picks one and always picks it:
 | `type`      | Written from           | Read back as |
 | ----------- | ---------------------- | ------------ |
 | `string`    | `string`               | `string`     |
-| `json`      | `string`               | `string`     |
+| `json`      | `JsonValue`            | `JsonValue`  |
 | `f64`       | `number`               | `number`     |
 | `f32`       | `number`               | `number`     |
 | `i64`       | `bigint`, safe integer | `bigint`     |
@@ -437,6 +459,29 @@ that column set to `null`.
 touching a single page — useful to see what a file holds before deciding to
 read it. It takes the same `types` as `readParquet`, since a column is claimed in
 the footer: `readSchema(bytes, { types: [price] })`.
+
+#### Reading some of the columns
+
+`ReadOptions.columns` narrows a read to a projection. A column chunk is
+independently seekable, so the columns left out are not decoded, not
+decompressed, and not even resolved:
+
+```ts
+const { schema, rows } = readParquet(bytes, { columns: ["at", "n"] });
+```
+
+Rows and the returned `schema` carry only those columns, in the **file's** order
+rather than the order asked for, and `rowCount` is unchanged — a projection
+narrows columns, never rows. Because an unselected column is never resolved, a
+projection also lifts that column's refusals: a file with an `INT96`, a
+dictionary-encoded chunk, an unregistered codec or an annotation nothing claims
+still reads once the offending column is projected away. What it does not lift
+is the shape of the schema — a nested field is still refused whole-file.
+
+An unknown name, a duplicate, or an empty list is `ERR_READ_OPTION_INVALID`.
+`readRowGroups` honours the option too; `readSchema` deliberately does not,
+since inspecting what a file holds is the one case where the answer should not
+have been narrowed first.
 
 Rows are typed loosely, since a file's schema is only known at runtime. When you
 do know it, `ReadRowOf` is the read-side twin of the writer's row type:

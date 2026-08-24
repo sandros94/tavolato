@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { gunzipSync, zstdDecompressSync } from "node:zlib";
 import { afterAll, describe, expect, it } from "vitest";
 import {
+  createWriter,
   date,
   decimal,
   integer,
@@ -13,7 +14,7 @@ import {
   uuid,
 } from "../src/index.ts";
 import type { CodecName, ReaderCodec, ReadRow } from "../src/index.ts";
-import { cleanupTempDir, duckdb, duckdbRow, sqlPath, tempDir } from "./_duckdb.ts";
+import { cleanupTempDir, duckdb, duckdbRow, sqlPath, tempDir, writeParquet } from "./_duckdb.ts";
 import { expectError } from "./_errors.ts";
 import { sync } from "./_sync.ts";
 
@@ -93,7 +94,7 @@ describe("files DuckDB writes inside the subset", () => {
     const { rows } = readParquet(bytes);
 
     expect(rows).toHaveLength(reference.length);
-    expect(rows.map((row) => ({ n: String(row.n), s: row.s }))).toEqual(reference);
+    expect(rows.map((row) => ({ n: String(row.n as bigint), s: row.s }))).toEqual(reference);
   });
 
   it("reads a file DuckDB split into several row groups", () => {
@@ -134,17 +135,49 @@ describe("files DuckDB writes inside the subset", () => {
     expect(rows).toEqual(Array.from({ length: 5 }, (_, i) => ({ n: i, f: i + 0.5 })));
   });
 
-  it("reads a JSON-annotated column as a json column of strings", () => {
+  it("reads a JSON-annotated column as the documents it holds", () => {
     const bytes = copyTo(
       "cross-json.parquet",
-      `SELECT ('{"id":' || i || ',"tag":"t' || i || '"}')::JSON AS j FROM range(5) tbl(i)`,
+      `SELECT ('{"id":' || i || ',"tag":"t' || i || '","tags":[' || i || ',null],"π":"日本"}')::JSON AS j
+       FROM range(5) tbl(i)`,
     );
     const { schema, rows } = readParquet(bytes);
     expect(schema.columns).toEqual([{ name: "j", type: "json", optional: true }]);
-    // DuckDB stores the document as text and tavolato hands the text back; the
-    // annotation is the only thing that says what the text means.
+    // DuckDB stores the document as text, and the annotation is what says the
+    // text is JSON — which is exactly the licence tavolato needs to parse it.
     expect(rows.map((row) => row.j)).toEqual(
-      Array.from({ length: 5 }, (_, i) => `{"id":${i},"tag":"t${i}"}`),
+      Array.from({ length: 5 }, (_, i) => ({
+        id: i,
+        tag: `t${i}`,
+        tags: [i, null],
+        π: "日本",
+      })),
+    );
+  });
+
+  it("hands a DuckDB document back to DuckDB unchanged", () => {
+    // The full circle: DuckDB writes the JSON, tavolato parses it, tavolato
+    // writes it again from the structure, and DuckDB reads the same values out
+    // of the second file as out of the first.
+    const bytes = copyTo(
+      "cross-json-circle.parquet",
+      `SELECT ('{"id":' || i || ',"nested":{"tags":["a","b"],"n":' || i || '.5}}')::JSON AS j
+       FROM range(4) tbl(i)`,
+    );
+    const { schema, rows } = readParquet(bytes);
+
+    const writer = createWriter(schema);
+    for (const row of rows) writer.append({ j: row.j });
+    const again = sqlPath(writeParquet("cross-json-again.parquet", sync(writer.finish())));
+
+    const query = (path: string): unknown[] =>
+      duckdb(
+        `SELECT (j->>'$.id')::BIGINT AS id, j->>'$.nested.tags[1]' AS tag, (j->>'$.nested.n')::DOUBLE AS n
+         FROM read_parquet(${path}) ORDER BY id;`,
+      );
+    expect(query(again)).toEqual(query(sqlPath(join(tempDir(), "cross-json-circle.parquet"))));
+    expect(query(again)).toEqual(
+      Array.from({ length: 4 }, (_, i) => ({ id: i, tag: "b", n: i + 0.5 })),
     );
   });
 });
@@ -231,9 +264,9 @@ describe("files DuckDB compresses, read with a registered decompressor", () => {
     const reference = duckdb<{ n: string; s: string; f: number }>(
       `SELECT n::VARCHAR AS n, s, f FROM read_parquet(${path}) ORDER BY n::BIGINT;`,
     );
-    expect(walked.flat().map((row) => ({ n: String(row.n), s: row.s, f: row.f }))).toEqual(
-      reference,
-    );
+    expect(
+      walked.flat().map((row) => ({ n: String(row.n as bigint), s: row.s, f: row.f })),
+    ).toEqual(reference);
   });
 
   it("reads a compressed JSON column too", () => {
@@ -246,7 +279,109 @@ describe("files DuckDB compresses, read with a registered decompressor", () => {
       readParquet(bytes, { codecs: { GZIP: { decompress: (page) => gunzipSync(page) } } }),
     );
     expect(schema.columns[0].type).toBe("json");
-    expect(rows.map((row) => row.j)).toEqual(Array.from({ length: 50 }, (_, i) => `{"id":${i}}`));
+    expect(rows.map((row) => row.j)).toEqual(Array.from({ length: 50 }, (_, i) => ({ id: i })));
+  });
+});
+
+/**
+ * Projection against the oracle. DuckDB is the reader that decides what a file
+ * really holds, so a projected read is checked the only honest way: against
+ * DuckDB reading the same columns out of the same file.
+ */
+describe("reading some of DuckDB's columns and none of the rest", () => {
+  it("agrees with DuckDB's own projection of the same file", () => {
+    const file = "cross-projection.parquet";
+    const bytes = copyTo(
+      file,
+      `SELECT i::BIGINT AS n, 'v' || i AS s, (i + 0.5)::DOUBLE AS f,
+              CASE WHEN i % 4 = 0 THEN NULL ELSE 'o' || i END AS o
+       FROM range(300) tbl(i)`,
+      "COMPRESSION UNCOMPRESSED, ROW_GROUP_SIZE 2048",
+    );
+    const path = sqlPath(join(tempDir(), file));
+    const reference = duckdb<{ n: string; o: string | null }>(
+      `SELECT n::VARCHAR AS n, o FROM read_parquet(${path}) ORDER BY n::BIGINT;`,
+    );
+
+    const { schema, rows } = readParquet(bytes, { columns: ["o", "n"] });
+    // The file's order, not the order asked for, on both halves.
+    expect(schema.columns.map((column) => column.name)).toEqual(["n", "o"]);
+    expect(rows.map((row) => ({ n: String(row.n as bigint), o: row.o }))).toEqual(reference);
+    expect(Object.keys(rows[0])).toEqual(["n", "o"]);
+  });
+
+  it("reads past a dictionary-encoded column by projecting it away", () => {
+    // DuckDB reaches for a dictionary as soon as repetition pays, and a
+    // dictionary page is out of scope. The plain column beside it is not, and
+    // its chunk is a seek away.
+    const file = "cross-projection-dictionary.parquet";
+    const bytes = copyTo(
+      file,
+      `SELECT 'host-' || (i % 5) AS s, i::BIGINT AS n FROM range(20000) tbl(i)`,
+    );
+    const path = sqlPath(join(tempDir(), file));
+    const encodings = duckdb<{ name: string; encodings: string }>(
+      `SELECT path_in_schema AS name, encodings FROM parquet_metadata(${path});`,
+    );
+    expect(
+      encodings.filter((row) => row.encodings.includes("DICTIONARY")).map((row) => row.name),
+    ).toEqual(["s"]);
+
+    const refusal = expectError("ERR_READ_UNSUPPORTED", () => readParquet(bytes));
+    expect(refusal.message).toContain("dictionary");
+    expect(refusal.column).toBe("s");
+
+    const { schema, rows } = readParquet(bytes, { columns: ["n"] });
+    expect(schema.columns).toEqual([{ name: "n", type: "i64", optional: true }]);
+    expect(rows).toHaveLength(20_000);
+    expect(rows.at(-1)).toEqual({ n: 19_999n });
+  });
+
+  it("reads past a compressed column by projecting it away", () => {
+    // Every column of a DuckDB file shares its codec, so this is the refusal
+    // lifting rather than a mixed file: with only the projected column read,
+    // the codec is still needed — and once it is registered, only that column's
+    // pages go through it.
+    const file = "cross-projection-gzip.parquet";
+    const bytes = copyTo(
+      file,
+      `SELECT i::BIGINT AS n, 'v' || i AS s FROM range(300) tbl(i)`,
+      "COMPRESSION GZIP",
+    );
+    const { rows } = sync(
+      readParquet(bytes, {
+        columns: ["s"],
+        codecs: { GZIP: { decompress: (page) => gunzipSync(page) } },
+      }),
+    );
+    expect(rows).toHaveLength(300);
+    expect(rows.at(-1)).toEqual({ s: "v299" });
+  });
+
+  it("reads past DuckDB's annotated columns by projecting them away", () => {
+    // A DATE, a DECIMAL and a UUID, none of which has a built-in reading — and
+    // a BIGINT beside them, which has.
+    const bytes = copyTo(
+      "cross-projection-annotated.parquet",
+      `SELECT (DATE '2026-08-24' + i::INTEGER) AS d, (i + 0.25)::DECIMAL(18, 2) AS p,
+              ('b3f2c1a0-1111-4222-8333-44445555666' || i)::UUID AS u, i::BIGINT AS n
+       FROM range(3) tbl(i)`,
+    );
+    expectError("ERR_READ_UNSUPPORTED", () => readParquet(bytes));
+
+    const { schema, rows } = readParquet(bytes, { columns: ["n"] });
+    expect(schema.columns.map((column) => column.type)).toEqual(["i64"]);
+    expect(rows).toEqual([{ n: 0n }, { n: 1n }, { n: 2n }]);
+
+    // One of them back in, with the column type that claims it.
+    expect(
+      readParquet(bytes, { columns: ["n", "p"], types: [decimal({ precision: 18, scale: 2 })] })
+        .rows,
+    ).toEqual([
+      { p: "0.25", n: 0n },
+      { p: "1.25", n: 1n },
+      { p: "2.25", n: 2n },
+    ]);
   });
 });
 

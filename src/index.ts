@@ -8,6 +8,8 @@ export {
   defineColumnType,
   float16,
   integer,
+  json,
+  jsonReviver,
   time,
   timestamp,
   uuid,
@@ -17,6 +19,8 @@ export type {
   IntegerOptions,
   IntegerValue,
   IntegerWidth,
+  JsonHook,
+  JsonOptions,
   TimeOptions,
   TimeValue,
 } from "./adapters.ts";

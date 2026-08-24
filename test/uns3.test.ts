@@ -106,6 +106,8 @@ describe("export map", () => {
       "float16",
       "integer",
       "isTavolatoError",
+      "json",
+      "jsonReviver",
       "readParquet",
       "readRowGroups",
       "readSchema",

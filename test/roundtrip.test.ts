@@ -15,6 +15,7 @@ import {
 } from "../src/index.ts";
 import type {
   AnyLogicalAdapter,
+  JsonValue,
   ParquetSchema,
   ReadOptions,
   ReadRow,
@@ -149,7 +150,7 @@ describe.each(LEGS)("$label", ({ codec }) => {
         doc: { type: "json" },
         maybe: { type: "json", optional: true },
       });
-      const { schema: recovered } = roundtrip(declared, [{ k: 0n, doc: "{}" }]);
+      const { schema: recovered } = roundtrip(declared, [{ k: 0n, doc: {} }]);
       expect(recovered.columns).toEqual(declared.columns);
       expect(recovered.definition).toEqual({
         k: { type: "i64", optional: false },
@@ -159,10 +160,10 @@ describe.each(LEGS)("$label", ({ codec }) => {
 
       // The schema a file yields is valid input again: same columns, same file.
       const again = createWriter(recovered, { codec });
-      sync(again.append({ k: 1n, doc: '{"round":"trip"}' }));
+      sync(again.append({ k: 1n, doc: { round: "trip" } }));
       const reread = sync(readParquet(sync(again.finish()), read));
       expect(reread.schema.columns).toEqual(declared.columns);
-      expect(reread.rows).toEqual([{ k: 1n, doc: '{"round":"trip"}', maybe: null }]);
+      expect(reread.rows).toEqual([{ k: 1n, doc: { round: "trip" }, maybe: null }]);
     });
 
     it("returns a frozen schema, like defineSchema does", () => {
@@ -301,20 +302,26 @@ describe.each(LEGS)("$label", ({ codec }) => {
       expect(rows.map((row) => row.s)).toEqual(values);
     });
 
-    it("round-trips json documents as the exact strings they were given", () => {
-      // The last two are the point of the type: tavolato never parses and never
-      // re-serializes, so whitespace and key order come back untouched. A
-      // library that round-tripped through `JSON.parse` would fail both.
-      const documents = [
-        "{}",
-        "[]",
-        "null",
-        "42",
-        '"a bare string"',
-        '{"nested":{"deep":[1,2,3]}}',
-        '{"unicode":"日本語","emoji":"🎉"}',
-        '  {\n    "spaced": true\n  }  ',
-        '{"z":1,"a":2}',
+    it("round-trips json documents as the structures they were given", () => {
+      // Every shape JSON has, including the scalars a document is allowed to be
+      // all by itself. What comes back is deep-equal to what went in — the same
+      // guarantee the other column types make, over a value with an inside.
+      const documents: JsonValue[] = [
+        {},
+        [],
+        42,
+        0,
+        -1.5,
+        true,
+        false,
+        "a bare string",
+        "",
+        { nested: { deep: [1, 2, 3] } },
+        { unicode: "日本語", emoji: "🎉" },
+        { mixed: [1, "two", true, null, { three: 3 }, []] },
+        { "key with spaces": 1, "ключ": 2, "": 3 },
+        [[[[1]]]],
+        { inner: null },
       ];
       const schema = defineSchema({
         k: { type: "i64" },
@@ -334,6 +341,17 @@ describe.each(LEGS)("$label", ({ codec }) => {
       expect(rows.map((row) => row.maybe)).toEqual(
         documents.map((doc, index) => (index % 2 === 0 ? null : doc)),
       );
+    });
+
+    it("round-trips a json document through a second write unchanged", () => {
+      // What the reader hands back is legal input again, and writing it a
+      // second time produces the same document — which is what makes the
+      // structure, rather than the text, the value of the column.
+      const schema = defineSchema({ k: { type: "i64" }, doc: { type: "json" } });
+      const document = { b: [1, { c: "d" }], a: null };
+      const first = roundtrip(schema, [{ k: 0n, doc: document }]);
+      const second = roundtrip(schema, [{ k: 0n, doc: first.rows[0].doc as JsonValue }]);
+      expect(second.rows).toEqual(first.rows);
     });
 
     it("round-trips the signed 64-bit extremes as bigints", () => {

@@ -7,6 +7,8 @@ import {
   defineSchema,
   float16,
   integer,
+  json,
+  jsonReviver,
   readParquet,
   readRowGroups,
   time,
@@ -14,6 +16,7 @@ import {
   uuid,
 } from "../src/index.ts";
 import type {
+  JsonValue,
   ParquetFile,
   ParquetRowGroups,
   ReadRow,
@@ -47,35 +50,43 @@ const schema = defineSchema({
 const writer = createWriter(schema);
 
 // Accepted shapes.
-writer.append({ s: "x", j: "{}", f: 1, g: 1, i: 1n, n: 1, b: true, t: 0 }); // optional column omitted
-writer.append({ s: "x", j: "{}", f: 1, g: 1, i: 1, n: 1, b: true, t: new Date(), opt: null });
-writer.append({ s: "x", j: "{}", f: 1, g: 1, i: 1n, n: 1, b: false, t: Date.now(), opt: "y" });
-writer.append({ s: "x", j: "{}", f: 1, g: 1, i: 1n, n: 1, b: false, t: 0, opt: undefined });
+writer.append({ s: "x", j: { a: 1 }, f: 1, g: 1, i: 1n, n: 1, b: true, t: 0 }); // optional column omitted
+writer.append({ s: "x", j: { a: 1 }, f: 1, g: 1, i: 1, n: 1, b: true, t: new Date(), opt: null });
+writer.append({ s: "x", j: { a: 1 }, f: 1, g: 1, i: 1n, n: 1, b: false, t: Date.now(), opt: "y" });
+writer.append({ s: "x", j: { a: 1 }, f: 1, g: 1, i: 1n, n: 1, b: false, t: 0, opt: undefined });
 
 // @ts-expect-error a required column must not be omitted
-writer.append({ j: "{}", f: 1, g: 1, i: 1n, n: 1, b: true, t: 0 });
+writer.append({ j: { a: 1 }, f: 1, g: 1, i: 1n, n: 1, b: true, t: 0 });
 // @ts-expect-error a required column must not be null
-writer.append({ s: null, j: "{}", f: 1, g: 1, i: 1n, n: 1, b: true, t: 0 });
+writer.append({ s: null, j: { a: 1 }, f: 1, g: 1, i: 1n, n: 1, b: true, t: 0 });
 // @ts-expect-error string columns take strings
-writer.append({ s: 1, j: "{}", f: 1, g: 1, i: 1n, n: 1, b: true, t: 0 });
-// @ts-expect-error json columns take the document as a string, not as an object
-writer.append({ s: "x", j: { a: 1 }, f: 1, g: 1, i: 1n, n: 1, b: true, t: 0 });
+writer.append({ s: 1, j: { a: 1 }, f: 1, g: 1, i: 1n, n: 1, b: true, t: 0 });
+// @ts-expect-error a json column takes a JSON document, and JSON has no bigint
+writer.append({ s: "x", j: 1n, f: 1, g: 1, i: 1n, n: 1, b: true, t: 0 });
+// @ts-expect-error nor anywhere inside one
+writer.append({ s: "x", j: { big: 1n }, f: 1, g: 1, i: 1n, n: 1, b: true, t: 0 });
+// @ts-expect-error nor a function, which serializes to nothing at all
+writer.append({ s: "x", j: () => 1, f: 1, g: 1, i: 1n, n: 1, b: true, t: 0 });
+// Every other JSON shape is a value the column takes, scalars included.
+writer.append({ s: "x", j: [1, "two", null, { d: true }], f: 1, g: 1, i: 1n, n: 1, b: true, t: 0 });
+writer.append({ s: "x", j: "a bare string", f: 1, g: 1, i: 1n, n: 1, b: true, t: 0 });
+writer.append({ s: "x", j: 42, f: 1, g: 1, i: 1n, n: 1, b: true, t: 0 });
 // @ts-expect-error f64 columns take numbers, not bigints
-writer.append({ s: "x", j: "{}", f: 1n, g: 1, i: 1n, n: 1, b: true, t: 0 });
+writer.append({ s: "x", j: { a: 1 }, f: 1n, g: 1, i: 1n, n: 1, b: true, t: 0 });
 // @ts-expect-error f32 columns take numbers, not bigints
-writer.append({ s: "x", j: "{}", f: 1, g: 1n, i: 1n, n: 1, b: true, t: 0 });
+writer.append({ s: "x", j: { a: 1 }, f: 1, g: 1n, i: 1n, n: 1, b: true, t: 0 });
 // @ts-expect-error i64 columns take bigints or numbers, not strings
-writer.append({ s: "x", j: "{}", f: 1, g: 1, i: "1", n: 1, b: true, t: 0 });
+writer.append({ s: "x", j: { a: 1 }, f: 1, g: 1, i: "1", n: 1, b: true, t: 0 });
 // @ts-expect-error i32 columns take plain numbers, not bigints
-writer.append({ s: "x", j: "{}", f: 1, g: 1, i: 1n, n: 1n, b: true, t: 0 });
+writer.append({ s: "x", j: { a: 1 }, f: 1, g: 1, i: 1n, n: 1n, b: true, t: 0 });
 // @ts-expect-error bool columns take booleans
-writer.append({ s: "x", j: "{}", f: 1, g: 1, i: 1n, n: 1, b: 1, t: 0 });
+writer.append({ s: "x", j: { a: 1 }, f: 1, g: 1, i: 1n, n: 1, b: 1, t: 0 });
 // @ts-expect-error timestamp columns take Dates or epoch milliseconds
-writer.append({ s: "x", j: "{}", f: 1, g: 1, i: 1n, n: 1, b: true, t: "2026-01-01" });
+writer.append({ s: "x", j: { a: 1 }, f: 1, g: 1, i: 1n, n: 1, b: true, t: "2026-01-01" });
 // @ts-expect-error unknown columns are rejected
-writer.append({ s: "x", j: "{}", f: 1, g: 1, i: 1n, n: 1, b: true, t: 0, zz: 1 });
+writer.append({ s: "x", j: { a: 1 }, f: 1, g: 1, i: 1n, n: 1, b: true, t: 0, zz: 1 });
 // @ts-expect-error optional columns still reject wrong value types
-writer.append({ s: "x", j: "{}", f: 1, g: 1, i: 1n, n: 1, b: true, t: 0, opt: 2 });
+writer.append({ s: "x", j: { a: 1 }, f: 1, g: 1, i: 1n, n: 1, b: true, t: 0, opt: 2 });
 
 /*
  * Maybe-promise surface. Without a codec nothing defers, but the *type* cannot
@@ -84,7 +95,16 @@ writer.append({ s: "x", j: "{}", f: 1, g: 1, i: 1n, n: 1, b: true, t: 0, opt: 2 
  * return type every existing caller relies on.
  */
 // A writer without a codec cannot defer, and is typed accordingly.
-const stillVoid: void = writer.append({ s: "x", j: "{}", f: 1, g: 1, i: 1n, n: 1, b: true, t: 0 });
+const stillVoid: void = writer.append({
+  s: "x",
+  j: { a: 1 },
+  f: 1,
+  g: 1,
+  i: 1n,
+  n: 1,
+  b: true,
+  t: 0,
+});
 const stillBytes: Uint8Array = writer.finish();
 void [stillVoid, stillBytes];
 
@@ -98,7 +118,7 @@ const both = {
 const packing = createWriter(schema, { codec: both });
 const appended: void | Promise<void> = packing.append({
   s: "x",
-  j: "{}",
+  j: { a: 1 },
   f: 1,
   g: 1,
   i: 1n,
@@ -171,9 +191,26 @@ const notACodec = { decompress: (page: Uint8Array) => page };
 // @ts-expect-error only the codecs Parquet names can be registered
 void readParquet(new Uint8Array(), { codecs: { DEFLATE: notACodec } });
 
-// `ReadValue` carries the raw-binary member reserved for a future column type.
+// `ReadValue` carries the raw-binary member reserved for a future column type,
+// and the structures a json column parses to.
 const binary: ReadValue = new Uint8Array();
-void binary;
+const structure: ReadValue = { a: [1, null, "two"] };
+void [binary, structure];
+
+/*
+ * Column projection. It narrows what is read, never what the call returns, so
+ * both entry points keep the overload rule they already had — a projected read
+ * with no codec is still the synchronous shape.
+ */
+const projected: ParquetFile = readParquet(new Uint8Array(), { columns: ["s", "j"] });
+const projectedLazy: SyncParquetRowGroups = readRowGroups(new Uint8Array(), { columns: ["s"] });
+const projectedNames: readonly string[] = ["s"];
+void [projected, projectedLazy, readParquet(new Uint8Array(), { columns: projectedNames })];
+
+// @ts-expect-error columns is a list of column names, not one name
+void readParquet(new Uint8Array(), { columns: "s" });
+// @ts-expect-error and the names are strings
+void readRowGroups(new Uint8Array(), { columns: [1] });
 
 /**
  * The read side. `readParquet` cannot know a file's schema, so its rows are
@@ -184,7 +221,7 @@ const read = readParquet(new Uint8Array()).rows as ReadRowOf<typeof schema.defin
 
 const first = read[0];
 const asString: string = first.s;
-const asJson: string = first.j; // a json column is a string in and a string out
+const asJson: JsonValue = first.j; // a json column is the document, both ways
 const asNumber: number = first.f;
 const asSingle: number = first.g;
 const asBigint: bigint = first.i;
@@ -194,6 +231,9 @@ const asDate: Date = first.t;
 const asNullable: string | null = first.opt;
 void [asString, asJson, asNumber, asSingle, asBigint, asInt32, asBoolean, asDate, asNullable];
 
+// @ts-expect-error a json column reads back as the document, which may be anything JSON is
+const notJsonText: string = first.j;
+void notJsonText;
 // @ts-expect-error i64 reads back as a bigint, never a number
 const notANumber: number = first.i;
 // @ts-expect-error i32 reads back as a number, never a bigint
@@ -309,3 +349,43 @@ const notRawBytes: Uint8Array = logicalRow.id;
 // @ts-expect-error an optional adapter column may be null
 const notMaybe: string = logicalRow.maybe;
 void [notPrice, notRawBytes, notMaybe];
+
+/*
+ * The `json` column type. It defaults to `JsonValue` on both sides, and takes a
+ * type argument for documents with a shape — which is also the way out of
+ * `JsonValue`'s index signature, since an `interface` cannot satisfy one.
+ */
+interface Payload {
+  user: number;
+  tags: string[];
+}
+
+const documents = defineSchema({
+  loose: { type: json() },
+  shaped: { type: json<Payload>() },
+  hooked: { type: json({ reviver: jsonReviver, replacer: (_key, value) => value }) },
+});
+const documentWriter = createWriter(documents);
+documentWriter.append({
+  loose: { anything: [1, null] },
+  shaped: { user: 1, tags: ["a"] },
+  hooked: "text",
+});
+
+// @ts-expect-error a shaped json column takes its shape
+documentWriter.append({ loose: {}, shaped: { user: "one", tags: [] }, hooked: null });
+
+// Through `unknown`, because `Payload` is an interface and therefore outside
+// `ReadValue` — which is exactly what the note on `ReadValue` says: a column
+// type is free to produce something the union has no member for, and
+// `ReadRowOf` is where that type comes back.
+const documentRows = readParquet(new Uint8Array(), { types: [json()] })
+  .rows as unknown as ReadRowOf<typeof documents.definition>[];
+const asLoose: JsonValue = documentRows[0].loose;
+const asShaped: Payload = documentRows[0].shaped;
+const asTag: string = documentRows[0].shaped.tags[0];
+void [asLoose, asShaped, asTag];
+
+// @ts-expect-error a json column's document is not a string unless it holds one
+const notText: string = documentRows[0].loose;
+void notText;
