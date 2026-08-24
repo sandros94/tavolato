@@ -491,7 +491,10 @@ describe("a column chunk of more than one page", () => {
     // and nothing forbids it: each step's synchronous prologue runs before any
     // of them has finished decompressing a page, so a step sharing its cursor
     // with the others would read their pages as its own.
-    expect(await Promise.all(file)).toEqual(groups);
+    // `Promise.resolve` narrows the maybe-promise steps for the aggregator;
+    // with an asynchronous codec they are all promises at runtime anyway.
+    const steps = [...file].map((value) => Promise.resolve(value));
+    expect(await Promise.all(steps)).toEqual(groups);
 
     // Awaiting each step before pulling the next says the same thing.
     const sequential: ReadRow[][] = [];
@@ -505,7 +508,9 @@ describe("a column chunk of more than one page", () => {
     const first = file[Symbol.iterator]();
     const second = file[Symbol.iterator]();
 
-    const pending = [step(first), step(second), step(first), step(second)];
+    const pending = [step(first), step(second), step(first), step(second)].map((value) =>
+      Promise.resolve(value),
+    );
     expect(await Promise.all(pending)).toEqual([groups[0], groups[0], groups[1], groups[1]]);
   });
 });
