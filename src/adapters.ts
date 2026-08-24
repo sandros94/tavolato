@@ -51,6 +51,9 @@ const WRITABLE_ANNOTATIONS: ReadonlySet<string> = new Set<Annotation["kind"]>([
 
 const TIME_UNITS: ReadonlySet<string> = new Set<TimeUnitName>(["millis", "micros", "nanos"]);
 
+/** Digits a Parquet `DECIMAL` can carry, which is what the annotation may declare. */
+const MAX_DECIMAL_PRECISION = 38;
+
 function invalid(message: string): TavolatoError {
   return new TavolatoError(message, "ERR_SCHEMA_COLUMN_INVALID");
 }
@@ -76,9 +79,20 @@ function annotationProblem(annotation: unknown): string | undefined {
     return `annotate() returned the annotation kind ${describe(value.kind)}, which cannot be written`;
   }
   if (value.kind === "decimal") {
-    return Number.isSafeInteger(value.precision) && Number.isSafeInteger(value.scale)
+    // The same bounds `decimal()` holds itself to, and for the same reason:
+    // Parquet defines `DECIMAL` only within them, so an annotation outside is
+    // one no reader can act on. Refusing it here is the schema gate keeping its
+    // promise — a schema that cannot produce a file says so before a row is
+    // appended, rather than in somebody else's query engine.
+    const { precision, scale } = value;
+    return Number.isSafeInteger(precision) &&
+      precision >= 1 &&
+      precision <= MAX_DECIMAL_PRECISION &&
+      Number.isSafeInteger(scale) &&
+      scale >= 0 &&
+      scale <= precision
       ? undefined
-      : "annotate() returned a decimal annotation without an integer precision and scale";
+      : `annotate() returned a decimal annotation of precision ${describe(precision)} and scale ${describe(scale)}; precision must be an integer from 1 to ${MAX_DECIMAL_PRECISION} and scale an integer from 0 to the precision`;
   }
   if (value.kind === "time" || value.kind === "timestamp") {
     return TIME_UNITS.has(value.unit) && typeof value.isAdjustedToUTC === "boolean"
@@ -149,6 +163,11 @@ export function adapterProblem(spec: unknown): string | undefined {
  * The result goes in two places: a schema (`{ type: price }`), where it decides
  * how a column is written, and `ReadOptions.types`, where it claims columns it
  * recognises on the way back in. The same object is fine for both.
+ *
+ * A `bytes` or `fixed` `write()` must return a **fresh** `Uint8Array` every
+ * time. The writer holds what it is handed by reference until the row group is
+ * flushed, so a reused scratch buffer would rewrite the rows already buffered
+ * with the newest row's bytes.
  *
  * @example
  * const centi = defineColumnType({
@@ -232,9 +251,9 @@ export interface DecimalOptions {
  */
 export function decimal(options: DecimalOptions): LogicalAdapter<string, string> {
   const { precision, scale = 0 } = options;
-  if (!Number.isSafeInteger(precision) || precision < 1 || precision > 38) {
+  if (!Number.isSafeInteger(precision) || precision < 1 || precision > MAX_DECIMAL_PRECISION) {
     throw invalid(
-      `decimal precision must be an integer from 1 to 38, received ${describe(precision)}`,
+      `decimal precision must be an integer from 1 to ${MAX_DECIMAL_PRECISION}, received ${describe(precision)}`,
     );
   }
   if (!Number.isSafeInteger(scale) || scale < 0 || scale > precision) {
@@ -392,6 +411,10 @@ function assertUnit(unit: TimeUnitName, what: string): void {
  * there is no date to put it on, and every `Date` this could produce would
  * carry one that was invented here.
  *
+ * The domain is `[0, one day)` — **strictly less than one day**, as Arrow and
+ * parquet-mr read it. A full day's worth of units is not a time of day but the
+ * next midnight; DuckDB renders it as `24:00:00`, which is nobody's clock.
+ *
  * The annotation is written as a wall-clock time (`isAdjustedToUTC=false`,
  * which is what DuckDB writes for `TIME`), and read whichever way the flag
  * points: the count is the same number either way, exactly as it is for the
@@ -418,9 +441,9 @@ export function time<TUnit extends TimeUnitName>(
           annotate,
           read: (raw) => raw as number,
           write: (value) => {
-            if (!Number.isSafeInteger(value) || value < 0 || value > Number(perDay)) {
+            if (!Number.isSafeInteger(value) || value < 0 || value >= Number(perDay)) {
               reject(
-                `time(millis) expects an integer number of milliseconds since midnight, received ${describe(value)}`,
+                `time(millis) expects an integer number of milliseconds since midnight, below ${perDay}, received ${describe(value)}`,
               );
             }
             return value;
@@ -433,9 +456,9 @@ export function time<TUnit extends TimeUnitName>(
           annotate,
           read: (raw) => raw as bigint,
           write: (value) => {
-            if (typeof value !== "bigint" || value < 0n || value > perDay) {
+            if (typeof value !== "bigint" || value < 0n || value >= perDay) {
               reject(
-                `time(${unit}) expects a bigint count of ${unit} since midnight, received ${describe(value)}`,
+                `time(${unit}) expects a bigint count of ${unit} since midnight, below ${perDay}, received ${describe(value)}`,
               );
             }
             return value;
@@ -583,8 +606,10 @@ export type IntegerValue<TWidth extends IntegerWidth> = TWidth extends 64 ? bigi
  *
  * The narrow widths are a *domain*, not a layout: Parquet stores them all in
  * an `INT32`, and the annotation is what says how much of it is meant. Values
- * are range-checked on the way in, so a column annotated `INTEGER(8, true)`
- * cannot come to hold 300.
+ * are range-checked **on the way in**, so nothing written through this can put
+ * 300 in an `INTEGER(8, true)` column. Reading is another matter: a value some
+ * other writer stored outside the annotated range comes back as it is stored,
+ * because tavolato reports what a file holds rather than what it should have.
  *
  * This claims annotated columns only. An unannotated `INT32` or `INT64` is
  * already the built-in `i32` and `i64`, and those keep it.

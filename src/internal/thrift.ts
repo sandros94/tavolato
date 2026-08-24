@@ -367,6 +367,19 @@ export class CompactReader {
     this.#depth--;
   }
 
+  /**
+   * Skips `size` elements of a container the caller has opened but cannot read.
+   *
+   * An element type only arrives *with* the container header, by which point
+   * the header is gone — so a caller that finds a list of the wrong thing
+   * cannot hand it back to {@link CompactReader.skip}, which would read a
+   * second header that is not there. This consumes the elements instead, and
+   * that is what keeps the fields after the container aligned.
+   */
+  skipElements(elementType: number, size: number): void {
+    for (let index = 0; index < size; index++) this.#skipElement(elementType);
+  }
+
   /** Container elements differ from fields in one place: a `bool` costs a byte. */
   #skipElement(type: number): void {
     if (type === ThriftType.BOOLEAN_TRUE || type === ThriftType.BOOLEAN_FALSE) {

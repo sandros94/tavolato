@@ -2,8 +2,17 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { gunzipSync, zstdDecompressSync } from "node:zlib";
 import { afterAll, describe, expect, it } from "vitest";
-import { date, decimal, integer, readParquet, time, timestamp, uuid } from "../src/index.ts";
-import type { CodecName, ReaderCodec } from "../src/index.ts";
+import {
+  date,
+  decimal,
+  integer,
+  readParquet,
+  readRowGroups,
+  time,
+  timestamp,
+  uuid,
+} from "../src/index.ts";
+import type { CodecName, ReaderCodec, ReadRow } from "../src/index.ts";
 import { cleanupTempDir, duckdb, duckdbRow, sqlPath, tempDir } from "./_duckdb.ts";
 import { expectError } from "./_errors.ts";
 import { sync } from "./_sync.ts";
@@ -185,6 +194,47 @@ describe("files DuckDB compresses, read with a registered decompressor", () => {
       );
     });
   }
+
+  it("reads one row group at a time, and agrees with DuckDB group for group", () => {
+    // DuckDB's own row groups, forced small, walked one at a time through a
+    // codec hook: the boundaries are DuckDB's, and so is every value.
+    const file = "cross-lazy.parquet";
+    // DuckDB rounds a row group down to whole vectors, so 2048 is the smallest
+    // group it will actually write; 6000 rows is three of them.
+    const bytes = copyTo(
+      file,
+      `SELECT i::BIGINT AS n, 'v' || i AS s, (i + 0.5)::DOUBLE AS f
+       FROM range(6000) tbl(i)`,
+      "COMPRESSION GZIP, ROW_GROUP_SIZE 2048",
+    );
+    const path = sqlPath(join(tempDir(), file));
+    const encodings = duckdb<{ encodings: string }>(
+      `SELECT DISTINCT encodings FROM parquet_metadata(${path});`,
+    ).map((row) => row.encodings);
+    expect(encodings.some((encoding) => encoding.includes("DICTIONARY"))).toBe(false);
+
+    const groups = duckdb<{ num_rows: number }>(
+      `SELECT DISTINCT row_group_id, row_group_num_rows AS num_rows FROM parquet_metadata(${path}) ORDER BY row_group_id;`,
+    ).map((row) => row.num_rows);
+    expect(groups.length).toBeGreaterThan(1);
+
+    const lazy = readRowGroups(bytes, {
+      codecs: { GZIP: { decompress: (page) => gunzipSync(page) } },
+    });
+    expect(lazy.rowCount).toBe(6000);
+    expect(lazy.groupCount).toBe(groups.length);
+
+    const walked: ReadRow[][] = [];
+    for (const rows of lazy) walked.push(sync(rows));
+    expect(walked.map((rows) => rows.length)).toEqual(groups);
+
+    const reference = duckdb<{ n: string; s: string; f: number }>(
+      `SELECT n::VARCHAR AS n, s, f FROM read_parquet(${path}) ORDER BY n::BIGINT;`,
+    );
+    expect(walked.flat().map((row) => ({ n: String(row.n), s: row.s, f: row.f }))).toEqual(
+      reference,
+    );
+  });
 
   it("reads a compressed JSON column too", () => {
     const bytes = copyTo(

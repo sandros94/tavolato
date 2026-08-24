@@ -66,6 +66,11 @@ export function defineSchema<const TDefinition extends SchemaDefinition>(
       if (problem !== undefined) {
         throw new TavolatoError(`Column "${name}" ${problem}`, "ERR_SCHEMA_COLUMN_INVALID", name);
       }
+      // A column type is a value, not a configuration object: what a schema was
+      // validated against should still be what it is when a file is written.
+      // `defineColumnType` already froze its own; this covers one that came
+      // from somewhere else.
+      Object.freeze(column.type);
     } else if (!COLUMN_TYPES.has(column.type)) {
       throw new TavolatoError(
         `Column "${name}" has unsupported type ${JSON.stringify(column.type)}; expected one of ${[

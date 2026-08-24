@@ -1,5 +1,5 @@
 export { defineSchema } from "./schema.ts";
-export { readParquet, readSchema } from "./reader.ts";
+export { readParquet, readRowGroups, readSchema } from "./reader.ts";
 export { createWriter, ParquetWriter } from "./writer.ts";
 export type { SyncParquetWriter } from "./writer.ts";
 export {

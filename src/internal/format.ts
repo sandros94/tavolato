@@ -312,7 +312,8 @@ export function columnTypeName(type: ColumnType | AnyLogicalAdapter): string {
 /** Everything the footer needs to know about one column chunk. */
 export interface ColumnChunkMeta {
   readonly name: string;
-  readonly type: ColumnType | AnyLogicalAdapter;
+  /** Taken from the same {@link ColumnSnapshot} the schema element is written from. */
+  readonly physical: PhysicalKind;
   readonly optional: boolean;
   /** `CompressionCodec` id the page bodies were written with. */
   readonly codec: number;
@@ -504,11 +505,10 @@ const EMPTY_LOGICAL_TYPE_IDS: Readonly<
   float16: LogicalTypeId.FLOAT16,
 };
 
-function writeSchemaElement(writer: CompactWriter, column: SchemaColumnLike): void {
-  const annotation = columnAnnotation(column.type);
-  const typeLength = columnTypeLength(column.type);
+function writeSchemaElement(writer: CompactWriter, column: ColumnSnapshot): void {
+  const { annotation, typeLength } = column;
   writer.structBegin();
-  writer.fieldI32(1, physicalTypeId(columnPhysical(column.type)));
+  writer.fieldI32(1, physicalTypeId(column.physical));
   if (typeLength !== undefined) writer.fieldI32(2, typeLength);
   writer.fieldI32(3, column.optional ? FieldRepetitionType.OPTIONAL : FieldRepetitionType.REQUIRED);
   writer.fieldString(4, column.name);
@@ -524,11 +524,41 @@ function writeSchemaElement(writer: CompactWriter, column: SchemaColumnLike): vo
   writer.structEnd();
 }
 
-/** The shape `writeSchemaElement` needs; satisfied by both schema and chunk metadata. */
+/** The shape {@link snapshotColumn} takes; satisfied by a `SchemaColumn`. */
 export interface SchemaColumnLike {
   readonly name: string;
   readonly type: ColumnType | AnyLogicalAdapter;
   readonly optional: boolean;
+}
+
+/**
+ * A column as the file will state it: everything an adapter answers, read once
+ * and never asked again.
+ *
+ * `physical`, `typeLength` and `annotate()` are all live properties of a
+ * caller's object. A writer shapes its buffers from them when it is built and
+ * writes its footer from them at `finish()` — so they are read **once**, here,
+ * and both halves of the file are built from the same answers. A column type
+ * that changes its mind in between can no longer produce a footer describing
+ * pages that were never written.
+ */
+export interface ColumnSnapshot {
+  readonly name: string;
+  readonly optional: boolean;
+  readonly physical: PhysicalKind;
+  readonly typeLength: number | undefined;
+  readonly annotation: Annotation;
+}
+
+/** Takes that snapshot, once, where a write begins. */
+export function snapshotColumn(column: SchemaColumnLike): ColumnSnapshot {
+  return Object.freeze({
+    name: column.name,
+    optional: column.optional,
+    physical: columnPhysical(column.type),
+    typeLength: columnTypeLength(column.type),
+    annotation: columnAnnotation(column.type),
+  });
 }
 
 function writeColumnChunk(writer: CompactWriter, chunk: ColumnChunkMeta): void {
@@ -537,7 +567,7 @@ function writeColumnChunk(writer: CompactWriter, chunk: ColumnChunkMeta): void {
   // ColumnMetaData is written outside the footer, which is our case.
   writer.fieldI64(2, 0n);
   writer.fieldStructBegin(3); // meta_data
-  writer.fieldI32(1, physicalTypeId(columnPhysical(chunk.type)));
+  writer.fieldI32(1, physicalTypeId(chunk.physical));
   const encodings = chunk.optional ? [Encoding.RLE, Encoding.PLAIN] : [Encoding.PLAIN];
   writer.fieldListBegin(2, ThriftType.I32, encodings.length);
   for (const encoding of encodings) writer.elementI32(encoding);
@@ -568,7 +598,7 @@ function writeRowGroup(writer: CompactWriter, group: RowGroupMeta): void {
 
 /** Serializes the `FileMetaData` footer struct. */
 export function encodeFileMetadata(
-  columns: readonly SchemaColumnLike[],
+  columns: readonly ColumnSnapshot[],
   rowGroups: readonly RowGroupMeta[],
   numRows: number,
   createdBy: string,
@@ -879,14 +909,38 @@ function decodeTimeUnit(reader: CompactReader): TimeUnitName | undefined {
   return unit;
 }
 
+/*
+ * Every parameter below is `required` in `parquet.thrift`, and every one of
+ * them is claimed only when the field really is the Thrift type the format
+ * declares for it.
+ *
+ * Both halves of that matter. A field of the wrong type carries a payload of a
+ * different shape — a `bool`'s value rides in its header and costs no bytes at
+ * all, an `i32` is a varint, a `binary` is a length and then bytes — so
+ * claiming one without reading it the way it was written leaves the rest of the
+ * footer misaligned, and the failure surfaces fields later as a Thrift type
+ * that does not exist. And a required parameter that is missing is not a
+ * default: `isSigned` decides what half of an integer's range means, and a unit
+ * decides a value's order of magnitude. A member the file did not spell out is
+ * one this version cannot read, which is exactly what `unknown` says — and it
+ * is refused a layer up, where the column has a name.
+ */
+
+/** Whether a field header carries a bool, whose value *is* its Thrift type. */
+function isBoolField(type: number): boolean {
+  return type === ThriftType.BOOLEAN_TRUE || type === ThriftType.BOOLEAN_FALSE;
+}
+
 /** `TimeType` and `TimestampType` are the same two fields, in the same order. */
 function decodeTimeLike(reader: CompactReader, kind: "time" | "timestamp"): Annotation {
-  let isAdjustedToUTC = false;
+  let isAdjustedToUTC: boolean | undefined;
   let unit: TimeUnitName | undefined;
   eachField(reader, (field) => {
     switch (field.id) {
       case 1: {
-        // A bool carries its value in the field header, so there is nothing to read.
+        // A bool carries its value in the field header, so there is nothing to
+        // read — as long as the field is one.
+        if (!isBoolField(field.type)) return false;
         isAdjustedToUTC = reader.bool(field.type);
         return true;
       }
@@ -902,22 +956,24 @@ function decodeTimeLike(reader: CompactReader, kind: "time" | "timestamp"): Anno
   });
   // A resolution nobody has named yet is not a `TIME` this version understands,
   // and pretending it is milliseconds would move every value.
-  return unit === undefined
+  return unit === undefined || isAdjustedToUTC === undefined
     ? { kind: "unknown", id: kind === "time" ? LogicalTypeId.TIME : LogicalTypeId.TIMESTAMP }
     : { kind, unit, isAdjustedToUTC };
 }
 
-/** `DecimalType { 1: scale, 2: precision }` — scale first, as the format has it. */
+/** `DecimalType { 1: i32 scale, 2: i32 precision }` — scale first, as the format has it. */
 function decodeDecimalType(reader: CompactReader): Annotation {
-  let scale = 0;
-  let precision = 0;
+  let scale: number | undefined;
+  let precision: number | undefined;
   eachField(reader, (field) => {
     switch (field.id) {
       case 1: {
+        if (field.type !== ThriftType.I32) return false;
         scale = reader.i32();
         return true;
       }
       case 2: {
+        if (field.type !== ThriftType.I32) return false;
         precision = reader.i32();
         return true;
       }
@@ -926,13 +982,15 @@ function decodeDecimalType(reader: CompactReader): Annotation {
       }
     }
   });
-  return { kind: "decimal", precision, scale };
+  return scale === undefined || precision === undefined
+    ? { kind: "unknown", id: LogicalTypeId.DECIMAL }
+    : { kind: "decimal", precision, scale };
 }
 
 /** `IntType { 1: i8 bitWidth, 2: bool isSigned }`. */
 function decodeIntType(reader: CompactReader): Annotation {
   let bitWidth = 0;
-  let isSigned = false;
+  let isSigned: boolean | undefined;
   eachField(reader, (field) => {
     switch (field.id) {
       case 1: {
@@ -941,6 +999,7 @@ function decodeIntType(reader: CompactReader): Annotation {
         return true;
       }
       case 2: {
+        if (!isBoolField(field.type)) return false;
         isSigned = reader.bool(field.type);
         return true;
       }
@@ -950,7 +1009,7 @@ function decodeIntType(reader: CompactReader): Annotation {
     }
   });
   const width = INTEGER_WIDTH_ORDER.find((candidate) => candidate === bitWidth);
-  return width === undefined
+  return width === undefined || isSigned === undefined
     ? { kind: "unknown", id: LogicalTypeId.INTEGER }
     : { kind: "integer", bitWidth: width, isSigned };
 }
@@ -1021,6 +1080,20 @@ function decodeLogicalType(reader: CompactReader): Annotation {
   return annotation;
 }
 
+/*
+ * The rest of the footer is claimed under the same rule as the annotations
+ * above: a field is only read as what it is declared to be.
+ *
+ * The reason is the protocol rather than the format. A compact `i32` is a
+ * varint, a `binary` is a length and then bytes, a `struct` ends in a stop
+ * byte, a `list` opens with a header — so a field claimed and read the wrong
+ * way consumes the wrong number of bytes, and every field after it is parsed
+ * from the middle of something. That surfaces as a Thrift type that does not
+ * exist, at an offset that means nothing to anybody. Skipping the field
+ * instead leaves the stream where it belongs, and leaves the value missing —
+ * which the checks downstream already refuse, by name and with the column.
+ */
+
 function decodeSchemaElement(reader: CompactReader): SchemaElement {
   let name = "";
   let physical: number | undefined;
@@ -1034,34 +1107,42 @@ function decodeSchemaElement(reader: CompactReader): SchemaElement {
   eachField(reader, (field) => {
     switch (field.id) {
       case 1: {
+        if (field.type !== ThriftType.I32) return false;
         physical = reader.i32();
         return true;
       }
       case 2: {
+        if (field.type !== ThriftType.I32) return false;
         typeLength = reader.i32();
         return true;
       }
       case 3: {
+        if (field.type !== ThriftType.I32) return false;
         repetition = reader.i32();
         return true;
       }
       case 4: {
+        if (field.type !== ThriftType.BINARY) return false;
         name = reader.string();
         return true;
       }
       case 5: {
+        if (field.type !== ThriftType.I32) return false;
         numChildren = reader.i32();
         return true;
       }
       case 6: {
+        if (field.type !== ThriftType.I32) return false;
         convertedType = reader.i32();
         return true;
       }
       case 7: {
+        if (field.type !== ThriftType.I32) return false;
         scale = reader.i32();
         return true;
       }
       case 8: {
+        if (field.type !== ThriftType.I32) return false;
         precision = reader.i32();
         return true;
       }
@@ -1092,29 +1173,41 @@ function decodeColumnMetaData(reader: CompactReader, chunk: MutableChunk): void 
   eachField(reader, (field) => {
     switch (field.id) {
       case 1: {
+        if (field.type !== ThriftType.I32) return false;
         chunk.physical = reader.i32();
         return true;
       }
       case 3: {
-        const { size } = reader.listBegin();
+        if (field.type !== ThriftType.LIST) return false;
+        const { elementType, size } = reader.listBegin();
+        if (elementType !== ThriftType.BINARY) {
+          // The header is already read, so the elements have to be consumed
+          // either way; what they are not is a path.
+          reader.skipElements(elementType, size);
+          return true;
+        }
         const path: string[] = [];
         for (let index = 0; index < size; index++) path.push(reader.string());
         chunk.path = path;
         return true;
       }
       case 4: {
+        if (field.type !== ThriftType.I32) return false;
         chunk.codec = reader.i32();
         return true;
       }
       case 5: {
+        if (field.type !== ThriftType.I64) return false;
         chunk.numValues = toCount(reader.i64(), "A column chunk's num_values");
         return true;
       }
       case 9: {
+        if (field.type !== ThriftType.I64) return false;
         chunk.dataPageOffset = toCount(reader.i64(), "A column chunk's data_page_offset");
         return true;
       }
       case 11: {
+        if (field.type !== ThriftType.I64) return false;
         chunk.dictionaryPageOffset = toCount(
           reader.i64(),
           "A column chunk's dictionary_page_offset",
@@ -1158,11 +1251,17 @@ function decodeRowGroup(reader: CompactReader): RowGroupInfo {
   eachField(reader, (field) => {
     switch (field.id) {
       case 1: {
-        const { size } = reader.listBegin();
+        if (field.type !== ThriftType.LIST) return false;
+        const { elementType, size } = reader.listBegin();
+        if (elementType !== ThriftType.STRUCT) {
+          reader.skipElements(elementType, size);
+          return true;
+        }
         for (let index = 0; index < size; index++) columns.push(decodeColumnChunk(reader));
         return true;
       }
       case 3: {
+        if (field.type !== ThriftType.I64) return false;
         numRows = toCount(reader.i64(), "A row group's num_rows");
         return true;
       }
@@ -1185,20 +1284,32 @@ export function decodeFileMetadata(bytes: Uint8Array): FileMetadata {
   eachField(reader, (field) => {
     switch (field.id) {
       case 2: {
-        const { size } = reader.listBegin();
+        if (field.type !== ThriftType.LIST) return false;
+        const { elementType, size } = reader.listBegin();
+        if (elementType !== ThriftType.STRUCT) {
+          reader.skipElements(elementType, size);
+          return true;
+        }
         for (let index = 0; index < size; index++) schema.push(decodeSchemaElement(reader));
         return true;
       }
       case 3: {
+        if (field.type !== ThriftType.I64) return false;
         numRows = toCount(reader.i64(), "The footer's num_rows");
         return true;
       }
       case 4: {
-        const { size } = reader.listBegin();
+        if (field.type !== ThriftType.LIST) return false;
+        const { elementType, size } = reader.listBegin();
+        if (elementType !== ThriftType.STRUCT) {
+          reader.skipElements(elementType, size);
+          return true;
+        }
         for (let index = 0; index < size; index++) rowGroups.push(decodeRowGroup(reader));
         return true;
       }
       case 6: {
+        if (field.type !== ThriftType.BINARY) return false;
         createdBy = reader.string();
         return true;
       }

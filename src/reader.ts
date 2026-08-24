@@ -6,7 +6,6 @@ import {
   annotationOf,
   codecName,
   type ColumnChunkInfo,
-  columnPhysical,
   CompressionCodec,
   decodeFileMetadata,
   decodePageHeader,
@@ -40,6 +39,7 @@ import type {
   AnyLogicalAdapter,
   ColumnType,
   ParquetFile,
+  ParquetRowGroups,
   ParquetSchema,
   PhysicalKind,
   ReadOptions,
@@ -47,10 +47,45 @@ import type {
   ReadValue,
   SchemaColumn,
   SchemaDefinition,
+  SyncParquetRowGroups,
 } from "./types.ts";
 
 /** Leading magic, the footer length, and the trailing magic: the smallest envelope. */
 const MIN_FILE_BYTES = MAGIC.length * 2 + 4;
+
+/**
+ * The instant furthest from the epoch a `Date` can hold, in milliseconds.
+ * A `TIMESTAMP(MILLIS)` past it has no reading as a `Date` but an invalid one.
+ */
+const MAX_DATE_MILLIS = 8_640_000_000_000_000n;
+
+/**
+ * A column with everything the decode path needs resolved once, where the
+ * column is claimed.
+ *
+ * An adapter is a caller's object: `physical` is a property on it rather than
+ * something the file carries, and reading it again for every page would let an
+ * object that answers differently between the footer and the last row decode
+ * values as a type the pages are not. So the *file's* physical type is what is
+ * kept here — the one an adapter had to agree with to claim the column at all —
+ * and every page is read from that.
+ */
+interface ReadColumn {
+  readonly name: string;
+  readonly optional: boolean;
+  /** The column type as the schema hands it back: a built-in name, or the adapter. */
+  readonly type: ColumnType | AnyLogicalAdapter;
+  /** Byte width of a `FIXED_LEN_BYTE_ARRAY` column, as the file declares it. */
+  readonly typeLength: number | undefined;
+  /** Where the values are read from. */
+  readonly physical: PhysicalKind;
+}
+
+/** A file's schema, in both the shape callers see and the shape pages are read with. */
+interface FileSchema {
+  readonly schema: ParquetSchema;
+  readonly columns: readonly ReadColumn[];
+}
 
 function hasMagic(bytes: Uint8Array, offset: number): boolean {
   for (let index = 0; index < MAGIC.length; index++) {
@@ -170,7 +205,7 @@ function claimedBy(
 }
 
 /** Maps one leaf `SchemaElement` onto a column, or refuses it by name. */
-function columnOf(element: SchemaElement, types: readonly AnyLogicalAdapter[]): SchemaColumn {
+function columnOf(element: SchemaElement, types: readonly AnyLogicalAdapter[]): ReadColumn {
   const { name, physical } = element;
   if (physical === undefined) {
     throw malformed(`Column "${name}" declares no physical type`, name);
@@ -206,16 +241,13 @@ function columnOf(element: SchemaElement, types: readonly AnyLogicalAdapter[]): 
   const annotation = annotationOf(element);
   const adapter = claimedBy(element, kind, typeLength, annotation, types);
   if (adapter !== undefined) {
-    return Object.freeze({
-      name,
-      type: adapter,
-      optional,
-      ...(typeLength === undefined ? {} : { typeLength }),
-    });
+    return { name, type: adapter, optional, typeLength, physical: kind };
   }
 
   const builtin = builtinTypeOf(kind, annotation);
-  if (builtin !== undefined) return Object.freeze({ name, type: builtin, optional });
+  if (builtin !== undefined) {
+    return { name, type: builtin, optional, typeLength: undefined, physical: kind };
+  }
 
   // Nothing claimed it, and tavolato will not guess which JavaScript type an
   // annotation ought to become — so it says what it found, in full.
@@ -236,7 +268,7 @@ function columnOf(element: SchemaElement, types: readonly AnyLogicalAdapter[]): 
 function toSchema(
   elements: readonly SchemaElement[],
   types: readonly AnyLogicalAdapter[],
-): ParquetSchema {
+): FileSchema {
   const root = elements[0];
   if (root === undefined) throw malformed("The footer carries no schema");
   if (root.numChildren === 0) throw unsupported("a file whose schema declares no columns");
@@ -259,7 +291,8 @@ function toSchema(
     );
   }
 
-  const columns: SchemaColumn[] = [];
+  const columns: ReadColumn[] = [];
+  const declared: SchemaColumn[] = [];
   const definition: SchemaDefinition = {};
   for (const element of leaves) {
     if (element.name === "") throw malformed("A column in the schema has an empty name");
@@ -268,6 +301,7 @@ function toSchema(
     }
     const column = columnOf(element, types);
     columns.push(column);
+    declared.push(publicColumn(column));
     // An adapter column carries the adapter object itself, so the definition a
     // file yields is still valid input to `createWriter`.
     definition[element.name] = { type: column.type, optional: column.optional };
@@ -276,14 +310,26 @@ function toSchema(
   // Built directly rather than through `defineSchema` so that column order is
   // the file's order even for integer-like column names, which an object's own
   // key order would reshuffle.
-  return Object.freeze({
-    columns: Object.freeze(columns) as readonly SchemaColumn[],
+  const schema = Object.freeze({
+    columns: Object.freeze(declared) as readonly SchemaColumn[],
     definition: Object.freeze(definition),
+  });
+  return { schema, columns };
+}
+
+/** The half of a column a caller sees: the resolved physical type stays inside. */
+function publicColumn(column: ReadColumn): SchemaColumn {
+  const { name, type, optional, typeLength } = column;
+  return Object.freeze({
+    name,
+    type,
+    optional,
+    ...(typeLength === undefined ? {} : { typeLength }),
   });
 }
 
 /** Converts one decoded PLAIN value into the type the column promises. */
-function toValue(column: SchemaColumn, values: ColumnValues, index: number): ReadValue {
+function toValue(column: ReadColumn, values: ColumnValues, index: number): ReadValue {
   const { type } = column;
   if (typeof type !== "string") return adapt(column, type, values.items[index]);
   switch (values.kind) {
@@ -292,7 +338,19 @@ function toValue(column: SchemaColumn, values: ColumnValues, index: number): Rea
     }
     case "i64": {
       const value = values.items[index];
-      return type === "timestamp" ? new Date(Number(value)) : value;
+      if (type !== "timestamp") return value;
+      // A `timestamp` column is a `Date`, and a `Date` runs out before an
+      // INT64 does. Handing back an Invalid Date would be this library
+      // quietly losing a value it can see perfectly well; the count is still
+      // there for the asking, through the adapter that reads it as one.
+      if (value < -MAX_DATE_MILLIS || value > MAX_DATE_MILLIS) {
+        throw unsupported(
+          `column "${column.name}", a TIMESTAMP(MILLIS) holding ${value} milliseconds — past the range a JavaScript Date can represent`,
+          column.name,
+          `register timestamp({ unit: "millis" }) in ReadOptions.types to read the count itself`,
+        );
+      }
+      return new Date(Number(value));
     }
     default: {
       return values.items[index];
@@ -307,7 +365,7 @@ function toValue(column: SchemaColumn, values: ColumnValues, index: number): Rea
  * The value is cast on the way out: what an adapter returns is its own
  * business, and `ReadRowOf` is where its real type comes back.
  */
-function adapt(column: SchemaColumn, adapter: AnyLogicalAdapter, raw: unknown): ReadValue {
+function adapt(column: ReadColumn, adapter: AnyLogicalAdapter, raw: unknown): ReadValue {
   try {
     return adapter.read(raw) as ReadValue;
   } catch (cause) {
@@ -340,7 +398,7 @@ const passThrough: PageDecompressor = (body) => body;
  * it returns has to be exactly as long as the page header promised.
  */
 function pageDecompressor(
-  column: SchemaColumn,
+  column: ReadColumn,
   chunk: ColumnChunkInfo,
   codecs: ReadOptions["codecs"],
 ): PageDecompressor {
@@ -413,7 +471,7 @@ function pageDecompressor(
 /** Decodes a page body — levels and values — and appends every row to `out`. */
 function readPageBody(
   body: ByteReader,
-  column: SchemaColumn,
+  column: ReadColumn,
   page: PageHeaderInfo,
   out: ReadValue[],
 ): void {
@@ -439,7 +497,7 @@ function readPageBody(
 
   // Nulls take a definition level but no bytes, so the value cursor only moves
   // on the rows that are present.
-  const values = readPlain(body, columnPhysical(column.type), present, column.typeLength);
+  const values = readPlain(body, column.physical, present, column.typeLength);
   let next = 0;
   for (let index = 0; index < page.numValues; index++) {
     out.push(levels !== undefined && levels[index] === 0 ? null : toValue(column, values, next++));
@@ -462,7 +520,7 @@ function readPageBody(
  */
 function readDataPage(
   input: ByteReader,
-  column: SchemaColumn,
+  column: ReadColumn,
   out: ReadValue[],
   remaining: number,
   decompress: PageDecompressor,
@@ -496,21 +554,27 @@ function readDataPage(
   });
 }
 
-/** Reads every page of one column chunk into a column of `numRows` values. */
-function readColumnChunk(
-  input: ByteReader,
-  column: SchemaColumn,
+/**
+ * Everything about a column chunk that can be settled from the footer alone,
+ * ending in the decompressor its pages will need.
+ *
+ * Split out because it touches no page bytes: `readRowGroups` runs it over
+ * every group up front, so a file that cannot be read at all says so when it is
+ * opened rather than from whichever step first reaches the bad chunk.
+ */
+function prepareColumnChunk(
+  column: ReadColumn,
   chunk: ColumnChunkInfo,
   numRows: number,
   codecs: ReadOptions["codecs"],
-): ReadValue[] | Promise<ReadValue[]> {
+): PageDecompressor {
   if (chunk.path.length !== 1 || chunk.path[0] !== column.name) {
     throw malformed(
       `A row group holds a chunk for "${chunk.path.join(".")}" where the schema declares "${column.name}"`,
       column.name,
     );
   }
-  const expected = physicalTypeId(columnPhysical(column.type));
+  const expected = physicalTypeId(column.physical);
   if (chunk.physical !== undefined && chunk.physical !== expected) {
     throw malformed(
       `Column "${column.name}" is a ${physicalTypeName(expected)} in the schema but a ${physicalTypeName(chunk.physical)} in a row group`,
@@ -528,6 +592,18 @@ function readColumnChunk(
       column.name,
     );
   }
+  return decompress;
+}
+
+/** Reads every page of one column chunk into a column of `numRows` values. */
+function readColumnChunk(
+  input: ByteReader,
+  column: ReadColumn,
+  chunk: ColumnChunkInfo,
+  numRows: number,
+  codecs: ReadOptions["codecs"],
+): ReadValue[] | Promise<ReadValue[]> {
+  const decompress = prepareColumnChunk(column, chunk, numRows, codecs);
 
   const out: ReadValue[] = [];
   input.seek(chunk.dataPageOffset);
@@ -543,26 +619,28 @@ function readColumnChunk(
   return chain(readPages(), () => out);
 }
 
-/** Reads one row group's column chunks and appends its rows to `rows`. */
+/**
+ * Reads one row group's column chunks and appends its rows to `rows`.
+ *
+ * The one place a row group is decoded: `readParquet` runs it over every group
+ * into a single array, and `readRowGroups` runs it one group at a time into an
+ * array of its own. There is no second decoding path, and never should be.
+ */
 function readRowGroup(
   input: ByteReader,
-  schema: ParquetSchema,
+  columns: readonly ReadColumn[],
   group: RowGroupInfo,
   rows: ReadRow[],
   codecs: ReadOptions["codecs"],
 ): void | Promise<void> {
-  if (group.columns.length !== schema.columns.length) {
-    throw malformed(
-      `A row group holds ${group.columns.length} column chunks but the schema declares ${schema.columns.length} columns`,
-    );
-  }
+  assertChunkCount(columns, group);
 
   // Chunks share one cursor over the file, so they are read strictly in order.
   const values: ReadValue[][] = [];
   return chain(
-    chainEach(schema.columns.length, (index) =>
+    chainEach(columns.length, (index) =>
       chain(
-        readColumnChunk(input, schema.columns[index], group.columns[index], group.numRows, codecs),
+        readColumnChunk(input, columns[index], group.columns[index], group.numRows, codecs),
         (column) => {
           values[index] = column;
         },
@@ -571,13 +649,53 @@ function readRowGroup(
     () => {
       for (let row = 0; row < group.numRows; row++) {
         const record: ReadRow = {};
-        for (const [index, column] of schema.columns.entries()) {
+        for (const [index, column] of columns.entries()) {
           record[column.name] = values[index][row];
         }
         rows.push(record);
       }
     },
   );
+}
+
+/** A row group holds one chunk per column, and the footer has to say so twice. */
+function assertChunkCount(columns: readonly ReadColumn[], group: RowGroupInfo): void {
+  if (group.columns.length !== columns.length) {
+    throw malformed(
+      `A row group holds ${group.columns.length} column chunks but the schema declares ${columns.length} columns`,
+    );
+  }
+}
+
+/**
+ * Everything the footer says, validated: the schema, the row groups, and the
+ * counts they have to agree on. No page byte is touched here.
+ */
+interface FooterInfo extends FileSchema {
+  readonly rowGroups: readonly RowGroupInfo[];
+  readonly rowCount: number;
+}
+
+/**
+ * Reads and validates the footer — the envelope, the metadata, the schema — and
+ * nothing else. The entry point every read shares, eager or lazy.
+ */
+function readFooter(bytes: Uint8Array, options: ReadOptions | undefined): FooterInfo {
+  const metadata = decodeFileMetadata(locateFooter(bytes));
+  const { schema, columns } = toSchema(metadata.schema, registeredTypes(options));
+
+  // Cross-checked before a single page is touched: the row groups must account
+  // for exactly the rows the footer promises, so a count corrupted in one place
+  // is caught rather than acted on.
+  let declared = 0;
+  for (const group of metadata.rowGroups) declared += group.numRows;
+  if (declared !== metadata.numRows) {
+    throw malformed(
+      `The footer declares ${metadata.numRows} rows but its row groups add up to ${declared}`,
+    );
+  }
+
+  return { schema, columns, rowGroups: metadata.rowGroups, rowCount: metadata.numRows };
 }
 
 /**
@@ -612,7 +730,8 @@ function readRowGroup(
  * meant to write. Reading a small file can therefore allocate a large result.
  * That is fine for your own files; for **untrusted** input, cap the byte length
  * you accept and use {@link readSchema} plus your own row limit before
- * committing to a full read.
+ * committing to a full read. {@link readRowGroups} is the same read one row
+ * group at a time, which brings that bound down to the largest single group.
  *
  * @example
  * const { schema, rows } = readParquet(bytes);
@@ -642,29 +761,130 @@ export function readParquet(
   bytes: Uint8Array,
   options?: ReadOptions,
 ): ParquetFile | Promise<ParquetFile> {
-  const metadata = decodeFileMetadata(locateFooter(bytes));
-  const schema = toSchema(metadata.schema, registeredTypes(options));
+  const { schema, columns, rowGroups } = readFooter(bytes, options);
   const input = new ByteReader(bytes);
   const rows: ReadRow[] = [];
-
-  // Cross-checked before a single page is touched: the row groups must account
-  // for exactly the rows the footer promises, so a count corrupted in one place
-  // is caught rather than acted on.
-  let declared = 0;
-  for (const group of metadata.rowGroups) declared += group.numRows;
-  if (declared !== metadata.numRows) {
-    throw malformed(
-      `The footer declares ${metadata.numRows} rows but its row groups add up to ${declared}`,
-    );
-  }
-
   const codecs = options?.codecs;
+
+  // The eager composition of the lazy read: the same footer, the same group
+  // decode, every group's rows into one array.
   return chain(
-    chainEach(metadata.rowGroups.length, (index) =>
-      readRowGroup(input, schema, metadata.rowGroups[index], rows, codecs),
+    chainEach(rowGroups.length, (index) =>
+      readRowGroup(input, columns, rowGroups[index], rows, codecs),
     ),
     () => ({ schema, rows }),
   );
+}
+
+/**
+ * Reads a Parquet file one **row group** at a time.
+ *
+ * A Parquet file is sliced horizontally into row groups, and each one is an
+ * independently decodable segment carrying all of the columns for its slice of
+ * the rows. {@link readParquet} materializes every row of every group at once,
+ * which is `O(all declared rows)` of memory; this decodes one group per
+ * iteration step, which is `O(the rows of one group)` — DuckDB writes about
+ * 122k rows per group by default, and some writers put a single group in a
+ * file.
+ *
+ * The footer is still read up front, eagerly and in full: that is where the
+ * schema and the groups' locations live, so there is nothing to be lazy about
+ * there. Anything wrong at that level — a bad envelope, a schema outside the
+ * subset, an annotation nothing claims, a chunk that contradicts the schema, a
+ * codec nobody registered — throws from this call. Only page-level problems
+ * wait for the step that reaches them. This is lazy *decoding* over bytes you
+ * already hold, not streaming input: `bytes` is referenced for as long as the
+ * result is used.
+ *
+ * Each step yields that group's rows, under the same rule the codec hooks
+ * follow everywhere else: with no codec or a synchronous one the value is the
+ * rows array itself and the walk allocates no promises at all; an asynchronous
+ * decompressor makes *that step's* value a promise to await. One group is one
+ * maybe-promise, never a mix of the two.
+ *
+ * The state of a walk lives in its iterator, not in the object, so every
+ * `[Symbol.iterator]()` starts again at group 0 and two walks may run at once
+ * without disturbing each other. Steps are independent of one another too —
+ * each owns its cursor over the bytes — so they may be pulled without being
+ * awaited: `await Promise.all([...file])` decodes every group concurrently and
+ * is the eager read again, group by group. A step that throws or rejects has
+ * consumed its group: the next step moves on to the following one, and the walk
+ * still ends after `groupCount` steps.
+ *
+ * @example
+ * const file = readRowGroups(bytes);
+ * file.rowCount; // 250_000, from the footer
+ * for (const group of file) {
+ *   for (const row of group) count += 1; // one group in memory at a time
+ * }
+ *
+ * @example
+ * // With an asynchronous decompressor, each step is a promise:
+ * for (const group of readRowGroups(bytes, { codecs })) {
+ *   for (const row of await group) count += 1;
+ * }
+ *
+ * @throws {TavolatoError} `ERR_READ_MALFORMED`, `ERR_READ_UNSUPPORTED` or
+ * `ERR_READ_OPTION_INVALID`.
+ */
+export function readRowGroups(
+  bytes: Uint8Array,
+  options?: ReadOptions & { codecs?: undefined },
+): SyncParquetRowGroups;
+export function readRowGroups(bytes: Uint8Array, options: ReadOptions): ParquetRowGroups;
+export function readRowGroups(bytes: Uint8Array, options?: ReadOptions): ParquetRowGroups {
+  const { schema, columns, rowGroups, rowCount } = readFooter(bytes, options);
+  const codecs = options?.codecs;
+
+  // Every chunk-level check the footer can answer runs here, over every group:
+  // a file that cannot be read at all should say so when it is opened, not
+  // three steps into a walk that has already handed back rows.
+  for (const group of rowGroups) {
+    assertChunkCount(columns, group);
+    for (const [index, column] of columns.entries()) {
+      prepareColumnChunk(column, group.columns[index], group.numRows, codecs);
+    }
+  }
+
+  return Object.freeze({
+    schema,
+    rowCount,
+    groupCount: rowGroups.length,
+    [Symbol.iterator](): IterableIterator<ReadRow[] | Promise<ReadRow[]>> {
+      let next = 0;
+      const iterator: IterableIterator<ReadRow[] | Promise<ReadRow[]>> = {
+        next(): IteratorResult<ReadRow[] | Promise<ReadRow[]>> {
+          if (next >= rowGroups.length) return { done: true, value: undefined };
+          const group = rowGroups[next++];
+          // A cursor of its own, per **step** rather than per walk, and an
+          // array to go with it.
+          //
+          // A column chunk is read page by page from one position, and a codec
+          // puts an `await` between two of those reads — so a step holding a
+          // cursor anything else can move comes back to find it moved, and
+          // reads another group's pages as its own. Owning it is what makes
+          // steps that overlap safe, which is to say what makes collecting
+          // them and awaiting them together — `Promise.all([...file])` — a
+          // concurrent read rather than a corrupt one. A `ByteReader` is a
+          // view over `bytes`, so the whole guarantee costs one small object.
+          //
+          // The array is the step's for the same reason it is fresh: once it
+          // has been yielded nothing here refers to it, which is what makes
+          // the memory bound real.
+          const input = new ByteReader(bytes);
+          const rows: ReadRow[] = [];
+          return {
+            done: false,
+            value: chain(readRowGroup(input, columns, group, rows, codecs), () => rows),
+          };
+        },
+        [Symbol.iterator](): IterableIterator<ReadRow[] | Promise<ReadRow[]>> {
+          return iterator;
+        },
+      };
+      return iterator;
+    },
+  });
 }
 
 /**
@@ -680,15 +900,18 @@ export function readParquet(
  * `ERR_READ_OPTION_INVALID`.
  */
 export function readSchema(bytes: Uint8Array, options?: ReadOptions): ParquetSchema {
-  return toSchema(decodeFileMetadata(locateFooter(bytes)).schema, registeredTypes(options));
+  return toSchema(decodeFileMetadata(locateFooter(bytes)).schema, registeredTypes(options)).schema;
 }
 
 /**
- * Validates `options.types` once, before a footer is looked at.
+ * Validates `options.types` once, before a footer is looked at, and freezes
+ * each of them.
  *
  * An entry that is not a column type would otherwise surface as a `TypeError`
  * from somewhere inside a column, breaking the one promise that holds
- * everywhere else: everything this library throws is a `TavolatoError`.
+ * everywhere else: everything this library throws is a `TavolatoError`. The
+ * freeze is the cheap half of the same idea as `ReadColumn`: a column type is a
+ * value, and the read it takes part in should not depend on when it was asked.
  */
 function registeredTypes(options: ReadOptions | undefined): readonly AnyLogicalAdapter[] {
   const types = options?.types;
@@ -699,6 +922,7 @@ function registeredTypes(options: ReadOptions | undefined): readonly AnyLogicalA
   for (const [index, adapter] of types.entries()) {
     const problem = adapterProblem(adapter);
     if (problem !== undefined) throw badOption(`ReadOptions.types[${index}] ${problem}`);
+    Object.freeze(adapter);
   }
   return types;
 }

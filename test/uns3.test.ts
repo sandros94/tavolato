@@ -107,6 +107,7 @@ describe("export map", () => {
       "integer",
       "isTavolatoError",
       "readParquet",
+      "readRowGroups",
       "readSchema",
       "time",
       "timestamp",

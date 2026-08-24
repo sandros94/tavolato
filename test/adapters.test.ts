@@ -12,7 +12,13 @@ import {
   timestamp,
   uuid,
 } from "../src/index.ts";
-import type { Annotation, AnyLogicalAdapter, LogicalAdapter, ReadRow } from "../src/index.ts";
+import type {
+  Annotation,
+  AnyLogicalAdapter,
+  LogicalAdapter,
+  PhysicalKind,
+  ReadRow,
+} from "../src/index.ts";
 import { expectError } from "./_errors.ts";
 import { sync } from "./_sync.ts";
 
@@ -88,6 +94,21 @@ describe("defineColumnType", () => {
     ["an annotate() that returns nothing", { ...valid, annotate: () => undefined }],
     ["an annotation nobody can write", { ...valid, annotate: () => ({ kind: "unknown", id: 99 }) }],
     ["a decimal without parameters", { ...valid, annotate: () => ({ kind: "decimal" }) }],
+    // The same bounds `decimal()` holds itself to: an annotation outside them
+    // is one no Parquet reader can act on, and the gate is here rather than in
+    // a file somebody else has to open.
+    [
+      "a decimal of negative precision",
+      { ...valid, annotate: () => ({ kind: "decimal", precision: -3, scale: 999 }) },
+    ],
+    [
+      "a decimal past 38 digits",
+      { ...valid, annotate: () => ({ kind: "decimal", precision: 39, scale: 0 }) },
+    ],
+    [
+      "a decimal scaled past its own precision",
+      { ...valid, annotate: () => ({ kind: "decimal", precision: 4, scale: 5 }) },
+    ],
     ["a timestamp without a unit", { ...valid, annotate: () => ({ kind: "timestamp" }) }],
     [
       "an integer of no known width",
@@ -405,6 +426,62 @@ describe("a column type that misbehaves", () => {
     expectError("ERR_ROW_VALUE_INVALID", appendOne(overflowing, 2 ** 31));
     expectError("ERR_ROW_VALUE_INVALID", appendOne(overflowing, 1.5));
   });
+
+  it("writes the column it buffered, even when the adapter changes underneath", () => {
+    // The buffers are shaped when the writer is built and the footer is
+    // written at `finish()`. An adapter that answers differently in between
+    // would otherwise stamp a type the pages do not hold: a corrupt file, and
+    // not one byte of it out of place enough to say so.
+    let physical: PhysicalKind = "i32";
+    let annotation: Annotation = { kind: "date" };
+    const shifty = defineColumnType<number, number>({
+      name: "shifty",
+      get physical(): PhysicalKind {
+        return physical;
+      },
+      matches: () => false,
+      annotate: () => annotation,
+      read: (raw) => raw as number,
+      write: (value) => value,
+    });
+
+    const writer = createWriter(defineSchema({ v: { type: shifty } }));
+    writer.append({ v: 1 });
+    writer.append({ v: 2 });
+    physical = "i64";
+    annotation = { kind: "uuid" };
+    const bytes = sync(writer.finish());
+
+    // What the pages hold is an INT32 column annotated DATE, and that is what
+    // the footer has to say they are.
+    expect(readParquet(bytes, { types: [date()] }).rows).toEqual([
+      { v: new Date(86_400_000) },
+      { v: new Date(172_800_000) },
+    ]);
+  });
+
+  it("reads the column it claimed, even when the adapter changes underneath", () => {
+    // `matches()` runs while the footer is read; the pages are decoded after.
+    // An adapter that moves its physical type in between would have the reader
+    // taking eight bytes per value out of a column of four.
+    const bytes = write(integer({ bitWidth: 8 }), [1, 2, 3, 4]);
+    let physical: PhysicalKind = "i32";
+    const shifty = defineColumnType<number, number>({
+      name: "shifty",
+      get physical(): PhysicalKind {
+        return physical;
+      },
+      matches: (annotation) => {
+        physical = "i64";
+        return annotation.kind === "integer";
+      },
+      annotate: (): Annotation => ({ kind: "integer", bitWidth: 8, isSigned: true }),
+      read: (raw) => raw as number,
+      write: (value) => value,
+    });
+
+    expect(readParquet(bytes, { types: [shifty] }).rows.map((row) => row.v)).toEqual([1, 2, 3, 4]);
+  });
 });
 
 describe("date", () => {
@@ -527,22 +604,28 @@ describe("uuid", () => {
 
 describe("time and timestamp", () => {
   it("carries milliseconds as a number and the finer units as bigints", () => {
-    expect(roundtrip(time({ unit: "millis" }), [0, 45_296_789, 86_400_000])).toEqual([
-      0, 45_296_789, 86_400_000,
+    // The domain is `[0, one day)`, as Arrow and parquet-mr read it: the last
+    // count of the day is the largest there is, and a full day is tomorrow.
+    expect(roundtrip(time({ unit: "millis" }), [0, 45_296_789, 86_399_999])).toEqual([
+      0, 45_296_789, 86_399_999,
     ]);
-    expect(roundtrip(time({ unit: "micros" }), [0n, 86_400_000_000n])).toEqual([
+    expect(roundtrip(time({ unit: "micros" }), [0n, 86_399_999_999n])).toEqual([
       0n,
-      86_400_000_000n,
+      86_399_999_999n,
     ]);
-    expect(roundtrip(time({ unit: "nanos" }), [0n, 86_400_000_000_000n])).toEqual([
+    expect(roundtrip(time({ unit: "nanos" }), [0n, 86_399_999_999_999n])).toEqual([
       0n,
-      86_400_000_000_000n,
+      86_399_999_999_999n,
     ]);
   });
 
   it("refuses a count that is not a time of day", () => {
     expectError("ERR_ROW_VALUE_INVALID", appendOne(time({ unit: "millis" }), -1));
     expectError("ERR_ROW_VALUE_INVALID", appendOne(time({ unit: "millis" }), 86_400_001));
+    // A whole day is not a time of day: DuckDB renders that count as 24:00:00.
+    expectError("ERR_ROW_VALUE_INVALID", appendOne(time({ unit: "millis" }), 86_400_000));
+    expectError("ERR_ROW_VALUE_INVALID", appendOne(time({ unit: "micros" }), 86_400_000_000n));
+    expectError("ERR_ROW_VALUE_INVALID", appendOne(time({ unit: "nanos" }), 86_400_000_000_000n));
     expectError("ERR_ROW_VALUE_INVALID", appendOne(time({ unit: "millis" }), 1.5));
     expectError("ERR_ROW_VALUE_INVALID", appendOne(time({ unit: "millis" }), 1n));
     expectError("ERR_ROW_VALUE_INVALID", appendOne(time({ unit: "micros" }), -1n));

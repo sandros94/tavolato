@@ -8,11 +8,19 @@ import {
   float16,
   integer,
   readParquet,
+  readRowGroups,
   time,
   timestamp,
   uuid,
 } from "../src/index.ts";
-import type { ParquetFile, ReadRowOf, ReadValue } from "../src/index.ts";
+import type {
+  ParquetFile,
+  ParquetRowGroups,
+  ReadRow,
+  ReadRowOf,
+  ReadValue,
+  SyncParquetRowGroups,
+} from "../src/index.ts";
 
 /**
  * Compile-time contract of `Row<S>`: required columns are mandatory and
@@ -117,6 +125,43 @@ void [plain, typed, hooked];
 // @ts-expect-error with codecs registered the result may be a promise
 const notAFile: ParquetFile = readParquet(new Uint8Array(), { codecs: { GZIP: both } });
 void notAFile;
+
+/*
+ * The lazy read follows the same overload rule, one step at a time: without a
+ * codec a step is plainly the rows, with one it is a maybe-promise. The object
+ * itself is never one — the footer is read eagerly either way.
+ */
+const lazy: SyncParquetRowGroups = readRowGroups(new Uint8Array());
+const lazyTyped: SyncParquetRowGroups = readRowGroups(new Uint8Array(), { types: [uuid()] });
+const lazyHooked: ParquetRowGroups = readRowGroups(new Uint8Array(), { codecs: { GZIP: both } });
+const groupCount: number = lazy.groupCount;
+const declaredRows: number = lazy.rowCount;
+void [lazyTyped, groupCount, declaredRows];
+
+for (const group of lazy) {
+  const rows: ReadRow[] = group; // no codec: a step is the rows themselves
+  const known = rows as ReadRowOf<typeof schema.definition>[];
+  const asCount: bigint = known[0].i;
+  void [rows, asCount];
+}
+
+for (const group of lazyHooked) {
+  const rows: ReadRow[] | Promise<ReadRow[]> = group;
+  void rows;
+}
+
+for (const group of lazyHooked) {
+  // @ts-expect-error with codecs registered a step may be a promise
+  const rows: ReadRow[] = group;
+  void rows;
+}
+
+// @ts-expect-error a lazy read with codecs is not the synchronous shape
+const notSync: SyncParquetRowGroups = readRowGroups(new Uint8Array(), { codecs: { GZIP: both } });
+void notSync;
+
+// @ts-expect-error the counts the footer declared are read-only
+lazy.rowCount = 1;
 
 // @ts-expect-error a writer codec must be able to compress
 void createWriter(schema, { codec: { name: "GZIP", decompress: (page: Uint8Array) => page } });

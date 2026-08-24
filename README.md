@@ -97,6 +97,13 @@ So does an annotated one, which names the annotation with its parameters:
 // … — pass a matching type in ReadOptions.types to read it anyway
 ```
 
+One value-level refusal names the same remedy. The built-in `timestamp` column
+type is a `Date`, and a `Date` stops at ±8.64 × 10¹⁵ milliseconds while an
+`INT64` does not: a `TIMESTAMP(MILLIS)` past that is refused rather than handed
+back as an Invalid Date, and `timestamp({ unit: "millis" })` reads the count
+itself. `tavolato`'s own writer will not produce such a value in the first
+place.
+
 Some cases stay out of reach whatever you register:
 
 - **Dictionary-encoded columns.** `parquet-rs` writers — `celld`'s telemetry
@@ -177,7 +184,9 @@ types](#column-types--adapters) you declare.
 
 `timestamp` is UTC-normalised, which is what `TIMESTAMP_MILLIS` means in the
 format. Readers surface it as an instant: DuckDB, for instance, reports
-`TIMESTAMP WITH TIME ZONE`.
+`TIMESTAMP WITH TIME ZONE`. It is a `Date` on both sides, so epoch milliseconds
+past ±8.64 × 10¹⁵ — the furthest a `Date` reaches — are `ERR_ROW_VALUE_INVALID`
+rather than a value that could only ever read back as an Invalid Date.
 
 `i32` is range-checked on the way in: a non-integer, or anything outside
 −2³¹ … 2³¹−1, is `ERR_ROW_VALUE_INVALID` rather than a silently wrapped value.
@@ -282,11 +291,18 @@ exact.
   refused rather than reinterpreted. One spelling per value is what makes the
   round trip exact. The physical type follows precision, exactly as DuckDB's
   writer chooses it: `INT32` to 9 digits, `INT64` to 18, `FIXED_LEN_BYTE_ARRAY(16)`
-  to 38.
+  to 38. On the way **in** that also decides what it claims: a fixed-width
+  decimal is claimed only at exactly 16 bytes. `parquet-mr`, Arrow and Spark
+  write the _minimum_ width instead — 9 bytes for a `DECIMAL(19, 2)` — and those
+  columns stay refused even with `decimal()` registered. Write your own column
+  type for one of those files; there is no width option yet.
 - **`uuid()`** takes the canonical lowercase 8-4-4-4-12 form and only that.
   `crypto.randomUUID()` already produces it.
 - **`time()`** is a count since midnight, not a `Date`: a time of day is not an
   instant, and every `Date` this could produce would carry a date invented here.
+  The domain is `[0, one day)` — a whole day's worth of units is the next
+  midnight, not a time of day, and is refused as Arrow and `parquet-mr` refuse
+  it.
 - **`timestamp()`** is the raw count since the epoch as a `bigint`. The built-in
   `timestamp` _column type_ is milliseconds as a `Date`, which is exactly what a
   `Date` holds; microseconds and nanoseconds are not, so this hands back the
@@ -344,6 +360,11 @@ Both halves are **synchronous** — an adapter is a pure value transform, and th
 one place `tavolato` defers is the codec seam. **Nulls never reach one**: an
 `optional` column is handled by the definition-level machinery on both sides, so
 `read` and `write` only ever see values that are present.
+
+A `bytes` or `fixed` `write()` must return a **fresh** `Uint8Array` every time.
+The writer holds what you hand it by reference until the row group is flushed, so
+a reused scratch buffer would rewrite every row already buffered with the latest
+row's bytes.
 
 Your functions are held to their word the way a codec is. A `write` that throws
 becomes `ERR_ROW_VALUE_INVALID` naming the column, with the original as `cause`,
@@ -414,6 +435,81 @@ import type { ReadRowOf } from "tavolato";
 const rows = readParquet(bytes).rows as ReadRowOf<typeof schema.definition>[];
 rows[0].n; // bigint
 ```
+
+### Reading one row group at a time
+
+A Parquet file is sliced horizontally into **row groups**, and each one is an
+independently decodable segment carrying all of the columns for its slice of the
+rows. `readParquet` materializes every row of every group at once, which is the
+documented cost of being this small. `readRowGroups` is the same read, one group
+per step:
+
+```ts
+import { readRowGroups } from "tavolato";
+
+const file = readRowGroups(bytes);
+
+file.schema; // decoded from the footer, same shape readParquet returns
+file.rowCount; // total rows the footer declares
+file.groupCount; // number of row groups
+
+for (const rows of file) {
+  // One group in memory at a time — `rows` is a ReadRow[]
+  for (const row of rows) total += row.n as bigint;
+}
+```
+
+Memory drops from `O(all declared rows)` to `O(the rows of one row group)`.
+DuckDB writes about 122 000 rows per group by default, and some writers — the
+`parquet-rs` telemetry files among them — put a single group in each file, so
+what the bound is worth depends on the writer rather than on you.
+
+The **footer is still read up front**, eagerly and in full: that is where the
+schema and the groups' locations live, so there is nothing to be lazy about
+there. This is lazy _decoding_ over bytes you already hold, not streaming input —
+`bytes` stays referenced for as long as you use the result.
+
+That split is also where errors land. Anything the footer can answer on its own
+throws from the `readRowGroups` call: a bad envelope, a schema outside the
+subset, an annotation nothing claims, a chunk that contradicts the schema, a
+compression codec you have not registered. Only page-level problems wait, and
+those throw from the step whose group they are in — a file whose second group is
+corrupt still yields its first.
+
+Steps follow the same maybe-promise rule as everything else here. With no codec
+or a synchronous one, a step _is_ the rows array and the whole walk allocates no
+promises and crosses no microtask; with an asynchronous decompressor, that
+step's value is a `Promise<ReadRow[]>` to await. One group is one maybe-promise,
+never a mix:
+
+```ts
+for (const rows of readRowGroups(bytes, { codecs })) {
+  for (const row of await rows) total += row.n as bigint;
+}
+```
+
+The state of a walk lives in its iterator, not in the object, so every
+`for…of` starts again at the first group and two walks can run at once without
+disturbing each other. Steps are independent of one another as well — each owns
+its cursor over the bytes — so they may be pulled without being awaited, which
+decodes the groups **concurrently**:
+
+```ts
+const groups = await Promise.all([...readRowGroups(bytes, { codecs })]);
+```
+
+That one gives the memory bound back up, naturally: it is there for when the
+decoding, rather than the memory, is what you wanted spread out.
+
+A step that throws or rejects has consumed its group: the next step moves on to
+the following one, and the walk still ends after `groupCount` steps.
+
+`readRowGroups(bytes)` and `readRowGroups(bytes, { types })` are typed
+`SyncParquetRowGroups`, whose steps are plainly `ReadRow[]`; only the overload
+that takes `codecs` widens a step to `ReadRow[] | Promise<ReadRow[]>` — the same
+rule `readParquet` follows for its result. Both entry points share one decoding
+path, so the rows are identical: `readParquet(bytes).rows` is exactly the
+concatenation of the steps, which the test suite checks file by file.
 
 ### Compression
 
@@ -610,19 +706,24 @@ Row groups are flushed once `rowGroupSize` rows have been appended (default
 row group is also cut early if a column chunk would otherwise outgrow the
 signed 32-bit page size the format imposes (roughly 2 GiB per column chunk).
 
-The reader takes the whole file as a `Uint8Array` and returns every row: it does
-not stream, and it does not skip row groups or columns. That is the honest cost
-of being this small — see the note above about when to reach for DuckDB
-instead.
+The reader takes the whole file as a `Uint8Array`: it does not stream, and it
+does not skip columns. That is the honest cost of being this small — see the note
+above about when to reach for DuckDB instead.
 
-Its memory use is therefore `O(rows declared in the footer)`, **not**
-`O(bytes)`. Definition levels are RLE compressed, so a six byte run can
-legitimately declare millions of nulls: a tiny file can expand into a very large
-result, and nothing distinguishes such a file from a sparse one somebody meant
-to write — a byte-count guard would only break legitimate compression. For your
-own files this is a non-issue. For **untrusted** input, cap the byte length you
-are willing to accept, and use `readSchema` together with your own row limit
-before committing to a full `readParquet`.
+`readParquet` additionally returns every row at once, so its memory use is
+`O(rows declared in the footer)`, **not** `O(bytes)`. Definition levels are RLE
+compressed, so a six byte run can legitimately declare millions of nulls: a tiny
+file can expand into a very large result, and nothing distinguishes such a file
+from a sparse one somebody meant to write — a byte-count guard would only break
+legitimate compression.
+
+[`readRowGroups`](#reading-one-row-group-at-a-time) is the mitigation, and the
+one to reach for whenever the file is bigger than a mouthful: it decodes a
+single row group per step, which brings that bound down to `O(the rows of one
+row group)`. The input bytes stay in memory either way. For **untrusted** input,
+cap the byte length you are willing to accept, and use `readSchema` — or
+`readRowGroups`, whose `rowCount` and `groupCount` come off the footer — together
+with your own row limit before committing to decoding anything.
 
 ## License
 

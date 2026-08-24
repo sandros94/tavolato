@@ -209,6 +209,20 @@ describe("row validation", () => {
     expect(() => writer.append({ ...valid, n: -(2 ** 31) })).not.toThrow();
   });
 
+  it("rejects epoch millis a Date cannot hold", () => {
+    // A `timestamp` column reads back as a `Date`, and a `Date` stops at
+    // ±8.64e15 milliseconds. Accepting a count past that writes a value whose
+    // only possible reading is an Invalid Date.
+    const writer = createWriter(schema);
+    for (const t of [8_640_000_000_000_001, -8_640_000_000_000_001, 9e15]) {
+      const error = expectError("ERR_ROW_VALUE_INVALID", () => writer.append({ ...valid, t }));
+      expect(error.column).toBe("t");
+    }
+    // The extremes themselves are exactly what a Date holds, and stay legal.
+    expect(() => writer.append({ ...valid, t: 8_640_000_000_000_000 })).not.toThrow();
+    expect(() => writer.append({ ...valid, t: -8_640_000_000_000_000 })).not.toThrow();
+  });
+
   it("leaves the writer untouched when a row is rejected", () => {
     const writer = createWriter(schema);
     writer.append({ ...valid });

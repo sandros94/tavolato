@@ -5,7 +5,7 @@ import {
   CODEC_IDS,
   codecId,
   type ColumnChunkMeta,
-  columnPhysical,
+  type ColumnSnapshot,
   columnTypeName,
   CompressionCodec,
   encodeDataPageHeader,
@@ -13,6 +13,7 @@ import {
   MAGIC,
   MAX_DEFINITION_LEVEL_BIT_WIDTH,
   type RowGroupMeta,
+  snapshotColumn,
 } from "./internal/format.ts";
 import { describe, TavolatoError } from "./error.ts";
 import type {
@@ -32,6 +33,9 @@ const INT64_MIN = -(2n ** 63n);
 const INT64_MAX = 2n ** 63n - 1n;
 const INT32_MIN = -(2 ** 31);
 const INT32_MAX = 2 ** 31 - 1;
+
+/** The instant furthest from the epoch a `Date` can hold, in milliseconds. */
+const MAX_DATE_MILLIS = 8_640_000_000_000_000;
 
 /**
  * `PageHeader` stores page sizes as signed 32-bit integers, so a page body may
@@ -57,6 +61,12 @@ type StagedValue =
 
 interface ColumnState {
   readonly column: SchemaColumn;
+  /**
+   * What the file will say this column is, read off the column type once. The
+   * buffer below is shaped from it and the footer is written from it, so the
+   * two cannot come to disagree.
+   */
+  readonly snapshot: ColumnSnapshot;
   readonly values: ColumnValues;
   /** Definition levels for the current row group; unused for required columns. */
   readonly levels: number[];
@@ -66,12 +76,13 @@ interface ColumnState {
 }
 
 function createColumnState(column: SchemaColumn): ColumnState {
-  const physical = columnPhysical(column.type);
+  const snapshot = snapshotColumn(column);
+  const { physical } = snapshot;
   const values: ColumnValues =
     physical === "fixed"
-      ? { kind: physical, typeLength: column.typeLength ?? 0, items: [] }
+      ? { kind: physical, typeLength: snapshot.typeLength ?? 0, items: [] }
       : { kind: physical, items: [] };
-  return { column, values, levels: [], nullCount: 0, byteArraySize: 0 };
+  return { column, snapshot, values, levels: [], nullCount: 0, byteArraySize: 0 };
 }
 
 function resetColumnState(state: ColumnState): void {
@@ -118,6 +129,12 @@ function toEpochMillis(column: SchemaColumn, value: unknown): bigint {
   if (typeof value === "number") {
     if (!Number.isSafeInteger(value)) {
       throw invalid(column, value, "a Date or integer epoch milliseconds");
+    }
+    // A `timestamp` column is read back as a `Date`, and a `Date` runs out
+    // long before an INT64 does. A count past that boundary could only ever be
+    // read as an Invalid Date, so it is refused here rather than stored.
+    if (value < -MAX_DATE_MILLIS || value > MAX_DATE_MILLIS) {
+      throw invalid(column, value, "epoch milliseconds within the range a Date can represent");
     }
     return BigInt(value);
   }
@@ -321,7 +338,7 @@ function projectedPageSize(state: ColumnState, staged: StagedValue): number {
  * compressed and written.
  */
 interface PendingPage {
-  readonly column: SchemaColumn;
+  readonly column: ColumnSnapshot;
   readonly body: Uint8Array;
   readonly nullCount: number;
 }
@@ -606,7 +623,7 @@ export class ParquetWriter<TDefinition extends SchemaDefinition = SchemaDefiniti
   /** Writes the footer and hands over the file. */
   #complete(): Uint8Array {
     const footer = encodeFileMetadata(
-      this.schema.columns,
+      this.#states.map((state) => state.snapshot),
       this.#rowGroups,
       this.#rowCount,
       this.#createdBy,
@@ -641,7 +658,7 @@ export class ParquetWriter<TDefinition extends SchemaDefinition = SchemaDefiniti
         page.raw(levels);
       }
       writePlain(page, state.values);
-      pages.push({ column: state.column, body: page.toBytes(), nullCount: state.nullCount });
+      pages.push({ column: state.snapshot, body: page.toBytes(), nullCount: state.nullCount });
       resetColumnState(state);
     }
 
@@ -666,7 +683,7 @@ export class ParquetWriter<TDefinition extends SchemaDefinition = SchemaDefiniti
           totalCompressedSize += header.length + body.length;
           columns.push({
             name: page.column.name,
-            type: page.column.type,
+            physical: page.column.physical,
             optional: page.column.optional,
             codec: this.#codecId,
             numValues: numRows,

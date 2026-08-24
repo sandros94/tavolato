@@ -290,6 +290,44 @@ export interface ParquetFile {
   readonly rows: ReadRow[];
 }
 
+/**
+ * What `readRowGroups` returns: the footer, read eagerly, and a lazy walk over
+ * the file's row groups.
+ *
+ * The counts and the schema come from the footer and are there immediately. The
+ * rows are not: iterating decodes **one row group per step**, which is what
+ * keeps memory to the rows of a single group rather than the rows of the file.
+ *
+ * `TStep` is what a step yields — the rows array itself for a read that cannot
+ * defer, and `ReadRow[] | Promise<ReadRow[]>` where a codec can. See
+ * {@link SyncParquetRowGroups}.
+ */
+export interface ParquetRowGroups<TStep = ReadRow[] | Promise<ReadRow[]>> {
+  /** Derived from the file, in the same shape `defineSchema` produces. */
+  readonly schema: ParquetSchema;
+  /** Total rows the footer declares, across every group. */
+  readonly rowCount: number;
+  /** Number of row groups in the file. */
+  readonly groupCount: number;
+  /**
+   * Decodes one row group per step, in file order.
+   *
+   * State lives in the iterator rather than in this object, so each call starts
+   * again at the first group and two walks may run at the same time.
+   */
+  [Symbol.iterator](): IterableIterator<TStep>;
+}
+
+/**
+ * A {@link ParquetRowGroups} read without codecs, and typed for it.
+ *
+ * Only a codec can make a read defer, so a read that registers none never
+ * does — and its steps are plain rows arrays rather than maybe-promises.
+ * `readRowGroups` hands this back whenever no `codecs` option is passed, which
+ * mirrors what `readParquet` does with `ParquetFile`.
+ */
+export type SyncParquetRowGroups = ParquetRowGroups<ReadRow[]>;
+
 /*
  * ---------------------------------------------------------------------------
  * Compression

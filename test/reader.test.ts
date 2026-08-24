@@ -7,8 +7,12 @@ import {
   readParquet,
   readSchema,
   TavolatoError,
+  timestamp,
   uuid,
 } from "../src/index.ts";
+import { PhysicalType } from "../src/internal/format.ts";
+import { CompactWriter, ThriftType } from "../src/internal/thrift.ts";
+import { sealFile, startFile, writeDataPage } from "./_build.ts";
 import { expectError } from "./_errors.ts";
 import { sync } from "./_sync.ts";
 
@@ -261,6 +265,25 @@ describe("types the reader refuses outright", () => {
     );
   });
 
+  it("refuses a millisecond timestamp no Date can hold, and names the remedy", () => {
+    // Written through the adapter, which stamps exactly the annotation the
+    // built-in `timestamp` column type carries — so the count comes back to a
+    // reader that would have to hand it over as an Invalid Date.
+    const millis = timestamp({ unit: "millis" });
+    const writer = createWriter(defineSchema({ t: { type: millis } }));
+    writer.append({ t: 9_000_000_000_000_000n });
+    const bytes = sync(writer.finish());
+
+    const error = expectError("ERR_READ_UNSUPPORTED", () => readParquet(bytes));
+    expect(error.column).toBe("t");
+    expect(error.message).toContain("Date");
+    expect(error.message).toContain("9000000000000000");
+    expect(error.message).toContain("ReadOptions.types");
+
+    // The remedy works: the adapter claims the column and hands back the count.
+    expect(readParquet(bytes, { types: [millis] }).rows[0].t).toBe(9_000_000_000_000_000n);
+  });
+
   it("names a fixed-width column by the width it declares", () => {
     const writer = createWriter(defineSchema({ u: { type: uuid() } }));
     writer.append({ u: "b3f2c1a0-1111-4222-8333-444455556666" });
@@ -331,6 +354,140 @@ describe("truncation", () => {
       }
     }
     expect([...codes].sort()).toEqual(["ERR_READ_MALFORMED", "ERR_READ_UNSUPPORTED"]);
+  });
+});
+
+/**
+ * A footer whose fields are not the Thrift types `parquet.thrift` declares.
+ *
+ * Every compact type carries its payload differently — a varint, a length and
+ * then bytes, a struct that ends in a stop byte — so a field claimed without
+ * being read the way it was written leaves the rest of the footer misaligned,
+ * and the failure surfaces fields later, at an offset that means nothing to
+ * anyone. The reader claims a field only when its type is the declared one and
+ * skips it otherwise: the file is still refused, but by the check that owns the
+ * missing value, with the column named.
+ */
+describe("a footer whose fields are the wrong Thrift type", () => {
+  /**
+   * A one row `INT64` file, written field by field so that a single field can
+   * be given the wrong type. Each hook replaces exactly the field it names.
+   */
+  function handBuilt(
+    doctored: {
+      physical?: number;
+      typeLength?: (writer: CompactWriter) => void;
+      path?: (writer: CompactWriter) => void;
+      codec?: (writer: CompactWriter) => void;
+      numValues?: (writer: CompactWriter) => void;
+    } = {},
+  ): Uint8Array {
+    const out = startFile();
+    const dataPageOffset = out.length;
+    const page = writeDataPage(out, [7n]);
+
+    const writer = new CompactWriter();
+    writer.structBegin(); // FileMetaData
+    writer.fieldI32(1, 1); // version
+    writer.fieldListBegin(2, ThriftType.STRUCT, 2);
+    writer.structBegin(); // the root group
+    writer.fieldString(4, "schema");
+    writer.fieldI32(5, 1);
+    writer.structEnd();
+    writer.structBegin(); // the one leaf
+    writer.fieldI32(1, doctored.physical ?? PhysicalType.INT64);
+    doctored.typeLength?.(writer);
+    writer.fieldI32(3, 0); // REQUIRED
+    writer.fieldString(4, "n");
+    writer.structEnd();
+    writer.fieldI64(3, 1n); // num_rows
+    writer.fieldListBegin(4, ThriftType.STRUCT, 1);
+    writer.structBegin(); // the one row group
+    writer.fieldListBegin(1, ThriftType.STRUCT, 1);
+    writer.structBegin(); // the one column chunk
+    writer.fieldI64(2, 0n); // file_offset
+    writer.fieldStructBegin(3); // meta_data
+    writer.fieldI32(1, PhysicalType.INT64);
+    writer.fieldListBegin(2, ThriftType.I32, 1); // encodings
+    writer.elementI32(0); // PLAIN
+    if (doctored.path === undefined) {
+      writer.fieldListBegin(3, ThriftType.BINARY, 1); // path_in_schema
+      writer.elementString("n");
+    } else {
+      doctored.path(writer);
+    }
+    if (doctored.codec === undefined)
+      writer.fieldI32(4, 0); // UNCOMPRESSED
+    else doctored.codec(writer);
+    if (doctored.numValues === undefined) writer.fieldI64(5, 1n);
+    else doctored.numValues(writer);
+    writer.fieldI64(6, BigInt(page.uncompressedSize));
+    writer.fieldI64(7, BigInt(page.compressedSize));
+    writer.fieldI64(9, BigInt(dataPageOffset));
+    writer.structEnd();
+    writer.structEnd();
+    writer.fieldI64(2, BigInt(page.uncompressedSize)); // total_byte_size
+    writer.fieldI64(3, 1n); // num_rows
+    writer.structEnd();
+    writer.fieldString(6, "probe");
+    writer.structEnd();
+    return sealFile(out, writer.toBytes());
+  }
+
+  it("reads the undoctored file, so the shape itself is sound", () => {
+    expect(readParquet(handBuilt()).rows).toEqual([{ n: 7n }]);
+  });
+
+  it("refuses a type_length that is not an i32", () => {
+    const bytes = handBuilt({
+      physical: PhysicalType.FIXED_LEN_BYTE_ARRAY,
+      typeLength: (writer) => writer.fieldBinary(2, new Uint8Array([16])),
+    });
+    const error = expectError("ERR_READ_MALFORMED", () => readParquet(bytes));
+    expect(error.column).toBe("n");
+    expect(error.message).toContain("type_length");
+  });
+
+  it("refuses a path_in_schema that is not a list", () => {
+    const bytes = handBuilt({ path: (writer) => writer.fieldString(3, "n") });
+    const error = expectError("ERR_READ_MALFORMED", () => readParquet(bytes));
+    expect(error.column).toBe("n");
+    expect(error.message).toContain('the schema declares "n"');
+  });
+
+  it("refuses a path_in_schema that is a list of the wrong thing", () => {
+    // A list whose header is already read cannot be handed back to the
+    // skipper, so its elements are consumed here — two varints, and the
+    // fields after them still land where they should.
+    const bytes = handBuilt({
+      path: (writer) => {
+        writer.fieldListBegin(3, ThriftType.I32, 2);
+        writer.elementI32(1);
+        writer.elementI32(2);
+      },
+    });
+    const error = expectError("ERR_READ_MALFORMED", () => readParquet(bytes));
+    expect(error.column).toBe("n");
+    expect(error.message).toContain('the schema declares "n"');
+  });
+
+  it("refuses a num_values that is not an i64", () => {
+    const bytes = handBuilt({ numValues: (writer) => writer.fieldString(5, "one") });
+    const error = expectError("ERR_READ_MALFORMED", () => readParquet(bytes));
+    expect(error.column).toBe("n");
+    expect(error.message).toContain("declares 0 values");
+  });
+
+  it("does not read past a codec id that is not an i32", () => {
+    // Skipped rather than parsed, so the page — which really is uncompressed —
+    // is still there to be read, at the offset the rest of the footer gives.
+    const bytes = handBuilt({
+      codec: (writer) => {
+        writer.fieldStructBegin(4);
+        writer.structEnd();
+      },
+    });
+    expect(readParquet(bytes).rows).toEqual([{ n: 7n }]);
   });
 });
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { defineColumnType } from "../src/index.ts";
+import { defineColumnType, readParquet } from "../src/index.ts";
 import type { Annotation, LogicalAdapter } from "../src/index.ts";
 import {
   annotationName,
@@ -8,10 +8,14 @@ import {
   decodeFileMetadata,
   encodeFileMetadata,
   LogicalTypeId,
+  MAGIC,
   PhysicalType,
   type SchemaElement,
+  snapshotColumn,
+  TimeUnit,
 } from "../src/internal/format.ts";
 import { CompactWriter, ThriftType } from "../src/internal/thrift.ts";
+import { expectError } from "./_errors.ts";
 
 /**
  * The annotation model: one open shape both spellings of a Parquet annotation
@@ -42,7 +46,7 @@ function stamping(annotation: Annotation): LogicalAdapter<number, number> {
 
 /** Writes a one-column footer and reads the annotation back out of it. */
 function stamped(annotation: Annotation): Annotation {
-  const columns = [{ name: "c", type: stamping(annotation), optional: false }];
+  const columns = [snapshotColumn({ name: "c", type: stamping(annotation), optional: false })];
   const metadata = decodeFileMetadata(encodeFileMetadata(columns, [], 0, "test"));
   return annotationOf(metadata.schema[1]);
 }
@@ -156,7 +160,7 @@ describe("the annotations a column type stamps", () => {
  * None of them may throw. An annotation that cannot be read is `unknown`, and
  * `unknown` is refused one layer up, where the column has a name.
  */
-function decodedLogicalType(write: (writer: CompactWriter) => void): Annotation {
+function footerWithLogicalType(write: (writer: CompactWriter) => void): Uint8Array {
   const writer = new CompactWriter();
   writer.structBegin(); // FileMetaData
   writer.fieldI32(1, 1); // version
@@ -177,7 +181,22 @@ function decodedLogicalType(write: (writer: CompactWriter) => void): Annotation 
   writer.fieldListBegin(4, ThriftType.STRUCT, 0);
   writer.fieldString(6, "test");
   writer.structEnd();
-  return annotationOf(decodeFileMetadata(writer.toBytes()).schema[1]);
+  return writer.toBytes();
+}
+
+function decodedLogicalType(write: (writer: CompactWriter) => void): Annotation {
+  return annotationOf(decodeFileMetadata(footerWithLogicalType(write)).schema[1]);
+}
+
+/** The same footer, wrapped in the envelope that makes it a file `readParquet` takes. */
+function fileWithLogicalType(write: (writer: CompactWriter) => void): Uint8Array {
+  const footer = footerWithLogicalType(write);
+  const bytes = new Uint8Array(MAGIC.length * 2 + footer.length + 4);
+  bytes.set(MAGIC, 0);
+  bytes.set(footer, MAGIC.length);
+  new DataView(bytes.buffer).setUint32(MAGIC.length + footer.length, footer.length, true);
+  bytes.set(MAGIC, MAGIC.length + footer.length + 4);
+  return bytes;
 }
 
 describe("a LogicalType this version cannot read", () => {
@@ -250,6 +269,83 @@ describe("a LogicalType this version cannot read", () => {
         writer.fieldI32(LogicalTypeId.DECIMAL, 0);
       }),
     ).toEqual({ kind: "unknown", id: 0 });
+  });
+
+  it("refuses a bool parameter that is not a bool, rather than reading past it", () => {
+    // `IntType.isSigned` is a bool, and a bool's value rides in its own field
+    // header — so there is nothing to read *only* when the field really is
+    // one. Any other type carries a payload, and claiming the field without
+    // consuming that payload leaves the rest of the footer misaligned.
+    expect(
+      decodedLogicalType((writer) => {
+        writer.fieldStructBegin(LogicalTypeId.INTEGER);
+        writer.fieldI8(1, 32);
+        writer.fieldString(2, "nope");
+        writer.structEnd();
+      }),
+    ).toEqual({ kind: "unknown", id: LogicalTypeId.INTEGER });
+  });
+
+  it("does not read an absent isSigned as an unsigned column", () => {
+    // The empty struct's stop byte happens to realign the stream, so this one
+    // parses cleanly — into INTEGER(8, unsigned), a column the file never
+    // declared. A required parameter that is not there is not a default: the
+    // flag decides what half the value range means.
+    expect(
+      decodedLogicalType((writer) => {
+        writer.fieldStructBegin(LogicalTypeId.INTEGER);
+        writer.fieldI8(1, 8);
+        writer.fieldStructBegin(2);
+        writer.structEnd();
+        writer.structEnd();
+      }),
+    ).toEqual({ kind: "unknown", id: LogicalTypeId.INTEGER });
+  });
+
+  it("refuses a UTC flag that is not a bool", () => {
+    expect(
+      decodedLogicalType((writer) => {
+        writer.fieldStructBegin(LogicalTypeId.TIMESTAMP);
+        writer.fieldI32(1, 1);
+        writer.fieldStructBegin(2);
+        writer.fieldStructBegin(TimeUnit.MILLIS);
+        writer.structEnd();
+        writer.structEnd();
+        writer.structEnd();
+      }),
+    ).toEqual({ kind: "unknown", id: LogicalTypeId.TIMESTAMP });
+  });
+
+  it("refuses a decimal parameter that is not the Thrift type the format declares", () => {
+    // `DecimalType.scale` is an i32, which on the wire is a varint. A binary
+    // field there is a length followed by bytes: reading it as a varint takes
+    // the length for the scale and leaves the bytes to be parsed as fields.
+    expect(
+      decodedLogicalType((writer) => {
+        writer.fieldStructBegin(LogicalTypeId.DECIMAL);
+        writer.fieldString(1, "nope");
+        writer.fieldI32(2, 12);
+        writer.structEnd();
+      }),
+    ).toEqual({ kind: "unknown", id: LogicalTypeId.DECIMAL });
+  });
+
+  it("names the column rather than the offset when a parameter desyncs a footer", () => {
+    // The whole point of the guards above: a file that gets a parameter wrong
+    // is refused as an annotation nothing claims, with the column named — not
+    // as a Thrift stream that fell apart three fields later.
+    const error = expectError("ERR_READ_UNSUPPORTED", () =>
+      readParquet(
+        fileWithLogicalType((writer) => {
+          writer.fieldStructBegin(LogicalTypeId.INTEGER);
+          writer.fieldI8(1, 32);
+          writer.fieldString(2, "nope");
+          writer.structEnd();
+        }),
+      ),
+    );
+    expect(error.column).toBe("c");
+    expect(error.message).toContain("INTEGER");
   });
 });
 
