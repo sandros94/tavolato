@@ -141,6 +141,52 @@ describe("asynchronous codecs", () => {
     expect(file.rows).toEqual(rows(5).map((row) => ({ n: row.n, s: row.s ?? null })));
   });
 
+  it("closes the iterable when appendAll's deferred append rejects", async () => {
+    const boom = new Error("worker died");
+    const writer = createWriter(schema, {
+      rowGroupSize: 1,
+      codec: { name: "GZIP", compress: () => Promise.reject(boom) },
+    });
+    let closed = false;
+    function* input() {
+      try {
+        yield { n: 1n };
+        yield { n: 2n };
+      } finally {
+        closed = true;
+      }
+    }
+
+    const error = await expectRejection("ERR_WRITER_CODEC_FAILED", writer.appendAll(input()));
+    expect(error.cause).toBe(boom);
+    expect(closed).toBe(true);
+    expect(writer.rowCount).toBe(1);
+  });
+
+  it("preserves a deferred append failure when closing the iterable also throws", async () => {
+    const boom = new Error("worker died");
+    const writer = createWriter(schema, {
+      rowGroupSize: 1,
+      codec: { name: "GZIP", compress: () => Promise.reject(boom) },
+    });
+    let closed = false;
+    const input: Iterable<Row<typeof schema.definition>> = {
+      [Symbol.iterator]() {
+        return {
+          next: () => ({ done: false, value: { n: 1n } }),
+          return: () => {
+            closed = true;
+            throw new Error("close failed");
+          },
+        };
+      },
+    };
+
+    const error = await expectRejection("ERR_WRITER_CODEC_FAILED", writer.appendAll(input));
+    expect(error.cause).toBe(boom);
+    expect(closed).toBe(true);
+  });
+
   it("refuses re-entry while a row group is still being compressed", async () => {
     const writer = createWriter(schema, { codec: asyncGzip, rowGroupSize: 1 });
     const pending = writer.append({ n: 1n });

@@ -76,6 +76,184 @@ describe("lifecycle", () => {
     const writer = createWriter(schema);
     expect(writer.schema).toBe(schema);
   });
+
+  it("closes the iterable when appendAll rejects a row", () => {
+    const writer = createWriter(schema);
+    let closed = false;
+    function* rows() {
+      try {
+        yield { n: 1n };
+        yield { n: "not an integer" };
+        yield { n: 3n };
+      } finally {
+        closed = true;
+      }
+    }
+
+    expectError("ERR_ROW_VALUE_INVALID", () =>
+      // @ts-expect-error the invalid row is the failure under test
+      writer.appendAll(rows()),
+    );
+    expect(closed).toBe(true);
+    expect(writer.rowCount).toBe(1);
+  });
+
+  it("preserves the append failure when closing the iterable also throws", () => {
+    const writer = createWriter(schema);
+    const closeFailure = new Error("close failed");
+    let closed = false;
+    const rows: Iterable<{ n: bigint }> = {
+      [Symbol.iterator]() {
+        return {
+          next: () => ({ done: false, value: { n: 1n, extra: true } }),
+          return: () => {
+            closed = true;
+            throw closeFailure;
+          },
+        };
+      },
+    };
+
+    const error = expectError("ERR_ROW_UNKNOWN_COLUMN", () => writer.appendAll(rows));
+    expect(error).not.toBe(closeFailure);
+    expect(closed).toBe(true);
+  });
+
+  it("does not close the iterable when reading its next value throws", () => {
+    const writer = createWriter(schema);
+    const failure = new Error("value failed");
+    let closed = false;
+    const rows: Iterable<{ n: bigint }> = {
+      [Symbol.iterator]() {
+        return {
+          next() {
+            return {
+              done: false as const,
+              get value(): never {
+                throw failure;
+              },
+            };
+          },
+          return() {
+            closed = true;
+            return { done: true as const, value: undefined };
+          },
+        };
+      },
+    };
+
+    expect(() => writer.appendAll(rows)).toThrow(failure);
+    expect(closed).toBe(false);
+  });
+
+  it("closes the iterable when attaching to a thenable throws", async () => {
+    const writer = createWriter(schema);
+    const failure = new Error("then failed");
+    let reads = 0;
+    // eslint-disable-next-line unicorn/no-thenable -- failing attachment is the point
+    const pending = Object.defineProperty({}, "then", {
+      get() {
+        reads++;
+        if (reads === 2) throw failure;
+        return (): void => undefined;
+      },
+    }) as Promise<void>;
+    writer.append = () => pending;
+
+    let closes = 0;
+    const rows: Iterable<{ n: bigint }> = {
+      [Symbol.iterator]() {
+        return {
+          next: () => ({ done: false, value: { n: 1n } }),
+          return: () => {
+            closes++;
+            return { done: true, value: undefined };
+          },
+        };
+      },
+    };
+
+    await expect(writer.appendAll(rows)).rejects.toBe(failure);
+    expect(closes).toBe(1);
+  });
+
+  it("closes once when a synchronous thenable continuation throws", async () => {
+    const writer = createWriter(schema);
+    const append = writer.append.bind(writer);
+    let appends = 0;
+    writer.append = (row) => {
+      appends++;
+      if (appends !== 1) return append(row);
+      return {
+        // eslint-disable-next-line unicorn/no-thenable -- synchronous settlement is the point
+        then(onFulfilled: () => void) {
+          onFulfilled();
+        },
+      } as Promise<void>;
+    };
+
+    let index = 0;
+    let closes = 0;
+    const rows: Iterable<{ n: bigint }> = {
+      [Symbol.iterator]() {
+        return {
+          next: () =>
+            index++ === 0
+              ? { done: false, value: { n: 1n } }
+              : { done: false, value: { n: 2n, extra: true } },
+          return: () => {
+            closes++;
+            return { done: true, value: undefined };
+          },
+        };
+      },
+    };
+
+    await expect(writer.appendAll(rows)).rejects.toMatchObject({ code: "ERR_ROW_UNKNOWN_COLUMN" });
+    expect(closes).toBe(1);
+  });
+
+  it("does not close when a deferred continuation cannot read the next value", async () => {
+    const writer = createWriter(schema);
+    const append = writer.append.bind(writer);
+    let appends = 0;
+    writer.append = (row) => {
+      appends++;
+      if (appends !== 1) return append(row);
+      return {
+        // eslint-disable-next-line unicorn/no-thenable -- synchronous settlement is the point
+        then(onFulfilled: () => void) {
+          onFulfilled();
+        },
+      } as Promise<void>;
+    };
+
+    const failure = new Error("value failed");
+    let index = 0;
+    let closes = 0;
+    const rows: Iterable<{ n: bigint }> = {
+      [Symbol.iterator]() {
+        return {
+          next() {
+            if (index++ === 0) return { done: false as const, value: { n: 1n } };
+            return {
+              done: false as const,
+              get value(): never {
+                throw failure;
+              },
+            };
+          },
+          return() {
+            closes++;
+            return { done: true as const, value: undefined };
+          },
+        };
+      },
+    };
+
+    await expect(writer.appendAll(rows)).rejects.toBe(failure);
+    expect(closes).toBe(0);
+  });
 });
 
 describe("row groups", () => {

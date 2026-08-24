@@ -554,10 +554,27 @@ export class ParquetWriter<TDefinition extends SchemaDefinition = SchemaDefiniti
    */
   appendAll(rows: Iterable<Row<TDefinition>>): void | Promise<void> {
     const iterator = rows[Symbol.iterator]();
+    let closed = false;
+    const fail = (failure: unknown): never => {
+      if (!closed) {
+        closed = true;
+        try {
+          iterator.return?.();
+        } catch {
+          // IteratorClose preserves an existing throw completion over return()'s.
+        }
+      }
+      throw failure;
+    };
     const run = (): void | Promise<void> => {
       for (let next = iterator.next(); next.done !== true; next = iterator.next()) {
-        const pending = this.append(next.value);
-        if (isThenable(pending)) return chain(pending, run);
+        const row = next.value;
+        try {
+          const pending = this.append(row);
+          if (isThenable(pending)) return Promise.resolve(pending).then(run, fail);
+        } catch (failure) {
+          return fail(failure);
+        }
       }
     };
     return run();
