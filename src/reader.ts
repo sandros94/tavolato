@@ -514,14 +514,13 @@ function adapt(column: ReadColumn, adapter: AnyLogicalAdapter, raw: unknown): Re
 
 /**
  * Turns one page body as it sits in the file into the bytes it decodes from.
- * The identity for an uncompressed chunk, a wrapped hook for every other.
+ * A validating identity for an uncompressed chunk, a wrapped hook for every
+ * other.
  */
 type PageDecompressor = (
   body: Uint8Array,
   uncompressedSize: number,
 ) => Uint8Array | PromiseLike<Uint8Array>;
-
-const passThrough: PageDecompressor = (body) => body;
 
 /**
  * Resolves the decompressor a column chunk needs, refusing the chunk when it
@@ -537,7 +536,17 @@ function pageDecompressor(
   chunk: ColumnChunkInfo,
   codecs: ReadOptions["codecs"],
 ): PageDecompressor {
-  if (chunk.codec === CompressionCodec.UNCOMPRESSED) return passThrough;
+  if (chunk.codec === CompressionCodec.UNCOMPRESSED) {
+    return (body, uncompressedSize) => {
+      if (body.length !== uncompressedSize) {
+        throw malformed(
+          `A page of column "${column.name}" uses UNCOMPRESSED but declares ${uncompressedSize} uncompressed bytes and ${body.length} compressed bytes`,
+          column.name,
+        );
+      }
+      return body;
+    };
+  }
 
   const name = registrableCodec(chunk.codec);
   const registered = name === undefined ? undefined : codecs?.[name];

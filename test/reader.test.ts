@@ -130,6 +130,57 @@ describe("file envelope", () => {
   });
 });
 
+describe("uncompressed page sizes", () => {
+  /** Locates the fixed header prefix tavolato writes for one required i64. */
+  function pageStarts(bytes: Uint8Array): number[] {
+    const header = [0x15, 0x00, 0x15, 0x10, 0x15, 0x10, 0x2c];
+    const starts: number[] = [];
+    for (let offset = 0; offset + header.length <= bytes.length; offset++) {
+      if (header.every((byte, index) => bytes[offset + index] === byte)) starts.push(offset);
+    }
+    return starts;
+  }
+
+  /** Inflates one of an uncompressed page's two size declarations from eight to nine. */
+  function contradictPageSize(
+    bytes: Uint8Array,
+    page: number,
+    pages: number,
+    size: "uncompressed" | "compressed" = "uncompressed",
+  ): Uint8Array {
+    const starts = pageStarts(bytes);
+    expect(starts).toHaveLength(pages);
+    return patch(bytes, starts[page] + (size === "uncompressed" ? 3 : 5), 0x10, 0x12);
+  }
+
+  it("refuses a page whose two sizes contradict its UNCOMPRESSED codec", () => {
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readParquet(contradictPageSize(minimal(), 0, 1)),
+    );
+    expect(error.column).toBe("n");
+    expect(error.message).toContain("9 uncompressed bytes");
+    expect(error.message).toContain("8 compressed bytes");
+  });
+
+  it("refuses the reverse size contradiction too", () => {
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readParquet(contradictPageSize(minimal(), 0, 1, "compressed")),
+    );
+    expect(error.column).toBe("n");
+    expect(error.message).toContain("8 uncompressed bytes");
+    expect(error.message).toContain("9 compressed bytes");
+  });
+
+  it("does not inspect a contradictory page projected away", () => {
+    const writer = createWriter(defineSchema({ kept: { type: "i64" }, broken: { type: "i64" } }));
+    writer.append({ kept: 1n, broken: 2n });
+    const bytes = contradictPageSize(sync(writer.finish()), 1, 2);
+
+    expectError("ERR_READ_MALFORMED", () => readParquet(bytes));
+    expect(readParquet(bytes, { columns: ["kept"] }).rows).toEqual([{ kept: 1n }]);
+  });
+});
+
 describe("unsupported features", () => {
   /*
    * The writer's first data page header starts at byte 4 and, for a one row
