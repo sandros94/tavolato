@@ -70,7 +70,8 @@ const WRITABLE_ANNOTATIONS: ReadonlySet<string> = new Set<Annotation["kind"]>([
 
 const TIME_UNITS: ReadonlySet<string> = new Set<TimeUnitName>(["millis", "micros", "nanos"]);
 
-const MAX_ANNOTATION_INTEGER = 2 ** 31 - 1;
+/** Largest positive integer writable in a signed-i32 Parquet/Thrift field. */
+const MAX_THRIFT_I32 = 2 ** 31 - 1;
 
 function invalid(message: string): TavolatoError {
   return new TavolatoError(message, "ERR_SCHEMA_COLUMN_INVALID");
@@ -104,7 +105,7 @@ function inspectAnnotation(annotation: unknown): Annotation | string {
     return typeof precision === "number" &&
       Number.isSafeInteger(precision) &&
       precision >= 1 &&
-      precision <= MAX_ANNOTATION_INTEGER &&
+      precision <= MAX_THRIFT_I32 &&
       typeof scale === "number" &&
       Number.isSafeInteger(scale) &&
       scale >= 0 &&
@@ -171,8 +172,13 @@ export function inspectAdapter(spec: unknown): AdapterInspection | string {
   }
   const typeLength = adapter.typeLength;
   if (physical === "fixed") {
-    if (typeof typeLength !== "number" || !Number.isSafeInteger(typeLength) || typeLength < 1) {
-      return `${name} is stored as a FIXED_LEN_BYTE_ARRAY and must declare a positive integer typeLength, received ${describe(typeLength)}`;
+    if (
+      typeof typeLength !== "number" ||
+      !Number.isSafeInteger(typeLength) ||
+      typeLength < 1 ||
+      typeLength > MAX_THRIFT_I32
+    ) {
+      return `${name} is stored as a FIXED_LEN_BYTE_ARRAY and must declare a signed-i32 typeLength from 1 to ${MAX_THRIFT_I32}, received ${describe(typeLength)}`;
     }
   } else if (typeLength !== undefined) {
     return `${name} declares a typeLength but is not stored as a FIXED_LEN_BYTE_ARRAY`;
@@ -382,9 +388,9 @@ export interface DecimalOptions {
 export function decimal(options: DecimalOptions): LogicalAdapter<string, string> {
   assertOptionsObject(options, "decimal options", "ERR_SCHEMA_COLUMN_INVALID");
   const { precision, scale = 0 } = options;
-  if (!Number.isSafeInteger(precision) || precision < 1 || precision > MAX_ANNOTATION_INTEGER) {
+  if (!Number.isSafeInteger(precision) || precision < 1 || precision > MAX_THRIFT_I32) {
     throw invalid(
-      `decimal precision must be an integer from 1 to ${MAX_ANNOTATION_INTEGER}, received ${describe(precision)}`,
+      `decimal precision must be an integer from 1 to ${MAX_THRIFT_I32}, received ${describe(precision)}`,
     );
   }
   if (!Number.isSafeInteger(scale) || scale < 0 || scale > precision) {

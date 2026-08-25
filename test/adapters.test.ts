@@ -9,6 +9,7 @@ import {
   integer,
   json,
   readParquet,
+  readSchema,
   TavolatoError,
   time,
   timestamp,
@@ -110,6 +111,7 @@ function annotatedAs(
 }
 
 describe("defineColumnType", () => {
+  const MAX_TYPE_LENGTH = 0x7f_ff_ff_ff;
   const valid = {
     name: "flag",
     physical: "bool",
@@ -200,7 +202,14 @@ describe("defineColumnType", () => {
     ["a nameless type", { ...valid, name: "" }],
     ["a physical type that does not exist", { ...valid, physical: "i128" }],
     ["a fixed type with no width", { ...valid, physical: "fixed" }],
+    ["a fixed type with a zero width", { ...valid, physical: "fixed", typeLength: 0 }],
+    ["a fixed type with a negative width", { ...valid, physical: "fixed", typeLength: -1 }],
     ["a fixed type with a fractional width", { ...valid, physical: "fixed", typeLength: 1.5 }],
+    ["a fixed type with a non-number width", { ...valid, physical: "fixed", typeLength: "4" }],
+    [
+      "a fixed type wider than signed i32 metadata",
+      { ...valid, physical: "fixed", typeLength: MAX_TYPE_LENGTH + 1 },
+    ],
     ["a width on a type that is not fixed", { ...valid, typeLength: 4 }],
     ["a missing matches()", { ...valid, matches: undefined }],
     ["a missing annotate()", { ...valid, annotate: undefined }],
@@ -254,6 +263,42 @@ describe("defineColumnType", () => {
   ])("refuses %s", (_what, spec) => {
     // @ts-expect-error deliberately wrong input
     expectError("ERR_SCHEMA_COLUMN_INVALID", () => defineColumnType(spec));
+  });
+
+  it("accepts the maximum signed-i32 fixed width without allocating it or wrapping metadata", () => {
+    const widest = defineColumnType({
+      ...valid,
+      name: "widest",
+      physical: "fixed",
+      typeLength: MAX_TYPE_LENGTH,
+    });
+    const writer = createWriter(defineSchema({ v: { type: widest } }));
+    const bytes = sync(writer.finish());
+    expect(readSchema(bytes, { types: [widest] }).columns[0].typeLength).toBe(MAX_TYPE_LENGTH);
+  });
+
+  it("rejects an oversized fixed width at every structural adapter boundary", () => {
+    const tooWide = {
+      ...valid,
+      physical: "fixed",
+      typeLength: MAX_TYPE_LENGTH + 1,
+    };
+
+    expectError("ERR_SCHEMA_COLUMN_INVALID", () => defineColumnType(tooWide as never));
+    const declared = expectError("ERR_SCHEMA_COLUMN_INVALID", () =>
+      defineSchema({ v: { type: tooWide as never } }),
+    );
+    expect(declared.column).toBe("v");
+
+    const structural = expectError("ERR_SCHEMA_COLUMN_INVALID", () =>
+      createWriter({ columns: [{ name: "v", type: tooWide, optional: false }] } as never),
+    );
+    expect(structural.column).toBe("v");
+
+    const registered = expectError("ERR_READ_OPTION_INVALID", () =>
+      readSchema(new Uint8Array(), { types: [tooWide as never] }),
+    );
+    expect(registered.message).toContain("ReadOptions.types[0]");
   });
 
   it("refuses options the in-box types cannot honour", () => {
