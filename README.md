@@ -1,495 +1,347 @@
 # tavolato
 
-[![npm version](https://npmx.dev/api/registry/badge/version/tavolato?name=true)](https://npmx.dev/package/tavolato)
-[![npm downloads](https://npmx.dev/api/registry/badge/downloads/tavolato)](https://npmx.dev/package/tavolato)
-[![bundle size](https://npmx.dev/api/registry/badge/size/tavolato)](https://npmx.dev/package/tavolato)
+[![npm version](https://npmx.dev/api/registry/badge/version/tavolato?name=true)](https://npmx.dev/package/tavolato) [![npm downloads](https://npmx.dev/api/registry/badge/downloads/tavolato)](https://npmx.dev/package/tavolato) [![bundle size](https://npmx.dev/api/registry/badge/size/tavolato)](https://npmx.dev/package/tavolato)
 
-A small [Apache Parquet](https://parquet.apache.org/) writer — and a reader for the files it writes — that works anywhere. The core imports nothing at all: no `node:*`, no dependencies, so the same code runs on Node, Deno, Bun, Cloudflare Workers, Deno Deploy and browsers.
+Small Parquet for JavaScript and TypeScript. Tavolato writes flat, interoperable [Apache Parquet](https://parquet.apache.org/) files and reads the format subset it writes across Node, Deno, Bun, workers, and browsers.
 
-_Tavolato_ is Italian for wooden planking — flat boards, laid side by side. That is exactly the shape of the data it handles: named columns, no nesting.
+The core has zero runtime dependencies and no `node:*` imports. Add it when you need portable analytics files without adopting a larger data stack.
 
-- **Flat schemas** — eight built-in column types, in-box adapters for the common annotated ones (`date`, `decimal`, `uuid`, `time`, `timestamp`, `float16`, `integer`, `json`), and `defineColumnType` for the rest.
-- **Synchronous unless you make it otherwise** — `append`, `finish` and `readParquet` only return a promise when a compression hook hands them one.
-- **Bring your own codec** — no compressor is shipped; the hook takes whatever your runtime already has, on both sides.
-- **Verified against DuckDB** — every file the test suite writes is read back with the DuckDB CLI, and files DuckDB writes are fed to the reader in turn.
+- Typed schemas and rows
+- Built-in logical types plus custom adapters
+- Optional compression hooks
+- Column and row-group selection
+- Ranged object-store reads through `uns3`
+- Cross-read compatibility tests with DuckDB
 
 ## Install
 
 ```sh
-# Auto-detect package manager (npm, yarn, pnpm, deno, bun)
 npx nypm install tavolato
 ```
 
 ## Quick start
 
+<!-- automd:file src="./playgrounds/quick-start.ts" code lang="ts" name=false -->
+
 ```ts
-import { createWriter, defineSchema, readParquet } from "tavolato";
+import { createWriter, defineSchema, readParquet, type ParquetFile } from "tavolato";
 
 const schema = defineSchema({
   at: { type: "timestamp" },
   host: { type: "string", optional: true },
-  n: { type: "i64" },
+  count: { type: "i64" },
 });
 
-const writer = createWriter(schema);
-writer.append({ at: Date.now(), host: "web-1", n: 42n });
-writer.append({ at: new Date(), host: null, n: 7 });
+export function roundTripEvents(): ParquetFile {
+  const writer = createWriter(schema);
+  writer.append({ at: Date.UTC(2026, 7, 25), host: "web-1", count: 42n });
+  writer.append({ at: new Date("2026-08-25T01:00:00Z"), host: null, count: 7 });
 
-const bytes = writer.finish(); // PAR1 … pages … footer … PAR1
-const { rows } = readParquet(bytes);
-rows[0]; // { at: Date, host: "web-1", n: 42n }
+  return readParquet(writer.finish());
+}
 ```
 
-`append` validates the whole row against the schema before anything is buffered, so a rejected row leaves the writer exactly as it was. `appendAll(rows)` takes any iterable, in order, pulled lazily. `finish()` flushes the pending row group, appends the footer, and makes the writer unusable; a writer that never saw a row still produces a valid file, with the schema present and `num_rows = 0`.
+<!-- /automd -->
 
-`createWriter(schema, options)` takes three options:
+`defineSchema` validates and freezes a flat schema. `append` validates each row before buffering it, while `appendAll` consumes any iterable. `finish` flushes the final row group and returns a complete Parquet `Uint8Array`; the writer cannot be reused afterwards.
 
-| option         | default      |                                                                                                                                                                                    |
-| -------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `rowGroupSize` | `10_000`     | Rows buffered before a row group is flushed, which is also when the column buffers are released. A group is cut early if a column chunk would outgrow Parquet's ~2 GiB page limit. |
-| `createdBy`    | `"tavolato"` | The footer's `created_by` string.                                                                                                                                                  |
-| `codec`        | none         | Page compression — see [Compression](#compression).                                                                                                                                |
+Writer options:
 
-The writer also exposes `schema`, `rowCount` and `finished`.
+| Option         | Default      | Use                                    |
+| -------------- | ------------ | -------------------------------------- |
+| `rowGroupSize` | `10_000`     | Maximum buffered rows per row group    |
+| `createdBy`    | `"tavolato"` | Footer `created_by` value              |
+| `codec`        | none         | Page compressor and Parquet codec name |
 
-## Column types
+## Schemas and column types
 
-Eight built-ins, each owning a **bare** physical type — the one a file carries with no annotation at all. Where the writer accepts two inputs, the reader picks one and always picks it:
+A schema is one level of named scalar columns. Set `optional: true` to write a Parquet `OPTIONAL` column; missing, `undefined`, and `null` inputs read back as `null`.
 
-| `type`      | write                  | read back      | Parquet                            |
-| ----------- | ---------------------- | -------------- | ---------------------------------- |
-| `string`    | `string`               | `string`       | `BYTE_ARRAY` / `STRING`            |
-| `json`      | `JsonDocument`         | `JsonDocument` | `BYTE_ARRAY` / `JSON`              |
-| `f64`       | `number`               | `number`       | `DOUBLE`                           |
-| `f32`       | `number`               | `number`       | `FLOAT`                            |
-| `i64`       | `bigint`, safe integer | `bigint`       | `INT64`                            |
-| `i32`       | `number` (integer)     | `number`       | `INT32`                            |
-| `bool`      | `boolean`              | `boolean`      | `BOOLEAN`                          |
-| `timestamp` | `Date`, epoch millis   | `Date`         | `INT64` / `TIMESTAMP(UTC, MILLIS)` |
+| Type        | Accepted input               | Read value     | Parquet                            |
+| ----------- | ---------------------------- | -------------- | ---------------------------------- |
+| `string`    | `string`                     | `string`       | `BYTE_ARRAY` / `STRING`            |
+| `json`      | `JsonDocument`               | `JsonDocument` | `BYTE_ARRAY` / `JSON`              |
+| `f64`       | `number`                     | `number`       | `DOUBLE`                           |
+| `f32`       | `number`                     | `number`       | `FLOAT`                            |
+| `i64`       | `bigint` or safe integer     | `bigint`       | `INT64`                            |
+| `i32`       | 32-bit integer               | `number`       | `INT32`                            |
+| `bool`      | `boolean`                    | `boolean`      | `BOOLEAN`                          |
+| `timestamp` | `Date` or epoch milliseconds | `Date`         | `INT64` / `TIMESTAMP(MILLIS, UTC)` |
 
-`optional: true` makes a column nullable — real Parquet `OPTIONAL` repetition with definition levels, not a sentinel. `null`, `undefined` and an absent key all write a null; a null reads back as `null` with the key always present. Omitting a value for a required column throws.
+Use `Row<typeof schema.definition>` for write-side row types and `ReadRowOf<typeof schema.definition>` when the file schema is already known by your application.
 
-Three built-ins are strict on the way in, so that what you read back is what you wrote: `i32` refuses a non-integer or anything outside −2³¹ … 2³¹−1 rather than wrapping it; `timestamp` refuses epoch millis past ±8.64 × 10¹⁵, the furthest a `Date` reaches, rather than storing a value that could only read back as an Invalid Date; and `f32` rounds to single precision **once**, on write, because single precision is what the column is.
+### Logical type adapters
 
-`ColumnType` is intentionally closed: arbitrary strings are not accepted, and there is no catch-all member. Recognized types may still join the union in a minor version — as `json` joined `string` — so give any `switch` over it a `default` arm.
+Adapters preserve Parquet annotations and select their JavaScript representation. Register the same adapters in `ReadOptions.types` when reading.
 
-### Adapters
+| Factory | JavaScript representation | Parquet annotation |
+| --- | --- | --- |
+| `date({ as: "date" })` | `Date` at UTC midnight | `DATE` |
+| `date({ as: "number" })` | signed epoch-day `number` | `DATE` |
+| `decimal({ precision, scale })` | canonical decimal `string` | `DECIMAL` |
+| `uuid()` | canonical UUID `string` | `UUID` |
+| `time({ unit, isAdjustedToUTC })` | `number` for millis; otherwise `bigint` | `TIME` |
+| `timestamp({ unit, isAdjustedToUTC })` | `bigint` | `TIMESTAMP` |
+| `float16({ as: "number" })` | rounded `number` | `FLOAT16` |
+| `float16({ as: "bits" })` | exact unsigned 16-bit pattern | `FLOAT16` |
+| `integer({ bitWidth, signed })` | `number` or 64-bit `bigint` | `INTEGER` |
+| `json({ as: "value" })` | parsed JSON document | `JSON` |
+| `json({ as: "text" })` | validated, unchanged JSON text | `JSON` |
 
-Parquet stores a column twice over: a **physical type**, which says how the bytes are laid out, and an **annotation**, which says what they mean. The annotation does not determine a JavaScript type — a `DECIMAL(38, 4)` is sixteen bytes of two's complement, and a `string`, a `bigint` and somebody's arbitrary-precision object are all defensible readings. So tavolato names what it found and stops. An adapter is you answering.
-
-Each in-box factory maps by one rule: the value must survive the round trip unchanged.
-
-| factory                                                               | JavaScript     | Parquet                                           |
-| --------------------------------------------------------------------- | -------------- | ------------------------------------------------- |
-| `date()` or `date({ as: "date" })`                                    | `Date`         | `INT32` / `DATE`                                  |
-| `date({ as: "number" })`                                              | `number`       | `INT32` / `DATE`                                  |
-| `decimal({ precision, scale })`                                       | `string`       | `INT32`, `INT64` or minimal `FLBA(n)` / `DECIMAL` |
-| `uuid()`                                                              | `string`       | `FLBA(16)` / `UUID`                               |
-| `time({ unit: "millis", isAdjustedToUTC })`                           | `number`       | `INT32` / `TIME(MILLIS, …)`                       |
-| `time({ unit: "micros" \| "nanos", isAdjustedToUTC })`                | `bigint`       | `INT64` / `TIME(…, …)`                            |
-| `timestamp({ unit, isAdjustedToUTC })`                                | `bigint`       | `INT64` / `TIMESTAMP(…, …)`                       |
-| `float16()` or `float16({ as: "number" })`                            | `number`       | `FLBA(2)` / `FLOAT16`                             |
-| `float16({ as: "bits" })`                                             | `number`       | `FLBA(2)` / `FLOAT16`                             |
-| `integer({ bitWidth: 8 \| 16 \| 32, signed })`                        | `number`       | `INT32` / `INTEGER(…)`                            |
-| `integer({ bitWidth: 64, signed })`                                   | `bigint`       | `INT64` / `INTEGER(64, …)`                        |
-| `json()` or `json({ as: "value", dangerousKeys, reviver, replacer })` | `JsonDocument` | `BYTE_ARRAY` / `JSON`                             |
-| `json({ as: "text" })`                                                | `string`       | `BYTE_ARRAY` / `JSON`                             |
+<!-- automd:file src="./playgrounds/adapters.ts" code lang="ts" name=false -->
 
 ```ts
-date(); // new Date(Date.UTC(2026, 7, 24)) — exactly UTC midnight, never a truncated instant
-date({ as: "date" }); // the same mapping, with the representation explicit
-date({ as: "number" }); // 20_689 — signed days since the Unix epoch, across the full INT32 domain
-decimal({ precision: 12, scale: 2 }); // "19.99" — canonical, exactly `scale` digits, one spelling per value
-uuid(); // crypto.randomUUID() — canonical lowercase 8-4-4-4-12, and only that
-time({ unit: "millis", isAdjustedToUTC: false }); // 43_200_000 — local time since midnight
-timestamp({ unit: "micros", isAdjustedToUTC: true }); // 1_756_000_000_000_000n — an instant
-float16(); // 1.5 — rounded to half precision once, on write
-float16({ as: "bits" }); // 0x3e00 — exact unsigned binary16 encoding of 1.5
-integer({ bitWidth: 8, signed: false }); // 255 — a domain, range-checked on the way in
-json({ as: "text" }); // '{ "exact": true }\n' — validated JSON source, preserved exactly
-json<Payload>(); // your document type, with the reviver and replacer opened up
+import {
+  createWriter,
+  date,
+  decimal,
+  defineSchema,
+  readParquet,
+  uuid,
+  type ParquetFile,
+} from "tavolato";
+
+const uuidType = uuid();
+const dateType = date({ as: "date" });
+const moneyType = decimal({ precision: 12, scale: 2 });
+
+const schema = defineSchema({
+  id: { type: uuidType },
+  issued: { type: dateType },
+  total: { type: moneyType },
+});
+
+export function roundTripInvoice(id: string): ParquetFile {
+  const writer = createWriter(schema);
+  writer.append({
+    id,
+    issued: new Date("2026-08-25T00:00:00Z"),
+    total: "19.99",
+  });
+
+  return readParquet(writer.finish(), {
+    types: [uuidType, dateType, moneyType],
+  });
+}
 ```
 
-`decimal()` covers Parquet's complete positive signed-i32 precision domain. It writes the smallest canonical layout for that precision and, when registered in `ReadOptions.types`, reads the same annotation from every legal `INT32`, `INT64`, `BYTE_ARRAY` or fixed-width layout.
+<!-- /automd -->
 
-The same object serves both sides: in a schema it decides how a column is written, and in `ReadOptions.types` it claims the columns it recognises.
+`date()` defaults to `{ as: "date" }`, `float16()` to `{ as: "number" }`, and `json()` to `{ as: "value" }`. Use the explicit representation when a public API should state its output type.
 
-Parquet `DATE` reaches far beyond JavaScript's ±100,000,000-day `Date` range. The default adapter refuses those otherwise-valid values with `ERR_READ_UNSUPPORTED`; use `date({ as: "number" })` for a lossless signed day count across the complete Parquet `INT32` domain. The representation is stable per adapter—never selected from the value's magnitude.
+Value-mode JSON follows native `JSON.stringify` and `JSON.parse` semantics. Dangerous own keys (`__proto__`, `prototype`, and `constructor`) are removed by default, including after a custom reviver. Set `dangerousKeys: "preserve"` only for trusted documents. Use `JSON_NULL` for a top-level JSON literal `null`; a JavaScript `null` in an optional column remains a Parquet null.
 
-`TIME` and `TIMESTAMP` carry `unit` and `isAdjustedToUTC` as separate required Parquet parameters. Adapters match and re-emit both exactly. The built-in `timestamp` type maps only `TIMESTAMP(MILLIS, true)` to `Date`; use `timestamp({ unit: "millis", isAdjustedToUTC: false })` to preserve a local timestamp as its raw `bigint` count.
+### Custom column types
 
-`float16()` uses JavaScript numeric values and therefore canonicalizes NaN while rounding writes to binary16. Use `float16({ as: "bits" })` for the unsigned integer bit pattern from `0x0000` through `0xffff`; it preserves every binary16 encoding, including NaN payload and sign, infinities, subnormals, and both zero encodings. Both representations use Parquet's little-endian two-byte `FLOAT16` layout.
+Use `defineColumnType` for an annotated scalar representation not covered by an in-box adapter. Its synchronous `write` and `read` hooks map between your value and a supported Parquet physical value.
 
-```ts
-import { createWriter, decimal, defineSchema, readParquet, uuid } from "tavolato";
-
-const price = decimal({ precision: 12, scale: 2 });
-const schema = defineSchema({ id: { type: uuid() }, price: { type: price } });
-
-const writer = createWriter(schema);
-writer.append({ id: crypto.randomUUID(), price: "19.99" });
-
-const { rows } = readParquet(writer.finish(), { types: [uuid(), price] });
-rows[0].price; // "19.99" — the string you wrote, exactly
-```
-
-Two rules decide who claims what, and they do not overlap. **Built-in types own the bare physical types**: an unannotated `INT64` is `i64` whatever you register, and no in-box adapter claims an unannotated column. **Adapters own the annotations**, and are consulted first — so `integer({ bitWidth: 32 })` takes an `INTEGER(32, signed)` column that `i32` would otherwise have read. `types` is tried **in order**, so put the more specific one first. A claimed column carries the adapter object itself as its `type` in the schema the reader returns, which keeps `readParquet(bytes).schema` valid `createWriter` input.
-
-### Writing your own
-
-`defineColumnType` validates the spec — a physical kind that exists (`bool`, `i32`, `i64`, `f32`, `f64`, `bytes`, `fixed`), a `typeLength` exactly where `fixed` needs one, callable hooks, an annotation that can actually be written — and freezes it:
+<!-- automd:file src="./playgrounds/custom-column.ts" code lang="ts" name=false -->
 
 ```ts
-import { defineColumnType } from "tavolato";
+import { createWriter, defineColumnType, defineSchema, readParquet } from "tavolato";
 
-const centi = defineColumnType({
-  name: "centi", // used in errors and wherever a schema is displayed
+const cents = defineColumnType<number, number>({
+  name: "cents",
   physical: "i64",
   matches: (annotation) =>
     annotation.kind === "decimal" && annotation.precision === 18 && annotation.scale === 2,
   annotate: () => ({ kind: "decimal", precision: 18, scale: 2 }),
   read: (raw) => Number(raw as bigint) / 100,
-  write: (value: number) => BigInt(Math.round(value * 100)),
+  write: (value) => BigInt(Math.round(value * 100)),
 });
+
+const schema = defineSchema({ amount: { type: cents } });
+
+export function roundTripAmount(amount: number): number {
+  const writer = createWriter(schema);
+  writer.append({ amount });
+
+  const { rows } = readParquet(writer.finish(), { types: [cents] });
+  return rows[0].amount as number;
+}
 ```
 
-`physical` and `typeLength` are the layout an adapter writes, and that exact layout is always accepted. Define `acceptsPhysical(physical, typeLength)` only to add other layouts that the same logical representation safely decodes; it and `matches()` must return booleans, and `matches()` decides whether the annotation belongs to the adapter.
+<!-- /automd -->
 
-Both halves are **synchronous** — an adapter is a pure value transform, and the one place tavolato defers is the codec seam. **Nulls never reach one**: an `optional` column is handled by the definition-level machinery on both sides. A `bytes` or `fixed` `write()` must return a **fresh** `Uint8Array` every time, since the writer holds what you hand it by reference until the row group is flushed.
-
-Your functions are held to their word. A `write` that throws, or that hands back something other than the physical value it promised, is `ERR_ROW_VALUE_INVALID` naming the column; a `read` that throws is `ERR_READ_MALFORMED`; `matches()` or `acceptsPhysical()` throwing or returning a non-boolean is your option misbehaving rather than the file, and says so with `ERR_READ_OPTION_INVALID`.
-
-This is also the way to read a column the built-ins have no reading for at all — an unannotated `BYTE_ARRAY` or `FIXED_LEN_BYTE_ARRAY`. tavolato will not hand you raw bytes and call it a value; declare what those bytes are, and it will.
-
-## json documents
-
-A flat schema has no room for something semi-structured. `json` is the way out: one column, one document per row, annotated so the engine reading it knows what the bytes are.
-
-```ts
-const schema = defineSchema({ at: { type: "timestamp" }, payload: { type: "json" } });
-writer.append({ at: Date.now(), payload: { user: 1, tags: ["a"] } });
-// reads back as { user: 1, tags: ["a"] }
-```
-
-The built-in `json` type and `json()` use the **document value** in and out: `JSON.stringify` on write, `JSON.parse` on read. The round-trip semantics are therefore **JSON's, not tavolato's** — `NaN` and infinities become JSON nulls, an `undefined` property vanishes, a `Date` becomes its ISO string, a `Map` becomes `{}`, and `toJSON()` is honoured. A `bigint` or a value that serializes to nothing is a typed error.
-
-At the document boundary, `null` already means a Parquet/SQL null. Use the exported singleton `JSON_NULL` for the distinct JSON document literal `null`; it writes the bytes `null` and reads back by identity. Nested ordinary nulls stay ordinary nulls. A nested `JSON_NULL` that reaches serialization is rejected, but normal JSON semantics still apply: a `replacer` or `toJSON()` may remove its containing subtree before it is visited. This keeps SQL engines able to distinguish `doc IS NULL` from `json_type(doc) = 'NULL'`.
-
-```ts
-import { JSON_NULL } from "tavolato";
-
-writer.append({ payload: null }); // Parquet/SQL null; optional column only
-writer.append({ payload: JSON_NULL }); // present JSON document: null
-writer.append({ payload: { nested: null } }); // ordinary nested JSON null
-```
-
-`json({ as: "text" })` instead accepts and returns a complete JSON source string. It validates syntax and UTF-8 on both sides while preserving valid text exactly, including whitespace, key order, and `"null"`; it never parses and re-stringifies. Because no value is materialized, text mode refuses `dangerousKeys`, `reviver` and `replacer` options.
-
-Value mode drops dangerous own keys named `__proto__`, `prototype` or `constructor` by default. Without a custom reviver, native JSON objects receive the strong guarantee that these keys are absent. Sanitization runs after a custom reviver and covers its reflectively exposed graph plus the three direct keys on every visited object. It preserves identity, prototypes, cycles, safe accessors without invoking getters, and exotic values only when their dangerous own keys are removable. Otherwise reading fails with `ERR_READ_MALFORMED`; `dangerousKeys: "preserve"` is the explicit remedy when retaining every key is safe.
-
-A custom reviver is caller-supplied executable code and therefore a trust boundary: adversarial proxy traps, prototypes, accessors, exotic internals such as `Map` entries, and later mutation remain its responsibility. This policy is different from a **column** named `__proto__`, which round-trips faithfully. Opt out of sanitization only for a trusted consumer that needs the exact parsed keys:
-
-```ts
-import { json } from "tavolato";
-
-const trusted = json({ dangerousKeys: "preserve" });
-```
-
-`jsonReviver` remains exported as an idempotent sanitizer for direct `JSON.parse` use. A custom reviver can focus on its own transformation:
-
-```ts
-import { json } from "tavolato";
-
-const ISO = /^\d{4}-\d{2}-\d{2}T/;
-
-const dated = json({
-  reviver: (_key, value) =>
-    typeof value === "string" && ISO.test(value) ? new Date(value) : value,
-});
-```
-
-What the annotation buys is the other side. DuckDB reads the column as native `JSON`, so its operators just work — though it is still a flat column, so a query engine cannot prune on what is inside it. Promote a field to its own column when you want to filter on it.
-
-```sql
-SELECT payload->>'$.user' AS user, count(*) FROM read_parquet('events/*.parquet') GROUP BY user;
-```
+Register custom adapters in `ReadOptions.types`, most-specific first. An adapter only receives non-null values. A `bytes` or `fixed` writer must return a fresh `Uint8Array` for every value.
 
 ## Compression
 
-A Parquet v1 data page is compressed as **one opaque body** — the RLE definition levels live inside it — so a codec is nothing but a byte transform. tavolato ships no compressor and never will; it ships the hook, and you fill it with what your runtime already has. One object can serve both sides:
+Tavolato ships no compressor. Pass a codec supplied by the runtime or your own library, then register its decompressor when reading.
+
+<!-- automd:file src="./playgrounds/compression.ts" code lang="ts" name=false -->
 
 ```ts
-import { gunzipSync, gzipSync } from "node:zlib";
+import { gzipSync, gunzipSync } from "node:zlib";
+import {
+  createWriter,
+  defineSchema,
+  readParquet,
+  type ReaderCodec,
+  type WriterCodec,
+} from "tavolato";
 
-const GZIP = {
+const gzip = {
   name: "GZIP",
-  compress: gzipSync,
+  compress: (page: Uint8Array) => gzipSync(page),
   decompress: (page: Uint8Array) => gunzipSync(page),
-} as const; // `as const` so `name` stays the literal "GZIP", not `string`
+} satisfies WriterCodec & ReaderCodec;
 
-const writer = createWriter(schema, { codec: GZIP });
-writer.append({ at: Date.now(), n: 1n });
-const bytes = await writer.finish();
+const schema = defineSchema({ message: { type: "string" } });
 
-const { rows } = await readParquet(bytes, { codecs: { GZIP } });
+export async function roundTripCompressed(): Promise<string> {
+  const writer = createWriter(schema, { codec: gzip });
+  await writer.append({ message: "compressed" });
+
+  const bytes = await writer.finish();
+  const { rows } = await readParquet(bytes, { codecs: { GZIP: gzip } });
+  return rows[0].message as string;
+}
 ```
 
-`compress` and `decompress` may each be synchronous or asynchronous, and tavolato is exactly as asynchronous as they are — no more. With **no codec**, or a **synchronous** one, nothing defers at runtime: `append` and `finish` return outright, and so does `readParquet`. With an **asynchronous** one, `append` returns a promise when appending that row closed a row group, `finish` when the final group is still being compressed, and `readParquet` when a page has to be inflated; **await it before touching the writer again**, or the next call throws `ERR_WRITER_BUSY` rather than interleaving two row groups into the same offsets.
+<!-- /automd -->
 
-The **types** are drawn one step wider, which is why the example above awaits: `createWriter(schema)` without a `codec` hands back a `SyncParquetWriter`, and `readParquet(bytes)` — with no options, or with `types` alone, since a column type cannot defer — is plainly a `ParquetFile`. The moment `codec` or `codecs` is passed the result widens to a maybe-promise, whichever half of it your codec turns out to be. Awaiting a value that is already there costs a microtask and nothing else.
+Supported Parquet codec names are `GZIP`, `ZSTD`, `SNAPPY`, `BROTLI`, `LZO`, `LZ4_RAW`, and legacy `LZ4`. GZIP uses an RFC 1952 member, ZSTD an RFC 8878 frame, SNAPPY a raw block, and `LZ4_RAW` a raw LZ4 block.
 
-### One line per runtime
-
-|                   | compress                               | decompress                                                                                     |
-| ----------------- | -------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| Node ≥ 23.8       | `zstdCompressSync` from `node:zlib`    | `zstdDecompressSync`                                                                           |
-| Node (any)        | `gzipSync` from `node:zlib`            | `gunzipSync`                                                                                   |
-| Bun               | `Bun.zstdCompressSync`, `Bun.gzipSync` | `Bun.zstdDecompressSync`, `Bun.gunzipSync`                                                     |
-| Deno              | same as Node, via `node:zlib`          | same                                                                                           |
-| Workers, browsers | a userland sync library                | [`fflate`](https://github.com/101arrowz/fflate), [`fzstd`](https://github.com/101arrowz/fzstd) |
-
-Workers and browsers do have `DecompressionStream`, and it is usable here since the hooks accept promises — but it is asynchronous and it only knows `gzip`, `deflate` and `deflate-raw`, none of which is `ZSTD` or `SNAPPY`. For anything it does not cover, reach for a userland synchronous decoder, or a wasm one you initialise once up front and then call synchronously.
-
-`decompress` is called as `decompress(page, uncompressedSize)`. That second argument is deliberate — a decoder that wants to preallocate its output buffer needs it — and it is why `node:zlib`'s functions are wrapped rather than passed by reference: their own second parameter is an options object, and a number does not belong in it.
-
-### Which container
-
-The page body is the codec's own standard container, not a bare stream. tavolato stamps whichever `name` you give it and never inspects the bytes, so picking the wrong one produces a file other readers will reject.
-
-| `name`    | body is                                                     |
-| --------- | ----------------------------------------------------------- |
-| `GZIP`    | an RFC 1952 member — use `gunzip`, **not** a raw `inflate`  |
-| `ZSTD`    | an RFC 8878 frame                                           |
-| `SNAPPY`  | the **raw block** format, not the framed one                |
-| `LZ4_RAW` | a raw LZ4 block — the modern id, and the one to write       |
-| `LZ4`     | the older, ambiguous Hadoop framing that `LZ4_RAW` replaced |
-| `BROTLI`  | a Brotli stream                                             |
-| `LZO`     | LZO1X                                                       |
+Codec hooks may return a value or promise. Without codecs, writing and local reading are synchronous. With codecs, await `append`, `appendAll`, `finish`, and read results before continuing.
 
 ## Reading
 
-```ts
-import { readParquet } from "tavolato";
+| API                              | Result                                      |
+| -------------------------------- | ------------------------------------------- |
+| `readParquet(bytes, options?)`   | Schema and all selected rows                |
+| `readSchema(bytes, options?)`    | Footer schema without decoding pages        |
+| `readRowGroups(bytes, options?)` | Schema/counts plus lazy row-group iteration |
 
-const { schema, rows } = readParquet(bytes);
+`ReadOptions.columns` projects named columns in file order. Unselected chunks are not decoded or decompressed. Unknown, repeated, or empty selections throw `ERR_READ_OPTION_INVALID`.
 
-schema.columns; // [{ name: "at", type: "timestamp", optional: false }, …]
-rows; // [{ at: Date, host: null, n: 42n }, …]
-```
+Use `readRowGroups` when decoded rows should be limited to one row group at a time:
 
-`schema` is derived from the file and has the shape `defineSchema` produces, so it can be handed straight to `createWriter` to make another file with the same columns. `rows` holds every row, in row group order and, within a group, in file order.
-
-Rows are typed loosely, since a file's schema is only known at runtime. When you do know it, `ReadRowOf` is the read-side twin of the writer's row type:
-
-```ts
-import type { ReadRowOf } from "tavolato";
-
-const rows = readParquet(bytes).rows as ReadRowOf<typeof schema.definition>[];
-rows[0].n; // bigint
-```
-
-### Reading some of the columns
-
-`ReadOptions.columns` narrows a read to a projection. A column chunk is independently seekable, so the columns left out are not decoded, not decompressed, and not even resolved:
+<!-- automd:file src="./playgrounds/row-groups.ts" code lang="ts" name=false -->
 
 ```ts
-const { schema, rows } = readParquet(bytes, { columns: ["at", "n"] });
-```
+import { createWriter, defineSchema, readRowGroups } from "tavolato";
 
-Rows and the returned `schema` carry only those columns, in the **file's** order rather than the order asked for. Because an unselected column is never resolved, a projection **lifts that column's refusals**: a file with an `INT96`, a dictionary-encoded chunk, an unregistered codec or an annotation nothing claims still reads once the offending column is projected away. What it does not lift is the shape of the schema — a nested field is refused whole-file. A projection narrows columns, never rows.
+const schema = defineSchema({ count: { type: "i64" } });
 
-An unknown name, a duplicate, or an empty list is `ERR_READ_OPTION_INVALID`.
+export function sumOneGroupAtATime(): bigint {
+  const writer = createWriter(schema, { rowGroupSize: 2 });
+  writer.appendAll([{ count: 1n }, { count: 2n }, { count: 3n }]);
 
-### Just the schema
-
-```ts
-import { readSchema } from "tavolato";
-
-readSchema(bytes); // the footer only; not a single page is touched
-readSchema(bytes, { types: [price] }); // a column is claimed in the footer, so types apply here too
-```
-
-`readSchema` deliberately ignores `columns`: inspecting what a file holds is the one case where the answer should not have been narrowed first.
-
-### One row group at a time
-
-A Parquet file is sliced horizontally into **row groups**, each an independently decodable segment carrying all of the columns for its slice of the rows. `readParquet` materializes every row of every group at once; `readRowGroups` is the same read, one group per step.
-
-```ts
-import { readRowGroups } from "tavolato";
-
-const file = readRowGroups(bytes);
-
-file.schema; // from the footer, same shape readParquet returns
-file.rowCount; // total rows the footer declares
-file.groupCount; // number of row groups
-
-for (const rows of file) {
-  // one group in memory at a time — `rows` is a ReadRow[]
-  for (const row of rows) total += row.n as bigint;
+  let total = 0n;
+  const file = readRowGroups(writer.finish(), { columns: ["count"] });
+  for (const rows of file) {
+    for (const row of rows) total += row.count as bigint;
+  }
+  return total;
 }
 ```
 
-Memory drops from `O(all declared rows)` to `O(the rows of one row group)`. What that is worth depends on the writer rather than on you: DuckDB writes about 122 000 rows per group by default, and some writers put a single group in each file.
+<!-- /automd -->
 
-The **footer is still read up front**, eagerly and in full — that is where the schema and the groups' locations live. This is lazy _decoding_ over bytes you already hold, not streaming input; `bytes` stays referenced for as long as you use the result. That split is also where errors land: anything the footer can answer on its own throws from the `readRowGroups` call, and only page-level problems wait for the step whose group they are in, so a file whose second group is corrupt still yields its first.
+The input `Uint8Array` and footer remain referenced during iteration. Adding `codecs` makes each iteration step a maybe-promise; await the yielded rows.
 
-Steps follow the same maybe-promise rule as everything else. One group is one maybe-promise, never a mix:
+## Object storage
+
+The optional `tavolato/uns3` entry point wraps an `uns3`-compatible client. The peer dependency is type-only; Tavolato calls the client supplied by your application.
+
+<!-- automd:file src="./playgrounds/object-store.ts" code lang="ts" name=false -->
 
 ```ts
-for (const rows of readRowGroups(bytes, { codecs })) {
-  for (const row of await rows) total += row.n as bigint;
+import { defineSchema, type ReadRow } from "tavolato";
+import { createParquetStore, type ParquetHead, type ParquetStoreClient } from "tavolato/uns3";
+
+const schema = defineSchema({
+  at: { type: "timestamp" },
+  count: { type: "i64" },
+});
+
+export async function storeEvents(
+  client: ParquetStoreClient,
+): Promise<{ head: ParquetHead; rows: ReadRow[] }> {
+  const store = createParquetStore(client, { bucket: "analytics" });
+  const key = "events/date=2026-08-25/part-001.parquet";
+
+  await store.put(key, {
+    schema,
+    rows: [{ at: Date.UTC(2026, 7, 25), count: 1n }],
+  });
+
+  const head = await store.head(key);
+  const { rows } = await store.get(key, { columns: ["count"], groups: [0] });
+  return { head, rows };
 }
 ```
 
-The state of a walk lives in its iterator, not in the object, so every `for…of` starts again at the first group and two walks can run at once. Steps are independent of one another as well — each owns its cursor over the bytes — so they may be pulled without being awaited, which decodes the groups **concurrently** and, naturally, gives the memory bound back up:
+<!-- /automd -->
 
-```ts
-const groups = await Promise.all([...readRowGroups(bytes, { codecs })]);
-```
+`createParquetStore` provides:
 
-A step that throws or rejects has consumed its group: the next step moves on, and the walk still ends after `groupCount` steps. `readParquet(bytes).rows` is exactly the concatenation of the steps, which the test suite checks file by file.
+| Method | Behavior                                                             |
+| ------ | -------------------------------------------------------------------- |
+| `put`  | Upload bytes, finish a writer, or build from `{ schema, rows }`      |
+| `get`  | Read the whole object or selected columns/row groups                 |
+| `head` | Read schema, size, ETag, and row-group counts without decoding pages |
+| `list` | List objects through the client                                      |
+| `del`  | Delete an object through the client                                  |
 
-## Remote objects
+Supplying `columns`, `groups`, or both lets `get` fetch a footer tail and selected column-chunk ranges. Small objects, or clients that ignore ranges, may still be fetched whole. The client must accept HTTP `206 Partial Content` responses. `putParquet` is available for a single direct upload without creating a store.
 
-The optional `tavolato/uns3` subpath puts Parquet in the middle of an [`uns3`](https://github.com/sandros94/uns3) client. It is a separate entry point, so importing `tavolato` never pulls it in, and `uns3` is an **optional peer dependency used for its types alone** — nothing here imports it at runtime, it only calls the five methods of the client you hand over.
+## Growing datasets
 
-```ts
-import { S3Client } from "uns3";
-import { createWriter, defineSchema } from "tavolato";
-import { createParquetStore } from "tavolato/uns3";
+A completed Parquet file ends with metadata describing every row group. Do not append bytes to an existing object: adding rows requires rebuilding that footer.
 
-const store = createParquetStore(new S3Client({/* … */}), { bucket: "metrics" });
-const schema = defineSchema({ at: { type: "timestamp" }, n: { type: "i64" } });
+For object storage, append new files to a dataset prefix instead. Partition keys used by queries can live in the path, for example `events/date=2026-08-25/hour=14/part-<uuid>.parquet`. DuckDB and other analytics engines can read matching files as one table and prune Hive-style partitions.
 
-await store.put("events/2026-08-24.parquet", { schema, rows: [{ at: Date.now(), n: 1n }] });
+Keep batches large enough to avoid excessive tiny files but comfortably below the producing runtime's memory limit. Periodically compact small files in a runtime with more memory, then publish the replacement files or prefix.
 
-// …or hand over a writer you have been appending to — the store finishes it.
-const writer = createWriter(schema);
-writer.append({ at: Date.now(), n: 2n });
-await store.put("events/2026-08-25.parquet", writer);
+Tavolato currently builds the complete output `Uint8Array` before upload. `rowGroupSize` bounds active row-group buffers, not final-file memory. A 128 MB serverless process should therefore create multiple smaller objects rather than one object approaching its heap limit.
 
-const { size, rowCount, groupCount } = await store.head("events/2026-08-24.parquet");
-const { rows } = await store.get("events/2026-08-24.parquet", { columns: ["n"], groups: [0] });
-
-await store.list({ prefix: "events/" });
-await store.del("events/2026-08-24.parquet");
-```
-
-`put` takes finished bytes, a writer to finish, or `{ schema, rows }` to build a file from. `head` answers what an object _is_ — `size`, `etag`, `schema`, `rowCount`, `groupCount` — without downloading a page, and `groupCount` is the range `groups` indexes. `del` and `list` pass straight through to the client.
-
-**`get` is the reason this exists.** Ask for nothing in particular and it is one plain GET of the whole object. Ask for `columns`, `groups`, or both, and it becomes a **ranged** read: the footer is fetched from the object's tail, the byte spans of the selected column chunks are computed from it, adjacent spans are coalesced, and only those ranges are transferred. Two columns of a forty column file cost two columns of bandwidth. The rows that come back are exactly what a local `readParquet` of the whole object under the same options would have produced.
-
-The factory takes defaults; every one of them is overridable per call, and `codecs` / `types` are replaced wholesale rather than merged.
-
-| default     |                                                                                                                                                       |
-| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `bucket`    | Bucket for every call, as `uns3`'s own `defaultBucket` is for a client.                                                                               |
-| `codecs`    | `ReadOptions.codecs` for `get`.                                                                                                                       |
-| `types`     | `ReadOptions.types` for `get` and `head`.                                                                                                             |
-| `writer`    | `WriterOptions` for a `put` handed `{ schema, rows }`.                                                                                                |
-| `tailBytes` | Bytes read from the end of an object when a read needs the footer. Defaults to 64 KiB; a larger footer costs one extra request, never a wrong answer. |
-
-Per call, `get` also takes `uns3`'s own get parameters (minus `key` and `range`, which the store owns) and `put` takes `uns3`'s put parameters plus `writer`. An index the file does not have, a repeated one, or an empty `groups` list is `ERR_READ_OPTION_INVALID`.
-
-For a single upload with no store around it, `putParquet` is the one call that predates the store:
-
-```ts
-import { putParquet } from "tavolato/uns3";
-
-await putParquet(client, { bucket: "metrics", key: "events/2026-08-24.parquet" }, writer);
-```
-
-It accepts either a writer (which it finishes for you) or raw bytes, defaults `contentType` to `application/vnd.apache.parquet` (exported as `PARQUET_CONTENT_TYPE`; pass your own, or `false` to send none), and passes every other `uns3` put parameter straight through.
+See [Parquet's file layout](https://parquet.apache.org/docs/file-format/), [DuckDB multi-file reads](https://duckdb.org/docs/stable/data/multiple_files/overview), and [Hive partitioning](https://duckdb.org/docs/stable/data/partitioning/hive_partitioning).
 
 ## Errors
 
-```ts
-import { isTavolatoError } from "tavolato";
+Library errors are `TavolatoError` instances with a stable `code` and, when applicable, `column`. Native output includes both, such as `TavolatoError [ERR_ROW_VALUE_INVALID]: …`. Use `isTavolatoError(error, code)` for programmatic handling.
 
-try {
-  writer.append({ at: Date.now(), n: "oops" });
-} catch (error) {
-  if (isTavolatoError(error, "ERR_ROW_VALUE_INVALID")) {
-    console.error(String(error));
-    // TavolatoError [ERR_ROW_VALUE_INVALID]: Column "n" of type i64 expects a bigint or a safe integer number, received "oops"
-  }
-}
-```
+| Code family               | Source                                          |
+| ------------------------- | ----------------------------------------------- |
+| `ERR_SCHEMA_*`            | Schema and adapter definitions                  |
+| `ERR_ROW_*`               | Row validation                                  |
+| `ERR_WRITER_*`            | Writer lifecycle, options, and codecs           |
+| `ERR_READ_MALFORMED`      | Invalid Parquet bytes                           |
+| `ERR_READ_UNSUPPORTED`    | Valid feature outside the supported read subset |
+| `ERR_READ_OPTION_INVALID` | Invalid reader configuration                    |
+| `ERR_STORE_*`             | Object-store integration                        |
 
-Every error thrown by the library is a `TavolatoError` carrying a `code` and, where the problem belongs to one column, its `column`. Native string and stack output includes the code as `TavolatoError [ERR_CODE]: message`; programmatic handling should still use `code` or `isTavolatoError`. New codes may be added in a minor version, so match on the ones you handle rather than assuming the list is closed.
+Unsupported compression errors name the codec to register. Unsupported logical annotations name the adapter required through `ReadOptions.types`.
 
-| family                    | thrown by                                                                            |
-| ------------------------- | ------------------------------------------------------------------------------------ |
-| `ERR_SCHEMA_*`            | `defineSchema`, `defineColumnType`, `createWriter`                                   |
-| `ERR_ROW_*`               | `append`, `appendAll`                                                                |
-| `ERR_WRITER_*`            | the writer's lifecycle, its options, its codec                                       |
-| `ERR_READ_MALFORMED`      | bytes that are not a well-formed Parquet file                                        |
-| `ERR_READ_UNSUPPORTED`    | valid Parquet, outside the subset tavolato writes — named, never guessed at          |
-| `ERR_READ_OPTION_INVALID` | a `ReadOptions` value that cannot be used as given, as opposed to an unreadable file |
-| `ERR_STORE_*`             | `tavolato/uns3` talking to object storage                                            |
+## Compatibility and limits
 
-An `ERR_READ_UNSUPPORTED` names the feature it found, and names the remedy where there is one: a compressed column says to register a decompressor in `ReadOptions.codecs`, an annotated one names the annotation with its parameters and says to pass a matching type in `ReadOptions.types`.
+- Schemas are flat scalar columns. Lists, maps, structs, and repeated fields are unsupported; use a `json` column for nested documents.
+- The writer emits Data Page V1, plain values, RLE definition levels, and one page per column chunk per row group. It does not emit dictionaries, `INT96`, page indexes, bloom filters, or page CRCs.
+- The reader targets files Tavolato writes. Dictionary encoding, `INT96`, and nested schemas are rejected. Projection can skip unsupported columns.
+- Tavolato omits `repetition_type` from the schema root, as defined upstream. The reader accepts valid root repetition values, including `REQUIRED` emitted by DuckDB and other established writers. Unknown values remain malformed.
+- Local APIs take a complete `Uint8Array`. `readParquet` also materializes all selected rows; `readRowGroups` reduces decoded-row memory but does not stream the input bytes. Remote selective reads can avoid most unselected chunk bytes when the store honors ranges; small files may still be fetched whole.
+- For untrusted files, cap accepted byte size and inspect `readSchema` or `readRowGroups` counts before decoding rows. Registered codecs and adapters are trusted application code.
 
-```
-TavolatoError [ERR_READ_UNSUPPORTED]: Cannot read column "price", a INT64 annotated DECIMAL(precision=18, scale=2). Pass a matching type in ReadOptions.types to read it anyway.
-```
-
-**Malformed input is a typed throw, never a hang or a bare `RangeError`** — wrong magic, a truncated stream, a length that does not fit, a footer that contradicts itself. That covers the _contents_ of any real `Uint8Array`, however hostile. Two carve-outs, and both are code that is not tavolato's:
-
-- **A `Uint8Array` subclass that lies about itself** — one whose `byteLength` or `length` getter returns something other than the memory it has. Nothing can be validated before such an object is measured, and the measurement is the lie, so it may surface as a platform `RangeError`. Pass the bytes you were given, not a proxy for them, and this cannot arise.
-- **A registered codec.** A third-party decoder can throw something else, loop, or trap in wasm, and nothing here can stop it. What tavolato does hold to on every page: the compressed length is bounded against the file **before** your hook sees a byte; whatever the hook throws or rejects with becomes `ERR_READ_MALFORMED` with the original as `cause`; and what it returns must be a `Uint8Array` of **exactly** the length the page header declared, or it is `ERR_READ_MALFORMED` too. On the write side a codec that throws, rejects, or returns something unusable raises `ERR_WRITER_CODEC_FAILED` and leaves the writer **unusable** — the row group it was compressing is already detached, so every later call throws the same error rather than quietly producing a file missing rows it accepted.
-
-## Scope
-
-> **tavolato writes flat Parquet files, and reads the ones it writes.**
-
-That is the default, not a vow: the hooks widen it in both directions, symmetrically, and the column type list has grown once already. The rule that stays is a different one — **no single-use features**. What is frozen is the _shape_.
-
-- **Flat schemas, forever.** One level of named scalar columns; repetition levels are always zero. No lists, no maps, no structs — ever. This half of the promise is absolute, and [`json`](#json-documents) is the escape valve for anything semi-structured.
-- **Canonical roots, compatible reads.** Tavolato omits `repetition_type` from the schema root. On read, it ignores a valid root repetition enum for interoperability with DuckDB, parquet-cpp and parquet-mr; malformed or unknown values remain malformed input.
-- **What lands in the file.** Data page v1, one page per column chunk per row group; `PLAIN` values and `RLE` definition levels; `UNCOMPRESSED` unless you pass a codec; `null_count` statistics only, so no `column_orders`; no dictionary pages and no page CRCs, which is what keeps the library free of a hashing dependency.
-- **Two permanent refusals**, with no hook and no way to opt in. **`INT96`** is the named example: deprecated in the format, never written here — and anything else the format deprecates goes the same way. **Dictionary-encoded columns** are the other wall; `parquet-rs` writers dictionary-encode by default and a codec hook does not unlock those files. Use DuckDB for them.
-- **The whole file is a `Uint8Array`.** The reader does not stream, and `readParquet` returns every row at once, so its memory is `O(rows declared in the footer)`, **not** `O(bytes)` — definition levels are RLE compressed, so a six byte run can legitimately declare millions of nulls, and nothing distinguishes such a file from a sparse one somebody meant to write. [`readRowGroups`](#one-row-group-at-a-time) is the mitigation, and the one to reach for whenever the file is bigger than a mouthful. For **untrusted** input, cap the byte length you accept and check `readSchema` — or `readRowGroups`' counts, which come off the footer — against your own row limit before committing to a decode.
-
-`readParquet` is for getting your own rows back: an S3 round trip, a test, a small aggregation in a worker. For predicate pushdown, files that do not fit in memory, or files written by something else, **DuckDB remains the recommended reader** — and anything that reads Parquet will read these files.
-
-```sql
--- `at` is quoted because SQL reserves it; tavolato does not care what a column is called.
-SELECT host, count(*) AS n, max("at") AS last_seen
-FROM read_parquet('events/*.parquet')
-WHERE host IS NOT NULL
-GROUP BY host ORDER BY n DESC;
-
-SELECT name, type, repetition_type, converted_type FROM parquet_schema('events/*.parquet');
-SELECT num_rows, num_row_groups, created_by FROM parquet_file_metadata('events/*.parquet');
-```
+Files written by Tavolato are cross-read by DuckDB in the test suite. Use DuckDB directly for arbitrary Parquet files, predicate-heavy analytics, or data that should not be materialized in the JavaScript heap.
 
 ## Development
 
-<details>
+Requires Node `>=24.17.0`, pnpm `11.17.0`, and DuckDB on `PATH` for interoperability tests.
 
-<summary>local development</summary>
-
-- Clone this repository
-- Install the latest LTS version of [Node.js](https://nodejs.org/en/)
-- Enable [Corepack](https://github.com/nodejs/corepack) using `corepack enable`
-- Install dependencies using `pnpm install`, then `pnpm dev:prepare`
-- Run tests using `pnpm test` — the cross-read suites drive the [DuckDB CLI](https://duckdb.org/docs/installation/), which acts as the executable specification for the output, so it has to be on `PATH`
-- Check with `pnpm lint` and `pnpm typecheck`
-
-</details>
+- `pnpm dev:prepare` — build development stubs and install hooks
+- `pnpm fmt` — regenerate Markdown and format the repository
+- `pnpm lint` — lint and check formatting
+- `pnpm typecheck` — typecheck source, tests, and playgrounds
+- `pnpm test` — run Vitest and DuckDB interoperability tests
+- `pnpm build` — build ESM and declarations
 
 ## License
 
 <!-- automd:contributors license=MIT -->
 
-Published under the [MIT](https://github.com/sandros94/tavolato/blob/main/LICENSE) license.
-Made by [community](https://github.com/sandros94/tavolato/graphs/contributors) 💛
-<br><br>
-<a href="https://github.com/sandros94/tavolato/graphs/contributors">
-<img src="https://contrib.rocks/image?repo=sandros94/tavolato" />
-</a>
+Published under the [MIT](https://github.com/sandros94/tavolato/blob/main/LICENSE) license. Made by [community](https://github.com/sandros94/tavolato/graphs/contributors) 💛 <br><br> <a href="https://github.com/sandros94/tavolato/graphs/contributors"> <img src="https://contrib.rocks/image?repo=sandros94/tavolato" /> </a>
 
 <!-- /automd -->
 
