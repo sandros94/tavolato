@@ -118,6 +118,14 @@ describe("defineSchema", () => {
   it("refuses an empty column name", () => {
     expectError("ERR_SCHEMA_COLUMN_INVALID", () => defineSchema({ "": { type: "i64" } }));
   });
+
+  it("refuses a column name without an exact UTF-8 representation", () => {
+    const name = "\ud800";
+    const error = expectError("ERR_SCHEMA_COLUMN_INVALID", () =>
+      defineSchema({ [name]: { type: "i64" } }),
+    );
+    expect(error.column).toBe(name);
+  });
 });
 
 describe("writer schema validation", () => {
@@ -142,6 +150,19 @@ describe("writer schema validation", () => {
 
   it("refuses the empty structural schema before it can emit a file", () => {
     expectError("ERR_SCHEMA_EMPTY", () => createWriter(forged({ columns: [], definition: {} })));
+  });
+
+  it("refuses a structural column name without an exact UTF-8 representation", () => {
+    const name = "\udfff";
+    const error = expectError("ERR_SCHEMA_COLUMN_INVALID", () =>
+      createWriter(
+        forged({
+          columns: [{ name, type: "i64", optional: false }],
+          definition: {},
+        }),
+      ),
+    );
+    expect(error.column).toBe(name);
   });
 
   it.each([
@@ -352,6 +373,14 @@ describe("row validation", () => {
     expect(writer.rowCount).toBe(1);
   });
 
+  it("rejects a string without an exact UTF-8 representation", () => {
+    const writer = createWriter(schema);
+    const error = expectError("ERR_ROW_VALUE_INVALID", () =>
+      writer.append({ ...valid, s: "before\ud800after" }),
+    );
+    expect(error.column).toBe("s");
+  });
+
   it("rejects an unknown column", () => {
     const writer = createWriter(schema);
     // @ts-expect-error deliberately wrong input
@@ -472,6 +501,12 @@ describe("writer options", () => {
   it("rejects a non-string createdBy", () => {
     // @ts-expect-error deliberately wrong input
     expectError("ERR_WRITER_OPTION_INVALID", () => createWriter(schema, { createdBy: 1 }));
+  });
+
+  it("rejects createdBy without an exact UTF-8 representation", () => {
+    expectError("ERR_WRITER_OPTION_INVALID", () =>
+      createWriter(schema, { createdBy: "tavolato \ud800" }),
+    );
   });
 });
 

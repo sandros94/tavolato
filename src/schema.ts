@@ -1,4 +1,5 @@
 import { inspectAdapter } from "./adapters.ts";
+import { encodeUtf8Exact } from "./internal/bytes.ts";
 import {
   columnAnnotation,
   columnPhysical,
@@ -58,6 +59,9 @@ function validateColumn(
     columnInvalid(`Column names must be strings, received ${describe(name)}`);
   }
   if (name.length === 0) columnInvalid("Column names must not be empty", name);
+  if (encodeUtf8Exact(name) === undefined) {
+    columnInvalid(`Column name ${describe(name)} has no exact UTF-8 representation`, name);
+  }
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     columnInvalid(`Column "${name}" must be an object such as { type: "string" }`, name);
   }

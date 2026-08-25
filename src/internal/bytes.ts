@@ -319,6 +319,17 @@ const utf8Decoder: TextDecoder = /* @__PURE__ */ new TextDecoder("utf-8", {
   ignoreBOM: true,
 });
 
+/**
+ * Encodes a string only when UTF-8 can preserve its exact JavaScript string
+ * (UTF-16 code-unit sequence). `TextEncoder` replaces lone surrogates with U+FFFD;
+ * comparing through the shared fatal decoder makes that lossy write visible
+ * while retaining the platform encoder and preserving a leading BOM.
+ */
+export function encodeUtf8Exact(value: string): Uint8Array | undefined {
+  const bytes = utf8.encode(value);
+  return utf8Decoder.decode(bytes) === value ? bytes : undefined;
+}
+
 /** Decodes UTF-8 bytes, turning a decoding failure into a typed error. */
 export function decodeUtf8(bytes: Uint8Array): string {
   try {

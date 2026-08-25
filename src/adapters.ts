@@ -1,4 +1,4 @@
-import { decodeUtf8, utf8 } from "./internal/bytes.ts";
+import { decodeUtf8, encodeUtf8Exact, utf8 } from "./internal/bytes.ts";
 import {
   decimalFixedLength,
   decimalPhysicalCanHold,
@@ -1164,8 +1164,8 @@ function jsonSourceBytesOf(value: unknown): Uint8Array {
       cause,
     );
   }
-  const bytes = utf8.encode(value);
-  if (decodeUtf8(bytes) !== value) {
+  const bytes = encodeUtf8Exact(value);
+  if (bytes === undefined) {
     throw new TavolatoError(
       "json as text expects source that has an exact UTF-8 representation",
       "ERR_ROW_VALUE_INVALID",

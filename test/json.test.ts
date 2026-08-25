@@ -671,6 +671,16 @@ describe("the json column type", () => {
     );
   });
 
+  it("preserves lone surrogates through JSON's well-formed escaped representation", () => {
+    const value = { text: "\ud800" };
+    const declared = defineSchema({
+      builtin: { type: "json" },
+      adapter: { type: json() },
+    });
+    const bytes = write(declared, [{ builtin: value, adapter: value }]);
+    expect(readParquet(bytes).rows).toEqual([{ builtin: value, adapter: value }]);
+  });
+
   it("round-trips an optional column, nulls included", () => {
     const declared = defineSchema({ k: { type: "i64" }, doc: { type: json(), optional: true } });
     const bytes = write(declared, [{ k: 0n, doc: { a: 1 } }, { k: 1n, doc: null }, { k: 2n }]);

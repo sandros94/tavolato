@@ -1,4 +1,4 @@
-import { ByteWriter, utf8 } from "./internal/bytes.ts";
+import { ByteWriter, encodeUtf8Exact, utf8 } from "./internal/bytes.ts";
 import { chain, chainEach, isThenable } from "./internal/chain.ts";
 import { type ColumnValues, encodeRleBitPackedHybrid, writePlain } from "./internal/encoding.ts";
 import {
@@ -172,7 +172,11 @@ function stage(state: ColumnState, value: unknown, present: boolean): StagedValu
   switch (type) {
     case "string": {
       if (typeof value !== "string") throw invalid(column, value, "a string");
-      return { kind: "bytes", value: utf8.encode(value) };
+      const bytes = encodeUtf8Exact(value);
+      if (bytes === undefined) {
+        throw invalid(column, value, "a string with an exact UTF-8 representation");
+      }
+      return { kind: "bytes", value: bytes };
     }
     case "json": {
       // A `json` column holds the *structure*, and the stored form is the JSON
@@ -399,6 +403,12 @@ export class ParquetWriter<TDefinition extends SchemaDefinition = SchemaDefiniti
     if (typeof createdBy !== "string") {
       throw new TavolatoError(
         `createdBy must be a string, received ${describe(options.createdBy)}`,
+        "ERR_WRITER_OPTION_INVALID",
+      );
+    }
+    if (encodeUtf8Exact(createdBy) === undefined) {
+      throw new TavolatoError(
+        `createdBy must have an exact UTF-8 representation, received ${describe(createdBy)}`,
         "ERR_WRITER_OPTION_INVALID",
       );
     }
