@@ -71,7 +71,7 @@ Eight built-ins, each owning a **bare** physical type — the one a file carries
 
 Three built-ins are strict on the way in, so that what you read back is what you wrote: `i32` refuses a non-integer or anything outside −2³¹ … 2³¹−1 rather than wrapping it; `timestamp` refuses epoch millis past ±8.64 × 10¹⁵, the furthest a `Date` reaches, rather than storing a value that could only read back as an Invalid Date; and `f32` rounds to single precision **once**, on write, because single precision is what the column is.
 
-`ColumnType` is a union that may gain members in a minor version — `json` joined `string` in one — so give any `switch` over it a `default` arm.
+`ColumnType` is intentionally closed: arbitrary strings are not accepted, and there is no catch-all member. Recognized types may still join the union in a minor version — as `json` joined `string` — so give any `switch` over it a `default` arm.
 
 ### Adapters
 

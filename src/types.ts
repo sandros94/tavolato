@@ -14,10 +14,11 @@ import type { JsonNull } from "./json-null.ts";
  * | `bool`      | `BOOLEAN`        | —                                             |
  * | `timestamp` | `INT64`          | `TIMESTAMP(UTC, MILLIS)` (`TIMESTAMP_MILLIS`) |
  *
- * The *shape* is frozen — one flat level of scalar columns, forever — but the
- * list itself grows: a minor version may add a member, as `json` was added
- * next to `string`. Switch over it with a `default` arm rather than an
- * exhaustive one, or a new member turns into a type error on upgrade.
+ * The *shape* is frozen — one flat level of scalar columns, forever — and this
+ * union is deliberately closed: an unknown string is not a column type. Its
+ * known members may still grow in a minor version, as `json` was added next to
+ * `string`. Switch over it with a `default` arm rather than an exhaustive one,
+ * or a new member turns into a type error on upgrade.
  *
  * These are the types that own a *bare* physical type, the one a file carries
  * with no annotation at all. Everything a column can additionally *mean* —
