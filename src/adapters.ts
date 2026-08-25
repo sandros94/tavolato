@@ -803,8 +803,7 @@ export function integer<TWidth extends IntegerWidth>(
  * {@link jsonTextOf}.
  *
  * The two halves below are shared by the built-in `json` column type and by
- * {@link json}, which is what keeps a hand-configured reviver an *override* of
- * one behaviour rather than a second one.
+ * {@link json}, so parsing, sanitization and serialization have one contract.
  * ---------------------------------------------------------------------------
  */
 
@@ -817,14 +816,18 @@ export type JsonHook = (key: string, value: unknown) => unknown;
 /** JavaScript representation used by {@link json}. */
 export type JsonRepresentation = "value" | "text";
 
+/** Policy for dangerous own keys in a parsed value-mode JSON document. */
+export type JsonDangerousKeys = "drop" | "preserve";
+
 /** The three keys that can reach `Object.prototype` when a parsed object is used. */
+const DANGEROUS_JSON_KEYS = ["__proto__", "prototype", "constructor"] as const;
+
 const isDangerousKey = (key: string): boolean =>
-  key === "__proto__" || key === "prototype" || key === "constructor";
+  DANGEROUS_JSON_KEYS.some((dangerous) => key === dangerous);
 
 /**
- * The reviver a `json` column is parsed with unless you supply your own: it
- * drops `__proto__`, `prototype` and `constructor` keys from every object in
- * the document.
+ * An idempotent `JSON.parse` reviver that drops `__proto__`, `prototype` and
+ * `constructor` keys from every object in a document.
  *
  * **Two different layers, and it is worth being exact about which is which.** A
  * *column* named `__proto__` round-trips faithfully — the reader defines that
@@ -833,19 +836,59 @@ const isDangerousKey = (key: string): boolean =>
  * different thing entirely: it is somebody's document, parsed into an object
  * your program will then use, and this reviver drops it.
  *
- * Exported so that a custom reviver can compose with it rather than replace it:
+ * Value-mode {@link json} sanitizes the final graph after any custom reviver,
+ * so callers do not need to compose this hook for safety. It remains exported
+ * for direct `JSON.parse` use and explicit composition.
  *
  * @example
- * import { json, jsonReviver } from "tavolato";
+ * import { jsonReviver } from "tavolato";
  *
- * const dated = json({
- *   reviver: (key, value) => {
- *     const safe = jsonReviver(key, value);
- *     return typeof safe === "string" && ISO.test(safe) ? new Date(safe) : safe;
- *   },
- * });
+ * const safe = JSON.parse(source, jsonReviver);
  */
 export const jsonReviver: JsonHook = (key, value) => (isDangerousKey(key) ? undefined : value);
+
+/** True for values whose own data properties may lead to more graph nodes. */
+function isObject(value: unknown): value is object {
+  return (typeof value === "object" && value !== null) || typeof value === "function";
+}
+
+/**
+ * Removes dangerous own keys from a materialized graph without reading a
+ * property value through ordinary access. Revivers may introduce cycles,
+ * accessors, proxies and locked descriptors, so traversal is iterative and a
+ * reflective operation that reports incomplete removal is a failure rather
+ * than a partial guard. A custom reviver is trusted executable code: hostile
+ * proxy traps, prototypes, accessors, exotic internals and later mutation stay
+ * on that caller-controlled side of the boundary.
+ */
+function dropDangerousKeys(value: unknown): void {
+  if (!isObject(value)) return;
+  const seen = new WeakSet<object>();
+  const pending: object[] = [value];
+  while (pending.length > 0) {
+    const current = pending.pop() as object;
+    if (seen.has(current)) continue;
+    seen.add(current);
+
+    // Do not trust enumeration to disclose these names: a Proxy may legally
+    // omit a configurable own property from ownKeys. Probe, delete and verify
+    // each known key independently before enumeration is used for traversal.
+    for (const key of DANGEROUS_JSON_KEYS) {
+      Object.hasOwn(current, key);
+      if (!Reflect.deleteProperty(current, key) || Object.hasOwn(current, key)) {
+        throw new TypeError(`Cannot remove dangerous JSON key ${JSON.stringify(key)}`);
+      }
+    }
+
+    for (const key of Reflect.ownKeys(current)) {
+      if (typeof key === "string" && isDangerousKey(key)) continue;
+      const descriptor = Reflect.getOwnPropertyDescriptor(current, key);
+      if (descriptor !== undefined && "value" in descriptor && isObject(descriptor.value)) {
+        pending.push(descriptor.value);
+      }
+    }
+  }
+}
 
 /**
  * Serializes one `json` column value, naming the two ways `JSON.stringify` has
@@ -914,8 +957,8 @@ export function jsonTextOf(value: unknown, column?: string, replacer?: JsonHook)
 }
 
 /**
- * Parses one `json` column value, with {@link jsonReviver} unless the caller
- * brought its own.
+ * Parses one `json` column value, then applies its dangerous-key policy after
+ * any caller reviver has completed.
  *
  * A JSON-annotated column is only *claimed* to hold JSON. Any file may say so
  * about any bytes, so a parse failure is the file being malformed rather than
@@ -926,14 +969,27 @@ export function jsonTextOf(value: unknown, column?: string, replacer?: JsonHook)
 export function jsonValueOf(
   text: string,
   column?: string,
-  reviver: JsonHook = jsonReviver,
+  reviver?: JsonHook,
+  dangerousKeys: JsonDangerousKeys = "drop",
 ): unknown {
+  let value: unknown;
   try {
-    const value = JSON.parse(text, reviver) as unknown;
-    return value === null ? JSON_NULL : value;
+    value = JSON.parse(text, reviver) as unknown;
   } catch (cause) {
     throw invalidJsonSource(text, column, cause);
   }
+  if (dangerousKeys === "drop") {
+    try {
+      dropDangerousKeys(value);
+    } catch (cause) {
+      throw malformed(
+        "A JSON-annotated column produced a value whose dangerous keys could not be removed",
+        column,
+        cause,
+      );
+    }
+  }
+  return value === null ? JSON_NULL : value;
 }
 
 /** One malformed-file contract for every representation of JSON source. */
@@ -954,11 +1010,16 @@ export interface JsonValueOptions {
   /** Parse to and serialize from a JavaScript value. Defaults to `"value"`. */
   readonly as?: "value";
   /**
-   * Reviver handed to `JSON.parse`. **Replaces** {@link jsonReviver} rather
-   * than running after it: bringing your own means owning it, dangerous keys
-   * included. Composing is one call — `jsonReviver` is exported for exactly
-   * that.
+   * Dangerous own keys are removed after parsing and reviving by default.
+   * Native JSON receives the strong guarantee. A custom reviver is trusted
+   * code; sanitization covers its reflectively exposed graph and direct known
+   * keys while preserving identity, prototypes, cycles, safe accessors and
+   * exotic values whose dangerous own keys are removable. Otherwise reading
+   * fails with `ERR_READ_MALFORMED`; use `"preserve"` only when downstream
+   * code is prepared to retain every key and trust exotic internals.
    */
+  readonly dangerousKeys?: JsonDangerousKeys;
+  /** Reviver handed to `JSON.parse`; sanitization runs after it returns. */
   readonly reviver?: JsonHook;
   /** Replacer handed to `JSON.stringify`. */
   readonly replacer?: JsonHook;
@@ -968,6 +1029,8 @@ export interface JsonValueOptions {
 export interface JsonTextOptions {
   /** Preserve the complete JSON document as source text. */
   readonly as: "text";
+  /** Text is not materialized into an object graph. */
+  readonly dangerousKeys?: never;
   /** Text is not parsed into a value, so a reviver has no meaning. */
   readonly reviver?: never;
   /** Text is not serialized from a value, so a replacer has no meaning. */
@@ -1037,11 +1100,12 @@ function jsonSourceBytesOf(value: unknown): Uint8Array {
  * const schema = defineSchema({ payload: { type: json<Payload>() } });
  *
  * @example
- * // Keeps the dangerous keys the default reviver drops:
- * const raw = json({ reviver: (_key, value) => value });
+ * // Explicitly retains dangerous own keys in the parsed graph:
+ * const raw = json({ dangerousKeys: "preserve" });
  *
  * @throws {TavolatoError} `ERR_SCHEMA_COLUMN_INVALID` for an unknown
- * representation, an invalid hook, or a hook supplied in text mode.
+ * representation or dangerous-key policy, an invalid hook, or a value-mode
+ * option supplied in text mode.
  */
 /*
  * Overloads rather than one default type argument: a defaulted parameter
@@ -1067,6 +1131,9 @@ export function json<TValue>(
     throw invalid(`json as must be "value" or "text", received ${describe(as)}`);
   }
   if (as === "text") {
+    if (options.dangerousKeys !== undefined) {
+      throw invalid("json as text does not accept a dangerousKeys policy");
+    }
     if (options.reviver !== undefined) {
       throw invalid("json as text does not accept a reviver");
     }
@@ -1083,8 +1150,13 @@ export function json<TValue>(
     });
   }
 
-  const { reviver = jsonReviver, replacer } = options;
-  if (typeof reviver !== "function") {
+  const { dangerousKeys = "drop", reviver, replacer } = options;
+  if (dangerousKeys !== "drop" && dangerousKeys !== "preserve") {
+    throw invalid(
+      `json dangerousKeys must be "drop" or "preserve", received ${describe(dangerousKeys)}`,
+    );
+  }
+  if (reviver !== undefined && typeof reviver !== "function") {
     throw invalid(`json reviver must be a function, received ${describe(reviver)}`);
   }
   if (replacer !== undefined && typeof replacer !== "function") {
@@ -1096,7 +1168,8 @@ export function json<TValue>(
     physical: "bytes",
     matches: (annotation) => annotation.kind === "json",
     annotate: () => ({ kind: "json" }),
-    read: (raw) => jsonValueOf(decodeUtf8(raw as Uint8Array), undefined, reviver) as TValue,
+    read: (raw) =>
+      jsonValueOf(decodeUtf8(raw as Uint8Array), undefined, reviver, dangerousKeys) as TValue,
     write: (value) => utf8.encode(jsonTextOf(value, undefined, replacer)),
   });
 }

@@ -20,6 +20,7 @@ import type {
   DateOptions,
   DateRepresentation,
   DateValue,
+  JsonDangerousKeys,
   JsonDocument,
   JsonNull,
   JsonOptions,
@@ -453,11 +454,20 @@ json({ as: "text", replacer: (_key, value) => value });
 json({ as: "bytes" });
 
 const jsonRepresentation: JsonRepresentation = "text";
-const jsonOptions: JsonOptions = { as: "value", reviver: jsonReviver };
+const dangerousKeys: JsonDangerousKeys = "preserve";
+const jsonOptions: JsonOptions = {
+  as: "value",
+  dangerousKeys,
+  reviver: jsonReviver,
+};
 const jsonFromOptions = (options: JsonOptions) => json(options);
 // @ts-expect-error representation options are immutable contracts
 jsonOptions.reviver = jsonReviver;
-void [jsonRepresentation, jsonOptions, jsonFromOptions];
+// @ts-expect-error text mode never materializes keys to sanitize or preserve
+json({ as: "text", dangerousKeys: "preserve" });
+// @ts-expect-error dangerous-key policy is a closed explicit choice
+json({ dangerousKeys: "remove" });
+void [jsonRepresentation, dangerousKeys, jsonOptions, jsonFromOptions];
 
 const jsonNullSchema = defineSchema({
   required: { type: "json" },

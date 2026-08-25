@@ -321,7 +321,7 @@ describe("dangerous keys inside a document", () => {
    * other. A *column* named `__proto__` is a name Parquet allows and JavaScript
    * finds special, and it round-trips faithfully. A dangerous *key inside a
    * json value* is somebody's document landing in an object your program will
-   * use, and the default reviver drops it.
+   * use, and the default value-mode policy drops it.
    */
   const polluting = '{"__proto__":{"polluted":true},"constructor":1,"prototype":2,"kept":3}';
 
@@ -342,8 +342,29 @@ describe("dangerous keys inside a document", () => {
     expect(({} as { polluted?: unknown }).polluted).toBeUndefined();
   });
 
-  it("keeps them when a custom reviver says so, because bring-your-own means own it", () => {
-    const document = parsed({ types: [json({ reviver: (_key, value) => value })] }).doc as Record<
+  it("still drops them after a custom reviver runs", () => {
+    let sawDangerousAtRoot = false;
+    const document = parsed({
+      types: [
+        json({
+          reviver: (key, value) => {
+            if (key === "") {
+              sawDangerousAtRoot = Object.hasOwn(value as object, "constructor");
+            }
+            return value;
+          },
+        }),
+      ],
+    }).doc as Record<string, unknown>;
+    expect(sawDangerousAtRoot).toBe(true);
+    expect(document).toEqual({ kept: 3 });
+    expect(Object.hasOwn(document, "__proto__")).toBe(false);
+    expect(Object.hasOwn(document, "constructor")).toBe(false);
+    expect(Object.hasOwn(document, "prototype")).toBe(false);
+  });
+
+  it("preserves original dangerous own keys only when explicitly requested", () => {
+    const document = parsed({ types: [json({ dangerousKeys: "preserve" })] }).doc as Record<
       string,
       unknown
     >;
@@ -355,7 +376,202 @@ describe("dangerous keys inside a document", () => {
     expect(Object.getPrototypeOf(document)).toBe(Object.prototype);
   });
 
-  it("composes with the default reviver in one call", () => {
+  it("drops dangerous own keys introduced by a custom reviver", () => {
+    const guarded = json({
+      reviver: (key, value) => {
+        if (key !== "") return value;
+        Object.defineProperty(value, "__proto__", {
+          value: { polluted: true },
+          configurable: true,
+          enumerable: true,
+        });
+        Object.defineProperty(value, "constructor", {
+          value: "introduced",
+          configurable: true,
+          enumerable: true,
+        });
+        return value;
+      },
+    });
+    const document = parsed({ types: [guarded] }).doc as Record<string, unknown>;
+    expect(document).toEqual({ kept: 3 });
+    expect(Object.hasOwn(document, "__proto__")).toBe(false);
+    expect(Object.hasOwn(document, "constructor")).toBe(false);
+  });
+
+  it("preserves dangerous own keys introduced by a reviver when opted out", () => {
+    const preserving = json({
+      dangerousKeys: "preserve",
+      reviver: (key, value) => {
+        if (key !== "") return value;
+        Object.defineProperty(value, "__proto__", {
+          value: "introduced",
+          configurable: true,
+          enumerable: true,
+        });
+        return value;
+      },
+    });
+    const document = parsed({ types: [preserving] }).doc as Record<string, unknown>;
+    expect(Object.hasOwn(document, "__proto__")).toBe(true);
+    expect(document["__proto__"]).toBe("introduced");
+    expect(document.constructor).toBe(1);
+    expect(document.prototype).toBe(2);
+  });
+
+  it("sanitizes cyclic graphs introduced by a reviver without recursing forever", () => {
+    const cyclic = json({
+      reviver: (key, value) => {
+        if (key !== "") return value;
+        Object.defineProperty(value, "self", {
+          value,
+          configurable: true,
+          enumerable: true,
+        });
+        return value;
+      },
+    });
+    const document = parsed({ types: [cyclic] }).doc as Record<string, unknown>;
+    expect(document.self).toBe(document);
+  });
+
+  it("preserves identity, prototypes and exotic values introduced by a reviver", () => {
+    class Envelope {
+      constructor(readonly at: Date) {}
+    }
+    const at = new Date("2026-08-25T00:00:00.000Z");
+    const envelope = new Envelope(at);
+    const adapted = json({ reviver: (key, value) => (key === "" ? envelope : value) });
+    const document = parsed({ types: [adapted] }).doc as unknown as Envelope;
+    expect(document).toBe(envelope);
+    expect(document).toBeInstanceOf(Envelope);
+    expect(document.at).toBe(at);
+  });
+
+  it("refuses a function's locked prototype unless preservation is explicit", () => {
+    function callable(): string {
+      return "trusted";
+    }
+    const guarded = json({ reviver: (key, value) => (key === "" ? callable : value) });
+    const error = expectError("ERR_READ_MALFORMED", () => parsed({ types: [guarded] }));
+    expect(error.column).toBe("doc");
+
+    const preserving = json({
+      dangerousKeys: "preserve",
+      reviver: (key, value) => (key === "" ? callable : value),
+    });
+    expect(parsed({ types: [preserving] }).doc).toBe(callable);
+  });
+
+  it("removes dangerous accessors without invoking any getter", () => {
+    const guarded = json({
+      reviver: (key, value) => {
+        if (key !== "") return value;
+        const fail = (): never => {
+          throw new Error("getter ran");
+        };
+        Object.defineProperty(value, "safe", { get: fail, configurable: true, enumerable: true });
+        Object.defineProperty(value, "prototype", {
+          get: fail,
+          configurable: true,
+          enumerable: true,
+        });
+        return value;
+      },
+    });
+    const document = parsed({ types: [guarded] }).doc as Record<string, unknown>;
+    expect(Object.hasOwn(document, "prototype")).toBe(false);
+    expect(Object.getOwnPropertyDescriptor(document, "safe")).toMatchObject({
+      get: expect.any(Function),
+    });
+  });
+
+  it("fails with a typed read error rather than leaving a non-configurable key", () => {
+    const guarded = json({
+      reviver: (key, value) => {
+        if (key === "") {
+          Object.defineProperty(value, "constructor", {
+            value: "locked",
+            configurable: false,
+            enumerable: true,
+          });
+        }
+        return value;
+      },
+    });
+    const error = expectError("ERR_READ_MALFORMED", () => parsed({ types: [guarded] }));
+    expect(error.column).toBe("doc");
+  });
+
+  it("fails with a typed read error when graph inspection is trapped", () => {
+    const guarded = json({
+      reviver: (key, value) =>
+        key === ""
+          ? new Proxy(value as object, {
+              ownKeys: () => {
+                throw new Error("trapped");
+              },
+            })
+          : value,
+    });
+    const error = expectError("ERR_READ_MALFORMED", () => parsed({ types: [guarded] }));
+    expect(error.column).toBe("doc");
+  });
+
+  it("removes known dangerous keys even when a proxy omits them from ownKeys", () => {
+    const guarded = json({
+      reviver: (key, value) =>
+        key === ""
+          ? new Proxy(value as object, {
+              ownKeys: (target) =>
+                Reflect.ownKeys(target).filter(
+                  (found) =>
+                    found !== "__proto__" && found !== "constructor" && found !== "prototype",
+                ),
+            })
+          : value,
+    });
+    const document = parsed({ types: [guarded] }).doc as Record<string, unknown>;
+    expect(Object.hasOwn(document, "__proto__")).toBe(false);
+    expect(Object.hasOwn(document, "constructor")).toBe(false);
+    expect(Object.hasOwn(document, "prototype")).toBe(false);
+    expect(document).toEqual({ kept: 3 });
+  });
+
+  it("fails when a proxy claims deletion without removing a dangerous key", () => {
+    const guarded = json({
+      reviver: (key, value) =>
+        key === ""
+          ? new Proxy(value as object, {
+              deleteProperty: (target, found) =>
+                found === "constructor" ? true : Reflect.deleteProperty(target, found),
+            })
+          : value,
+    });
+    const error = expectError("ERR_READ_MALFORMED", () => parsed({ types: [guarded] }));
+    expect(error.column).toBe("doc");
+  });
+
+  it("does not inspect an ownKeys-hiding proxy when preservation is explicit", () => {
+    let ownKeysCalls = 0;
+    const preserving = json({
+      dangerousKeys: "preserve",
+      reviver: (key, value) =>
+        key === ""
+          ? new Proxy(value as object, {
+              ownKeys: (target) => {
+                ownKeysCalls++;
+                return Reflect.ownKeys(target).filter((found) => found !== "__proto__");
+              },
+            })
+          : value,
+    });
+    const document = parsed({ types: [preserving] }).doc as Record<string, unknown>;
+    expect(ownKeysCalls).toBe(0);
+    expect(Object.hasOwn(document, "__proto__")).toBe(true);
+  });
+
+  it("keeps jsonReviver idempotent when a custom reviver composes with it", () => {
     const document = parsed({
       types: [
         json({
@@ -416,6 +632,17 @@ describe("the json column type", () => {
     expect(readParquet(bytes).rows).toEqual([{ doc: { n: "1" } }]);
   });
 
+  it("preserves JSON.parse's reviver holder binding", () => {
+    const bytes = write(defineSchema({ doc: { type: "json" } }), [{ doc: { n: 1 } }]);
+    const value = json({
+      reviver: function (key, found) {
+        if (key === "n") expect(this).toEqual({ n: 1 });
+        return found;
+      },
+    });
+    expect(readParquet(bytes, { types: [value] }).rows).toEqual([{ doc: { n: 1 } }]);
+  });
+
   it("turns a parse failure into the same malformed error the built-in raises", () => {
     const bytes = write(defineSchema({ doc: { type: rawJson } }), [{ doc: "{oops" }]);
     const error = expectError("ERR_READ_MALFORMED", () => readParquet(bytes, { types: [json()] }));
@@ -427,6 +654,10 @@ describe("the json column type", () => {
     expectError("ERR_SCHEMA_COLUMN_INVALID", () => json({ reviver: "nope" }));
     // @ts-expect-error deliberately wrong input
     expectError("ERR_SCHEMA_COLUMN_INVALID", () => json({ replacer: 1 }));
+  });
+
+  it("refuses an unknown dangerous-key policy", () => {
+    expectError("ERR_SCHEMA_COLUMN_INVALID", () => json({ dangerousKeys: "remove" as never }));
   });
 
   it("refuses the same values the built-in refuses", () => {
@@ -453,6 +684,12 @@ describe("the json column type", () => {
 
 describe("the json text representation", () => {
   const text = json({ as: "text" });
+
+  it("refuses a dangerous-key policy because text is never materialized", () => {
+    expectError("ERR_SCHEMA_COLUMN_INVALID", () =>
+      json({ as: "text", dangerousKeys: "preserve" } as never),
+    );
+  });
 
   it("preserves each complete document exactly, without normalization", () => {
     const declared = defineSchema({ doc: { type: text } });

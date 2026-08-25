@@ -79,20 +79,20 @@ Parquet stores a column twice over: a **physical type**, which says how the byte
 
 Each in-box factory maps by one rule: the value must survive the round trip unchanged.
 
-| factory                                                | JavaScript     | Parquet                                           |
-| ------------------------------------------------------ | -------------- | ------------------------------------------------- |
-| `date()` or `date({ as: "date" })`                     | `Date`         | `INT32` / `DATE`                                  |
-| `date({ as: "number" })`                               | `number`       | `INT32` / `DATE`                                  |
-| `decimal({ precision, scale })`                        | `string`       | `INT32`, `INT64` or minimal `FLBA(n)` / `DECIMAL` |
-| `uuid()`                                               | `string`       | `FLBA(16)` / `UUID`                               |
-| `time({ unit: "millis", isAdjustedToUTC })`            | `number`       | `INT32` / `TIME(MILLIS, …)`                       |
-| `time({ unit: "micros" \| "nanos", isAdjustedToUTC })` | `bigint`       | `INT64` / `TIME(…, …)`                            |
-| `timestamp({ unit, isAdjustedToUTC })`                 | `bigint`       | `INT64` / `TIMESTAMP(…, …)`                       |
-| `float16()`                                            | `number`       | `FLBA(2)` / `FLOAT16`                             |
-| `integer({ bitWidth: 8 \| 16 \| 32, signed })`         | `number`       | `INT32` / `INTEGER(…)`                            |
-| `integer({ bitWidth: 64, signed })`                    | `bigint`       | `INT64` / `INTEGER(64, …)`                        |
-| `json()` or `json({ as: "value", reviver, replacer })` | `JsonDocument` | `BYTE_ARRAY` / `JSON`                             |
-| `json({ as: "text" })`                                 | `string`       | `BYTE_ARRAY` / `JSON`                             |
+| factory                                                               | JavaScript     | Parquet                                           |
+| --------------------------------------------------------------------- | -------------- | ------------------------------------------------- |
+| `date()` or `date({ as: "date" })`                                    | `Date`         | `INT32` / `DATE`                                  |
+| `date({ as: "number" })`                                              | `number`       | `INT32` / `DATE`                                  |
+| `decimal({ precision, scale })`                                       | `string`       | `INT32`, `INT64` or minimal `FLBA(n)` / `DECIMAL` |
+| `uuid()`                                                              | `string`       | `FLBA(16)` / `UUID`                               |
+| `time({ unit: "millis", isAdjustedToUTC })`                           | `number`       | `INT32` / `TIME(MILLIS, …)`                       |
+| `time({ unit: "micros" \| "nanos", isAdjustedToUTC })`                | `bigint`       | `INT64` / `TIME(…, …)`                            |
+| `timestamp({ unit, isAdjustedToUTC })`                                | `bigint`       | `INT64` / `TIMESTAMP(…, …)`                       |
+| `float16()`                                                           | `number`       | `FLBA(2)` / `FLOAT16`                             |
+| `integer({ bitWidth: 8 \| 16 \| 32, signed })`                        | `number`       | `INT32` / `INTEGER(…)`                            |
+| `integer({ bitWidth: 64, signed })`                                   | `bigint`       | `INT64` / `INTEGER(64, …)`                        |
+| `json()` or `json({ as: "value", dangerousKeys, reviver, replacer })` | `JsonDocument` | `BYTE_ARRAY` / `JSON`                             |
+| `json({ as: "text" })`                                                | `string`       | `BYTE_ARRAY` / `JSON`                             |
 
 ```ts
 date(); // new Date(Date.UTC(2026, 7, 24)) — exactly UTC midnight, never a truncated instant
@@ -179,20 +179,28 @@ writer.append({ payload: JSON_NULL }); // present JSON document: null
 writer.append({ payload: { nested: null } }); // ordinary nested JSON null
 ```
 
-`json({ as: "text" })` instead accepts and returns a complete JSON source string. It validates syntax and UTF-8 on both sides while preserving valid text exactly, including whitespace, key order, and `"null"`; it never parses and re-stringifies. Because no value is materialized, text mode refuses `reviver` and `replacer` options.
+`json({ as: "text" })` instead accepts and returns a complete JSON source string. It validates syntax and UTF-8 on both sides while preserving valid text exactly, including whitespace, key order, and `"null"`; it never parses and re-stringifies. Because no value is materialized, text mode refuses `dangerousKeys`, `reviver` and `replacer` options.
 
-Value-mode parsing uses a sanitizing reviver that drops `__proto__`, `prototype` and `constructor` keys from the documents it parses. That is a different layer from a **column** named `__proto__`, which round-trips faithfully. `jsonReviver` is exported to compose with, and `json({ reviver, replacer })` takes both hooks — a custom reviver **replaces** the default rather than running after it:
+Value mode drops dangerous own keys named `__proto__`, `prototype` or `constructor` by default. Without a custom reviver, native JSON objects receive the strong guarantee that these keys are absent. Sanitization runs after a custom reviver and covers its reflectively exposed graph plus the three direct keys on every visited object. It preserves identity, prototypes, cycles, safe accessors without invoking getters, and exotic values only when their dangerous own keys are removable. Otherwise reading fails with `ERR_READ_MALFORMED`; `dangerousKeys: "preserve"` is the explicit remedy when retaining every key is safe.
+
+A custom reviver is caller-supplied executable code and therefore a trust boundary: adversarial proxy traps, prototypes, accessors, exotic internals such as `Map` entries, and later mutation remain its responsibility. This policy is different from a **column** named `__proto__`, which round-trips faithfully. Opt out of sanitization only for a trusted consumer that needs the exact parsed keys:
 
 ```ts
-import { json, jsonReviver } from "tavolato";
+import { json } from "tavolato";
+
+const trusted = json({ dangerousKeys: "preserve" });
+```
+
+`jsonReviver` remains exported as an idempotent sanitizer for direct `JSON.parse` use. A custom reviver can focus on its own transformation:
+
+```ts
+import { json } from "tavolato";
 
 const ISO = /^\d{4}-\d{2}-\d{2}T/;
 
 const dated = json({
-  reviver: (key, value) => {
-    const safe = jsonReviver(key, value);
-    return typeof safe === "string" && ISO.test(safe) ? new Date(safe) : safe;
-  },
+  reviver: (_key, value) =>
+    typeof value === "string" && ISO.test(value) ? new Date(value) : value,
 });
 ```
 

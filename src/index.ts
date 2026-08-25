@@ -24,6 +24,7 @@ export type {
   IntegerOptions,
   IntegerValue,
   IntegerWidth,
+  JsonDangerousKeys,
   JsonHook,
   JsonOptions,
   JsonRepresentation,
