@@ -209,9 +209,8 @@ export const LogicalTypeId: {
  * The field id that stands for "an annotation this version cannot name".
  *
  * Zero is not a legal Thrift field id, so it can never collide with a real
- * member of the union — which is what makes it the right marker for a
- * `ConvertedType` outside the enum, or a `LogicalType` struct carrying no
- * member at all.
+ * member of the union — which makes it the right marker for a `ConvertedType`
+ * outside the enum.
  */
 export const UNNAMED_ANNOTATION = 0 as const;
 
@@ -930,12 +929,22 @@ function eachField(reader: CompactReader, read: (field: ThriftField) => boolean)
   reader.structEnd();
 }
 
-function decodeTimeUnit(reader: CompactReader): TimeUnitName | undefined {
-  let unit: TimeUnitName | undefined;
+function decodeTimeUnit(reader: CompactReader): TimeUnitName | null {
+  let members = 0;
+  let unit: TimeUnitName | null = null;
   eachField(reader, (field) => {
-    unit = TIME_UNIT_KINDS[field.id];
-    return false; // the union's payload is an empty struct; skipping it reads the stop byte
+    members++;
+    if (members > 1) throw malformed("TimeUnit carries more than one union member");
+    const found = TIME_UNIT_KINDS[field.id];
+    if (found === undefined) return false;
+    if (field.type !== ThriftType.STRUCT) {
+      throw malformed(`TimeUnit member ${field.id} must be a Thrift STRUCT`);
+    }
+    unit = found;
+    reader.skip(field.type); // an empty struct today; unknown fields remain forward-compatible
+    return true;
   });
+  if (members === 0) throw malformed("TimeUnit carries no union member");
   return unit;
 }
 
@@ -951,9 +960,9 @@ function decodeTimeUnit(reader: CompactReader): TimeUnitName | undefined {
  * footer misaligned, and the failure surfaces fields later as a Thrift type
  * that does not exist. And a required parameter that is missing is not a
  * default: `isSigned` decides what half of an integer's range means, and a unit
- * decides a value's order of magnitude. A member the file did not spell out is
- * one this version cannot read, which is exactly what `unknown` says — and it
- * is refused a layer up, where the column has a name.
+ * decides a value's order of magnitude. Missing or wrongly wired known fields
+ * are malformed; correctly wired values this version cannot name remain
+ * `unknown` and are refused or claimed one layer up.
  */
 
 /** Whether a field header carries a bool, whose value *is* its Thrift type. */
@@ -964,18 +973,22 @@ function isBoolField(type: number): boolean {
 /** `TimeType` and `TimestampType` are the same two fields, in the same order. */
 function decodeTimeLike(reader: CompactReader, kind: "time" | "timestamp"): Annotation {
   let isAdjustedToUTC: boolean | undefined;
-  let unit: TimeUnitName | undefined;
+  let unit: TimeUnitName | null | undefined;
   eachField(reader, (field) => {
     switch (field.id) {
       case 1: {
         // A bool carries its value in the field header, so there is nothing to
         // read — as long as the field is one.
-        if (!isBoolField(field.type)) return false;
+        if (!isBoolField(field.type)) {
+          throw malformed(`${kind} isAdjustedToUTC must be a Thrift bool`);
+        }
         isAdjustedToUTC = reader.bool(field.type);
         return true;
       }
       case 2: {
-        if (field.type !== ThriftType.STRUCT) return false;
+        if (field.type !== ThriftType.STRUCT) {
+          throw malformed(`${kind} unit must be a Thrift STRUCT`);
+        }
         unit = decodeTimeUnit(reader);
         return true;
       }
@@ -984,9 +997,12 @@ function decodeTimeLike(reader: CompactReader, kind: "time" | "timestamp"): Anno
       }
     }
   });
-  // A resolution nobody has named yet is not a `TIME` this version understands,
-  // and pretending it is milliseconds would move every value.
-  return unit === undefined || isAdjustedToUTC === undefined
+  if (isAdjustedToUTC === undefined || unit === undefined) {
+    throw malformed(`${kind} payload is missing required fields`);
+  }
+  // A future unit remains an unknown annotation; guessing a resolution would
+  // move every value by orders of magnitude.
+  return unit === null
     ? { kind: "unknown", id: kind === "time" ? LogicalTypeId.TIME : LogicalTypeId.TIMESTAMP }
     : { kind, unit, isAdjustedToUTC };
 }
@@ -998,12 +1014,16 @@ function decodeDecimalType(reader: CompactReader): Annotation {
   eachField(reader, (field) => {
     switch (field.id) {
       case 1: {
-        if (field.type !== ThriftType.I32) return false;
+        if (field.type !== ThriftType.I32) {
+          throw malformed("DecimalType.scale must be a Thrift i32");
+        }
         scale = reader.i32();
         return true;
       }
       case 2: {
-        if (field.type !== ThriftType.I32) return false;
+        if (field.type !== ThriftType.I32) {
+          throw malformed("DecimalType.precision must be a Thrift i32");
+        }
         precision = reader.i32();
         return true;
       }
@@ -1012,24 +1032,29 @@ function decodeDecimalType(reader: CompactReader): Annotation {
       }
     }
   });
-  return scale === undefined || precision === undefined
-    ? { kind: "unknown", id: LogicalTypeId.DECIMAL }
-    : { kind: "decimal", precision, scale };
+  if (scale === undefined || precision === undefined) {
+    throw malformed("DecimalType payload is missing scale or precision");
+  }
+  return { kind: "decimal", precision, scale };
 }
 
 /** `IntType { 1: i8 bitWidth, 2: bool isSigned }`. */
 function decodeIntType(reader: CompactReader): Annotation {
-  let bitWidth = 0;
+  let bitWidth: number | undefined;
   let isSigned: boolean | undefined;
   eachField(reader, (field) => {
     switch (field.id) {
       case 1: {
-        if (field.type !== ThriftType.I8) return false;
+        if (field.type !== ThriftType.I8) {
+          throw malformed("IntType.bitWidth must be a Thrift i8");
+        }
         bitWidth = reader.i8();
         return true;
       }
       case 2: {
-        if (!isBoolField(field.type)) return false;
+        if (!isBoolField(field.type)) {
+          throw malformed("IntType.isSigned must be a Thrift bool");
+        }
         isSigned = reader.bool(field.type);
         return true;
       }
@@ -1038,67 +1063,112 @@ function decodeIntType(reader: CompactReader): Annotation {
       }
     }
   });
+  if (bitWidth === undefined || isSigned === undefined) {
+    throw malformed("IntType payload is missing bitWidth or isSigned");
+  }
   const width = INTEGER_WIDTH_ORDER.find((candidate) => candidate === bitWidth);
-  return width === undefined || isSigned === undefined
+  return width === undefined
     ? { kind: "unknown", id: LogicalTypeId.INTEGER }
     : { kind: "integer", bitWidth: width, isSigned };
 }
 
+const RECOGNIZED_LOGICAL_TYPE_IDS: ReadonlySet<number> = new Set([
+  LogicalTypeId.STRING,
+  LogicalTypeId.MAP,
+  LogicalTypeId.LIST,
+  LogicalTypeId.ENUM,
+  LogicalTypeId.DECIMAL,
+  LogicalTypeId.DATE,
+  LogicalTypeId.TIME,
+  LogicalTypeId.TIMESTAMP,
+  LogicalTypeId.INTEGER,
+  LogicalTypeId.NULL,
+  LogicalTypeId.JSON,
+  LogicalTypeId.BSON,
+  LogicalTypeId.UUID,
+  LogicalTypeId.FLOAT16,
+  LogicalTypeId.VARIANT,
+  LogicalTypeId.GEOMETRY,
+  LogicalTypeId.GEOGRAPHY,
+  LogicalTypeId.FILE,
+]);
+
 /**
  * Reads the `LogicalType` union straight into the annotation model.
  *
- * A member with no parameters is skipped rather than descended into, which
- * consumes its empty struct's stop byte; the parameterised ones are read here
- * and nowhere else. A known but unsupported member, or one a later release
- * adds, decodes to its field id so it can still be named in a refusal and
- * offered to an adapter where its physical contract permits one.
+ * A known member has exactly the STRUCT payload `parquet.thrift` declares;
+ * parameterised members are read here and nowhere else. A known but unsupported
+ * member, or one a later release adds, decodes to its field id so it can still
+ * be named in a refusal and offered to an adapter where its physical contract
+ * permits one.
  */
 function decodeLogicalType(reader: CompactReader): Annotation {
-  let annotation: Annotation = { kind: "unknown", id: UNNAMED_ANNOTATION };
+  let members = 0;
+  let annotation: Annotation | undefined;
   eachField(reader, (field) => {
+    members++;
+    if (members > 1) throw malformed("LogicalType carries more than one union member");
+    if (RECOGNIZED_LOGICAL_TYPE_IDS.has(field.id) && field.type !== ThriftType.STRUCT) {
+      throw malformed(`LogicalType member ${field.id} must be a Thrift STRUCT`);
+    }
     switch (field.id) {
       case LogicalTypeId.STRING: {
         annotation = { kind: "string" };
-        return false;
+        reader.skip(field.type);
+        return true;
       }
       case LogicalTypeId.ENUM: {
         annotation = { kind: "enum" };
-        return false;
+        reader.skip(field.type);
+        return true;
       }
       case LogicalTypeId.DATE: {
         annotation = { kind: "date" };
-        return false;
+        reader.skip(field.type);
+        return true;
       }
       case LogicalTypeId.JSON: {
         annotation = { kind: "json" };
-        return false;
+        reader.skip(field.type);
+        return true;
       }
       case LogicalTypeId.BSON: {
         annotation = { kind: "bson" };
-        return false;
+        reader.skip(field.type);
+        return true;
       }
       case LogicalTypeId.UUID: {
         annotation = { kind: "uuid" };
-        return false;
+        reader.skip(field.type);
+        return true;
       }
       case LogicalTypeId.FLOAT16: {
         annotation = { kind: "float16" };
-        return false;
+        reader.skip(field.type);
+        return true;
       }
       case LogicalTypeId.DECIMAL: {
-        if (field.type !== ThriftType.STRUCT) return false;
         annotation = decodeDecimalType(reader);
         return true;
       }
       case LogicalTypeId.TIME:
       case LogicalTypeId.TIMESTAMP: {
-        if (field.type !== ThriftType.STRUCT) return false;
         annotation = decodeTimeLike(reader, field.id === LogicalTypeId.TIME ? "time" : "timestamp");
         return true;
       }
       case LogicalTypeId.INTEGER: {
-        if (field.type !== ThriftType.STRUCT) return false;
         annotation = decodeIntType(reader);
+        return true;
+      }
+      case LogicalTypeId.MAP:
+      case LogicalTypeId.LIST:
+      case LogicalTypeId.NULL:
+      case LogicalTypeId.VARIANT:
+      case LogicalTypeId.GEOMETRY:
+      case LogicalTypeId.GEOGRAPHY:
+      case LogicalTypeId.FILE: {
+        annotation = { kind: "unknown", id: field.id };
+        reader.skip(field.type);
         return true;
       }
       default: {
@@ -1107,6 +1177,9 @@ function decodeLogicalType(reader: CompactReader): Annotation {
       }
     }
   });
+  if (members === 0 || annotation === undefined) {
+    throw malformed("LogicalType carries no union member");
+  }
   return annotation;
 }
 

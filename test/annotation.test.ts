@@ -191,10 +191,9 @@ describe("the annotations a column type stamps", () => {
 /**
  * The `LogicalType` union as it comes off the wire, written by hand: these are
  * the shapes no writer here produces — a member from a later release, a
- * parameter in the wrong Thrift type, a union with nothing in it.
- *
- * None of them may throw. An annotation that cannot be read is `unknown`, and
- * `unknown` is refused one layer up, where the column has a name.
+ * parameter in the wrong Thrift type, or a union with nothing in it.
+ * Structurally invalid known members are malformed; correctly wired future
+ * values remain `unknown` and claimable.
  */
 function footerWithLogicalType(
   write: ((writer: CompactWriter) => void) | undefined,
@@ -249,6 +248,162 @@ function fileWithLogicalType(
   return bytes;
 }
 
+describe("strict Thrift annotation unions", () => {
+  const recognizedLogicalTypes = [
+    LogicalTypeId.STRING,
+    LogicalTypeId.MAP,
+    LogicalTypeId.LIST,
+    LogicalTypeId.ENUM,
+    LogicalTypeId.DECIMAL,
+    LogicalTypeId.DATE,
+    LogicalTypeId.TIME,
+    LogicalTypeId.TIMESTAMP,
+    LogicalTypeId.INTEGER,
+    LogicalTypeId.NULL,
+    LogicalTypeId.JSON,
+    LogicalTypeId.BSON,
+    LogicalTypeId.UUID,
+    LogicalTypeId.FLOAT16,
+    LogicalTypeId.VARIANT,
+    LogicalTypeId.GEOMETRY,
+    LogicalTypeId.GEOGRAPHY,
+    LogicalTypeId.FILE,
+  ] as const;
+
+  it.each(recognizedLogicalTypes)("requires STRUCT for recognized LogicalType member %i", (id) => {
+    expectError("ERR_READ_MALFORMED", () => decodedLogicalType((writer) => writer.fieldI32(id, 0)));
+  });
+
+  it("requires exactly one LogicalType member", () => {
+    expectError("ERR_READ_MALFORMED", () => decodedLogicalType(() => {}));
+    expectError("ERR_READ_MALFORMED", () =>
+      decodedLogicalType((writer) => {
+        writer.fieldStructBegin(LogicalTypeId.STRING);
+        writer.structEnd();
+        writer.fieldStructBegin(LogicalTypeId.DATE);
+        writer.structEnd();
+      }),
+    );
+    expectError("ERR_READ_MALFORMED", () =>
+      decodedLogicalType((writer) => {
+        writer.fieldStructBegin(42);
+        writer.structEnd();
+        writer.fieldStructBegin(LogicalTypeId.STRING);
+        writer.structEnd();
+      }),
+    );
+    expectError("ERR_READ_MALFORMED", () =>
+      decodedLogicalType((writer) => {
+        writer.fieldStructBegin(42);
+        writer.structEnd();
+        writer.fieldI32(43, 0);
+      }),
+    );
+  });
+
+  it.each([
+    LogicalTypeId.DECIMAL,
+    LogicalTypeId.TIME,
+    LogicalTypeId.TIMESTAMP,
+    LogicalTypeId.INTEGER,
+  ])("refuses an empty recognized LogicalType payload %i", (id) => {
+    expectError("ERR_READ_MALFORMED", () =>
+      decodedLogicalType((writer) => {
+        writer.fieldStructBegin(id);
+        writer.structEnd();
+      }),
+    );
+  });
+
+  it("requires exactly one TimeUnit member of the declared STRUCT type", () => {
+    const decoded = (writeUnit: (writer: CompactWriter) => void): Annotation =>
+      decodedLogicalType((writer) => {
+        writer.fieldStructBegin(LogicalTypeId.TIME);
+        writer.fieldBool(1, false);
+        writer.fieldStructBegin(2);
+        writeUnit(writer);
+        writer.structEnd();
+        writer.structEnd();
+      });
+
+    expectError("ERR_READ_MALFORMED", () => decoded(() => {}));
+    expectError("ERR_READ_MALFORMED", () =>
+      decoded((writer) => writer.fieldI32(TimeUnit.MILLIS, 0)),
+    );
+    expectError("ERR_READ_MALFORMED", () =>
+      decoded((writer) => {
+        writer.fieldStructBegin(TimeUnit.MILLIS);
+        writer.structEnd();
+        writer.fieldStructBegin(TimeUnit.MICROS);
+        writer.structEnd();
+      }),
+    );
+    expectError("ERR_READ_MALFORMED", () =>
+      decoded((writer) => {
+        writer.fieldStructBegin(9);
+        writer.structEnd();
+        writer.fieldStructBegin(TimeUnit.NANOS);
+        writer.structEnd();
+      }),
+    );
+  });
+
+  it("keeps one unknown future union member forward compatible", () => {
+    expect(
+      decodedLogicalType((writer) => {
+        writer.fieldI32(42, 0);
+      }),
+    ).toEqual({ kind: "unknown", id: 42 });
+  });
+
+  it("ignores future fields inside a recognized empty payload struct", () => {
+    expect(
+      decodedLogicalType((writer) => {
+        writer.fieldStructBegin(LogicalTypeId.STRING);
+        writer.fieldString(42, "future");
+        writer.structEnd();
+      }),
+    ).toEqual({ kind: "string" });
+  });
+
+  it("ignores future fields inside parameter and TimeUnit structs", () => {
+    expect(
+      decodedLogicalType((writer) => {
+        writer.fieldStructBegin(LogicalTypeId.INTEGER);
+        writer.fieldI8(1, 32);
+        writer.fieldBool(2, true);
+        writer.fieldString(42, "future");
+        writer.structEnd();
+      }),
+    ).toEqual({ kind: "integer", bitWidth: 32, isSigned: true });
+
+    expect(
+      decodedLogicalType((writer) => {
+        writer.fieldStructBegin(LogicalTypeId.TIME);
+        writer.fieldBool(1, false);
+        writer.fieldStructBegin(2);
+        writer.fieldStructBegin(TimeUnit.MILLIS);
+        writer.fieldString(42, "future");
+        writer.structEnd();
+        writer.structEnd();
+        writer.structEnd();
+      }),
+    ).toEqual({ kind: "time", unit: "millis", isAdjustedToUTC: false });
+  });
+
+  it("keeps the last duplicate parameter value, matching other decoded structs", () => {
+    expect(
+      decodedLogicalType((writer) => {
+        writer.fieldStructBegin(LogicalTypeId.DECIMAL);
+        writer.fieldI32(1, 1);
+        writer.fieldI32(1, 2);
+        writer.fieldI32(2, 4);
+        writer.structEnd();
+      }),
+    ).toEqual({ kind: "decimal", precision: 4, scale: 2 });
+  });
+});
+
 describe("a LogicalType this version cannot read", () => {
   it("keeps a member from a later release, by its field id", () => {
     // 42 stands for a future member this version cannot know a contract for.
@@ -281,20 +436,20 @@ describe("a LogicalType this version cannot read", () => {
     expect(readParquet(file, { types: [future] }).schema.columns[0].type).toBe(future);
   });
 
-  it("reads a union carrying nothing as unnamed", () => {
-    expect(decodedLogicalType(() => {})).toEqual({ kind: "unknown", id: 0 });
+  it("refuses a union carrying nothing", () => {
+    expectError("ERR_READ_MALFORMED", () => decodedLogicalType(() => {}));
   });
 
   it("refuses to guess a resolution the file does not give", () => {
     // TimestampType with its UTC flag but no unit: milliseconds would be a
     // guess, and a wrong one moves every value by a factor of a thousand.
-    expect(
+    expectError("ERR_READ_MALFORMED", () =>
       decodedLogicalType((writer) => {
         writer.fieldStructBegin(LogicalTypeId.TIMESTAMP);
         writer.fieldBool(1, true);
         writer.structEnd();
       }),
-    ).toEqual({ kind: "unknown", id: LogicalTypeId.TIMESTAMP });
+    );
 
     // A TimeUnit union member nobody has defined yet.
     expect(
@@ -324,21 +479,21 @@ describe("a LogicalType this version cannot read", () => {
   it("refuses a parameter that is not the Thrift type the format declares", () => {
     // `IntType.bitWidth` is an i8. A writer that puts an i32 there is not one
     // this reader will second-guess.
-    expect(
+    expectError("ERR_READ_MALFORMED", () =>
       decodedLogicalType((writer) => {
         writer.fieldStructBegin(LogicalTypeId.INTEGER);
         writer.fieldI32(1, 32);
         writer.fieldBool(2, true);
         writer.structEnd();
       }),
-    ).toEqual({ kind: "unknown", id: LogicalTypeId.INTEGER });
+    );
 
     // Same for a whole member that is not the struct it should be.
-    expect(
+    expectError("ERR_READ_MALFORMED", () =>
       decodedLogicalType((writer) => {
         writer.fieldI32(LogicalTypeId.DECIMAL, 0);
       }),
-    ).toEqual({ kind: "unknown", id: 0 });
+    );
   });
 
   it("refuses a bool parameter that is not a bool, rather than reading past it", () => {
@@ -346,34 +501,28 @@ describe("a LogicalType this version cannot read", () => {
     // header — so there is nothing to read *only* when the field really is
     // one. Any other type carries a payload, and claiming the field without
     // consuming that payload leaves the rest of the footer misaligned.
-    expect(
+    expectError("ERR_READ_MALFORMED", () =>
       decodedLogicalType((writer) => {
         writer.fieldStructBegin(LogicalTypeId.INTEGER);
         writer.fieldI8(1, 32);
         writer.fieldString(2, "nope");
         writer.structEnd();
       }),
-    ).toEqual({ kind: "unknown", id: LogicalTypeId.INTEGER });
+    );
   });
 
   it("does not read an absent isSigned as an unsigned column", () => {
-    // The empty struct's stop byte happens to realign the stream, so this one
-    // parses cleanly — into INTEGER(8, unsigned), a column the file never
-    // declared. A required parameter that is not there is not a default: the
-    // flag decides what half the value range means.
-    expect(
+    expectError("ERR_READ_MALFORMED", () =>
       decodedLogicalType((writer) => {
         writer.fieldStructBegin(LogicalTypeId.INTEGER);
         writer.fieldI8(1, 8);
-        writer.fieldStructBegin(2);
-        writer.structEnd();
         writer.structEnd();
       }),
-    ).toEqual({ kind: "unknown", id: LogicalTypeId.INTEGER });
+    );
   });
 
   it("refuses a UTC flag that is not a bool", () => {
-    expect(
+    expectError("ERR_READ_MALFORMED", () =>
       decodedLogicalType((writer) => {
         writer.fieldStructBegin(LogicalTypeId.TIMESTAMP);
         writer.fieldI32(1, 1);
@@ -383,28 +532,25 @@ describe("a LogicalType this version cannot read", () => {
         writer.structEnd();
         writer.structEnd();
       }),
-    ).toEqual({ kind: "unknown", id: LogicalTypeId.TIMESTAMP });
+    );
   });
 
   it("refuses a decimal parameter that is not the Thrift type the format declares", () => {
     // `DecimalType.scale` is an i32, which on the wire is a varint. A binary
     // field there is a length followed by bytes: reading it as a varint takes
     // the length for the scale and leaves the bytes to be parsed as fields.
-    expect(
+    expectError("ERR_READ_MALFORMED", () =>
       decodedLogicalType((writer) => {
         writer.fieldStructBegin(LogicalTypeId.DECIMAL);
         writer.fieldString(1, "nope");
         writer.fieldI32(2, 12);
         writer.structEnd();
       }),
-    ).toEqual({ kind: "unknown", id: LogicalTypeId.DECIMAL });
+    );
   });
 
-  it("names the column rather than the offset when a parameter desyncs a footer", () => {
-    // The whole point of the guards above: a file that gets a parameter wrong
-    // is refused as an annotation nothing claims, with the column named — not
-    // as a Thrift stream that fell apart three fields later.
-    const error = expectError("ERR_READ_UNSUPPORTED", () =>
+  it("reports a malformed annotation at its structural cause", () => {
+    const error = expectError("ERR_READ_MALFORMED", () =>
       readParquet(
         fileWithLogicalType((writer) => {
           writer.fieldStructBegin(LogicalTypeId.INTEGER);
@@ -414,8 +560,7 @@ describe("a LogicalType this version cannot read", () => {
         }),
       ),
     );
-    expect(error.column).toBe("c");
-    expect(error.message).toContain("INTEGER");
+    expect(error.message).toContain("IntType.isSigned");
   });
 });
 
