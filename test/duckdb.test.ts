@@ -7,13 +7,14 @@ import {
   defineSchema,
   float16,
   integer,
+  JSON_NULL,
   readParquet,
   TavolatoError,
   time,
   timestamp,
   uuid,
 } from "../src/index.ts";
-import type { JsonValue, WriterCodec } from "../src/index.ts";
+import type { JsonDocument, WriterCodec } from "../src/index.ts";
 import { cleanupTempDir, duckdb, duckdbRow, sqlPath, writeParquet } from "./_duckdb.ts";
 import { sync } from "./_sync.ts";
 
@@ -376,11 +377,32 @@ describe("json columns", () => {
     });
   });
 
+  it("distinguishes SQL null from the JSON document literal null", () => {
+    const nullable = defineSchema({
+      k: { type: "i64" },
+      doc: { type: "json", optional: true },
+    });
+    const writer = createWriter(nullable);
+    writer.append({ k: 0n, doc: null });
+    writer.append({ k: 1n, doc: JSON_NULL });
+    const file = emit("json-null.parquet", writer.finish());
+
+    expect(
+      duckdb(`
+        SELECT k, doc IS NULL AS sql_null, json_type(doc) AS json_kind
+        FROM read_parquet(${file}) ORDER BY k;
+      `),
+    ).toEqual([
+      { k: 0, sql_null: true, json_kind: null },
+      { k: 1, sql_null: false, json_kind: "NULL" },
+    ]);
+  });
+
   it("carries nested, array and unicode documents past DuckDB and back", () => {
     // The oracle in both directions over one file: DuckDB reads the documents
     // with its own JSON operators, and tavolato reads the very same bytes back
     // into the structures they were written from.
-    const documents: JsonValue[] = [
+    const documents: JsonDocument[] = [
       { nested: { deep: [1, 2, 3] } },
       { unicode: "日本語", emoji: "🎉", ключ: "значение" },
       { list: [1, "two", null, true, {}, []] },

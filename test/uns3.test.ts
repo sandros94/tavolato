@@ -96,6 +96,7 @@ describe("putParquet", () => {
 describe("export map", () => {
   it("keeps the uns3 helper out of the root entry point", () => {
     expect(Object.keys(root).sort()).toEqual([
+      "JSON_NULL",
       "ParquetWriter",
       "TavolatoError",
       "createWriter",

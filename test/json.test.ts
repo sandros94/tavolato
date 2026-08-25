@@ -4,11 +4,12 @@ import {
   defineColumnType,
   defineSchema,
   json,
+  JSON_NULL,
   jsonReviver,
   readParquet,
   readSchema,
 } from "../src/index.ts";
-import type { JsonValue, ParquetSchema, ReadRow, SchemaDefinition } from "../src/index.ts";
+import type { JsonDocument, ParquetSchema, ReadRow, SchemaDefinition } from "../src/index.ts";
 import { decodeUtf8, utf8 } from "../src/internal/bytes.ts";
 import { expectError } from "./_errors.ts";
 import { sync } from "./_sync.ts";
@@ -29,7 +30,7 @@ const schema = defineSchema({ k: { type: "i64" }, doc: { type: "json" } });
 /** Writes one document and reads it back. */
 function roundtrip(document: unknown): unknown {
   const writer = createWriter(schema);
-  writer.append({ k: 0n, doc: document as JsonValue });
+  writer.append({ k: 0n, doc: document as JsonDocument });
   return readParquet(sync(writer.finish())).rows[0].doc;
 }
 
@@ -170,8 +171,8 @@ describe("values a json column refuses", () => {
   });
 
   it("treats a top-level null as the column being null, not as the document null", () => {
-    // A JSON `null` and a Parquet null are the same absence, and `optional` is
-    // where that is spelled. A required column has nowhere to put one.
+    // Ordinary JavaScript `null` chooses Parquet absence, which `optional`
+    // permits. JSON_NULL is the distinct present JSON document literal.
     const optional = defineSchema({ k: { type: "i64" }, doc: { type: "json", optional: true } });
     const { rows } = readParquet(write(optional, [{ k: 0n, doc: null }, { k: 1n }]));
     expect(rows.map((row) => row.doc)).toEqual([null, null]);
@@ -180,6 +181,106 @@ describe("values a json column refuses", () => {
       createWriter(schema).append({ k: 0n, doc: null as never }),
     );
     expect(error.column).toBe("doc");
+  });
+});
+
+describe("top-level JSON null", () => {
+  it("distinguishes the document literal from a Parquet null in the built-in", () => {
+    const declared = defineSchema({
+      k: { type: "i64" },
+      doc: { type: "json", optional: true },
+    });
+    const bytes = write(declared, [
+      { k: 0n, doc: null },
+      { k: 1n, doc: JSON_NULL },
+      { k: 2n, doc: { nested: null } },
+    ]);
+    const documents = readParquet(bytes).rows.map((row) => row.doc);
+    expect(documents).toEqual([null, JSON_NULL, { nested: null }]);
+    expect(documents[1]).toBe(JSON_NULL);
+  });
+
+  it("round-trips by identity through the default value adapter", () => {
+    const value = json();
+    const declared = defineSchema({ doc: { type: value } });
+    const bytes = write(declared, [{ doc: JSON_NULL }]);
+    expect(readParquet(bytes, { types: [value] }).rows[0].doc).toBe(JSON_NULL);
+  });
+
+  it("always spells null without invoking a replacer", () => {
+    let calls = 0;
+    const value = json({
+      replacer: (_key, found) => {
+        calls++;
+        return found;
+      },
+    });
+    const bytes = write(defineSchema({ doc: { type: value } }), [{ doc: JSON_NULL }]);
+    expect(calls).toBe(0);
+    expect(readParquet(bytes, { types: [value] }).rows[0].doc).toBe(JSON_NULL);
+  });
+
+  it("still lets a reviver transform the root null", () => {
+    const value = json<string>({
+      reviver: (key, found) => (key === "" && found === null ? "revived" : found),
+    });
+    const bytes = write(defineSchema({ doc: { type: rawJson } }), [{ doc: "null" }]);
+    expect(readParquet(bytes, { types: [value] }).rows[0].doc).toBe("revived");
+  });
+
+  it("maps a final root null introduced by a reviver to the singleton", () => {
+    const value = json({ reviver: (key, found) => (key === "" ? null : found) });
+    const bytes = write(defineSchema({ doc: { type: rawJson } }), [{ doc: '{"present":true}' }]);
+    expect(readParquet(bytes, { types: [value] }).rows[0].doc).toBe(JSON_NULL);
+  });
+
+  it("refuses the sentinel when it reaches serialization inside an object or array", () => {
+    const builtIn = defineSchema({ doc: { type: "json" } });
+    const adapted = defineSchema({
+      doc: {
+        type: json({ replacer: (key, value) => (key === "sentinel" ? undefined : value) }),
+      },
+    });
+    for (const document of [{ sentinel: JSON_NULL }, [JSON_NULL]]) {
+      expectError("ERR_ROW_VALUE_INVALID", () =>
+        createWriter(builtIn).append({ doc: document as never }),
+      );
+      const error = expectError("ERR_ROW_VALUE_INVALID", () =>
+        createWriter(adapted).append({ doc: document as never }),
+      );
+      expect(error.message).toContain("JSON_NULL");
+    }
+  });
+
+  it("allows an ancestor replacer to remove a subtree containing the sentinel", () => {
+    const value = json({ replacer: (key, found) => (key === "hidden" ? undefined : found) });
+    const document = { kept: true, hidden: { sentinel: JSON_NULL } };
+    const bytes = write(defineSchema({ doc: { type: value } }), [{ doc: document as never }]);
+    expect(readParquet(bytes).rows[0].doc).toEqual({ kept: true });
+  });
+
+  it("allows toJSON to replace a subtree containing the sentinel", () => {
+    const document = {
+      kept: true,
+      hidden: {
+        sentinel: JSON_NULL,
+        toJSON: () => "replaced",
+      },
+    };
+    const bytes = write(defineSchema({ doc: { type: "json" } }), [{ doc: document as never }]);
+    expect(readParquet(bytes).rows[0].doc).toEqual({ kept: true, hidden: "replaced" });
+  });
+
+  it("preserves JSON.stringify's replacer holder binding", () => {
+    const document = { factor: 2, n: 3 };
+    const value = json({
+      replacer: function (key, found) {
+        if (key === "n") expect(this).toBe(document);
+        return found;
+      },
+    });
+    const bytes = write(defineSchema({ doc: { type: value } }), [{ doc: document }]);
+    expect(readParquet(bytes).rows[0].doc).toEqual(document);
   });
 });
 

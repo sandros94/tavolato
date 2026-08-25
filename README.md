@@ -56,16 +56,16 @@ The writer also exposes `schema`, `rowCount` and `finished`.
 
 Eight built-ins, each owning a **bare** physical type — the one a file carries with no annotation at all. Where the writer accepts two inputs, the reader picks one and always picks it:
 
-| `type`      | write                  | read back   | Parquet                            |
-| ----------- | ---------------------- | ----------- | ---------------------------------- |
-| `string`    | `string`               | `string`    | `BYTE_ARRAY` / `STRING`            |
-| `json`      | `JsonValue`            | `JsonValue` | `BYTE_ARRAY` / `JSON`              |
-| `f64`       | `number`               | `number`    | `DOUBLE`                           |
-| `f32`       | `number`               | `number`    | `FLOAT`                            |
-| `i64`       | `bigint`, safe integer | `bigint`    | `INT64`                            |
-| `i32`       | `number` (integer)     | `number`    | `INT32`                            |
-| `bool`      | `boolean`              | `boolean`   | `BOOLEAN`                          |
-| `timestamp` | `Date`, epoch millis   | `Date`      | `INT64` / `TIMESTAMP(UTC, MILLIS)` |
+| `type`      | write                  | read back      | Parquet                            |
+| ----------- | ---------------------- | -------------- | ---------------------------------- |
+| `string`    | `string`               | `string`       | `BYTE_ARRAY` / `STRING`            |
+| `json`      | `JsonDocument`         | `JsonDocument` | `BYTE_ARRAY` / `JSON`              |
+| `f64`       | `number`               | `number`       | `DOUBLE`                           |
+| `f32`       | `number`               | `number`       | `FLOAT`                            |
+| `i64`       | `bigint`, safe integer | `bigint`       | `INT64`                            |
+| `i32`       | `number` (integer)     | `number`       | `INT32`                            |
+| `bool`      | `boolean`              | `boolean`      | `BOOLEAN`                          |
+| `timestamp` | `Date`, epoch millis   | `Date`         | `INT64` / `TIMESTAMP(UTC, MILLIS)` |
 
 `optional: true` makes a column nullable — real Parquet `OPTIONAL` repetition with definition levels, not a sentinel. `null`, `undefined` and an absent key all write a null; a null reads back as `null` with the key always present. Omitting a value for a required column throws.
 
@@ -79,20 +79,20 @@ Parquet stores a column twice over: a **physical type**, which says how the byte
 
 Each in-box factory maps by one rule: the value must survive the round trip unchanged.
 
-| factory                                                | JavaScript  | Parquet                                           |
-| ------------------------------------------------------ | ----------- | ------------------------------------------------- |
-| `date()` or `date({ as: "date" })`                     | `Date`      | `INT32` / `DATE`                                  |
-| `date({ as: "number" })`                               | `number`    | `INT32` / `DATE`                                  |
-| `decimal({ precision, scale })`                        | `string`    | `INT32`, `INT64` or minimal `FLBA(n)` / `DECIMAL` |
-| `uuid()`                                               | `string`    | `FLBA(16)` / `UUID`                               |
-| `time({ unit: "millis", isAdjustedToUTC })`            | `number`    | `INT32` / `TIME(MILLIS, …)`                       |
-| `time({ unit: "micros" \| "nanos", isAdjustedToUTC })` | `bigint`    | `INT64` / `TIME(…, …)`                            |
-| `timestamp({ unit, isAdjustedToUTC })`                 | `bigint`    | `INT64` / `TIMESTAMP(…, …)`                       |
-| `float16()`                                            | `number`    | `FLBA(2)` / `FLOAT16`                             |
-| `integer({ bitWidth: 8 \| 16 \| 32, signed })`         | `number`    | `INT32` / `INTEGER(…)`                            |
-| `integer({ bitWidth: 64, signed })`                    | `bigint`    | `INT64` / `INTEGER(64, …)`                        |
-| `json()` or `json({ as: "value", reviver, replacer })` | `JsonValue` | `BYTE_ARRAY` / `JSON`                             |
-| `json({ as: "text" })`                                 | `string`    | `BYTE_ARRAY` / `JSON`                             |
+| factory                                                | JavaScript     | Parquet                                           |
+| ------------------------------------------------------ | -------------- | ------------------------------------------------- |
+| `date()` or `date({ as: "date" })`                     | `Date`         | `INT32` / `DATE`                                  |
+| `date({ as: "number" })`                               | `number`       | `INT32` / `DATE`                                  |
+| `decimal({ precision, scale })`                        | `string`       | `INT32`, `INT64` or minimal `FLBA(n)` / `DECIMAL` |
+| `uuid()`                                               | `string`       | `FLBA(16)` / `UUID`                               |
+| `time({ unit: "millis", isAdjustedToUTC })`            | `number`       | `INT32` / `TIME(MILLIS, …)`                       |
+| `time({ unit: "micros" \| "nanos", isAdjustedToUTC })` | `bigint`       | `INT64` / `TIME(…, …)`                            |
+| `timestamp({ unit, isAdjustedToUTC })`                 | `bigint`       | `INT64` / `TIMESTAMP(…, …)`                       |
+| `float16()`                                            | `number`       | `FLBA(2)` / `FLOAT16`                             |
+| `integer({ bitWidth: 8 \| 16 \| 32, signed })`         | `number`       | `INT32` / `INTEGER(…)`                            |
+| `integer({ bitWidth: 64, signed })`                    | `bigint`       | `INT64` / `INTEGER(64, …)`                        |
+| `json()` or `json({ as: "value", reviver, replacer })` | `JsonDocument` | `BYTE_ARRAY` / `JSON`                             |
+| `json({ as: "text" })`                                 | `string`       | `BYTE_ARRAY` / `JSON`                             |
 
 ```ts
 date(); // new Date(Date.UTC(2026, 7, 24)) — exactly UTC midnight, never a truncated instant
@@ -167,7 +167,17 @@ writer.append({ at: Date.now(), payload: { user: 1, tags: ["a"] } });
 // reads back as { user: 1, tags: ["a"] }
 ```
 
-The built-in `json` type and `json()` use the **document value** in and out: `JSON.stringify` on write, `JSON.parse` on read. The round-trip semantics are therefore **JSON's, not tavolato's** — `NaN` and infinities become `null`, an `undefined` property vanishes, a `Date` becomes its ISO string, a `Map` becomes `{}`, and `toJSON()` is honoured. A `bigint` or a value that serializes to nothing is a typed error. A top-level `null` means the Parquet column is null; use the source text `"null"` when that distinction matters.
+The built-in `json` type and `json()` use the **document value** in and out: `JSON.stringify` on write, `JSON.parse` on read. The round-trip semantics are therefore **JSON's, not tavolato's** — `NaN` and infinities become JSON nulls, an `undefined` property vanishes, a `Date` becomes its ISO string, a `Map` becomes `{}`, and `toJSON()` is honoured. A `bigint` or a value that serializes to nothing is a typed error.
+
+At the document boundary, `null` already means a Parquet/SQL null. Use the exported singleton `JSON_NULL` for the distinct JSON document literal `null`; it writes the bytes `null` and reads back by identity. Nested ordinary nulls stay ordinary nulls. A nested `JSON_NULL` that reaches serialization is rejected, but normal JSON semantics still apply: a `replacer` or `toJSON()` may remove its containing subtree before it is visited. This keeps SQL engines able to distinguish `doc IS NULL` from `json_type(doc) = 'NULL'`.
+
+```ts
+import { JSON_NULL } from "tavolato";
+
+writer.append({ payload: null }); // Parquet/SQL null; optional column only
+writer.append({ payload: JSON_NULL }); // present JSON document: null
+writer.append({ payload: { nested: null } }); // ordinary nested JSON null
+```
 
 `json({ as: "text" })` instead accepts and returns a complete JSON source string. It validates syntax and UTF-8 on both sides while preserving valid text exactly, including whitespace, key order, and `"null"`; it never parses and re-stringifies. Because no value is materialized, text mode refuses `reviver` and `replacer` options.
 

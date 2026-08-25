@@ -8,6 +8,7 @@ import {
   float16,
   integer,
   json,
+  JSON_NULL,
   jsonReviver,
   readParquet,
   readRowGroups,
@@ -19,9 +20,10 @@ import type {
   DateOptions,
   DateRepresentation,
   DateValue,
+  JsonDocument,
+  JsonNull,
   JsonOptions,
   JsonRepresentation,
-  JsonValue,
   ParquetFile,
   ParquetRowGroups,
   ReadRow,
@@ -226,7 +228,7 @@ const read = readParquet(new Uint8Array()).rows as ReadRowOf<typeof schema.defin
 
 const first = read[0];
 const asString: string = first.s;
-const asJson: JsonValue = first.j; // a json column is the document, both ways
+const asJson: JsonDocument = first.j; // a json column is the document, both ways
 const asNumber: number = first.f;
 const asSingle: number = first.g;
 const asBigint: bigint = first.i;
@@ -393,9 +395,9 @@ const notMaybe: string = logicalRow.maybe;
 void [notPrice, notDefaultDayCount, notDayDate, notRawBytes, notMaybe];
 
 /*
- * The `json` column type. It defaults to `JsonValue` on both sides, and takes a
+ * The `json` column type. It defaults to `JsonDocument` on both sides, and takes a
  * type argument for documents with a shape — which is also the way out of
- * `JsonValue`'s index signature, since an `interface` cannot satisfy one.
+ * `JsonValue`'s recursive index signature, since an `interface` cannot satisfy one.
  */
 interface Payload {
   user: number;
@@ -425,7 +427,7 @@ documentWriter.append({ loose: {}, explicit: {}, shaped: { user: "one", tags: []
 // `ReadRowOf` is where that type comes back.
 const documentRows = readParquet(new Uint8Array(), { types: [json()] })
   .rows as unknown as ReadRowOf<typeof documents.definition>[];
-const asLoose: JsonValue = documentRows[0].loose;
+const asLoose: JsonDocument = documentRows[0].loose;
 const asShaped: Payload = documentRows[0].shaped;
 const asTag: string = documentRows[0].shaped.tags[0];
 void [asLoose, asShaped, asTag];
@@ -456,4 +458,34 @@ const jsonFromOptions = (options: JsonOptions) => json(options);
 // @ts-expect-error representation options are immutable contracts
 jsonOptions.reviver = jsonReviver;
 void [jsonRepresentation, jsonOptions, jsonFromOptions];
+
+const jsonNullSchema = defineSchema({
+  required: { type: "json" },
+  optional: { type: "json", optional: true },
+  adapted: { type: json() },
+  asserted: { type: json<Payload>() },
+});
+const jsonNullWriter = createWriter(jsonNullSchema);
+jsonNullWriter.append({
+  required: JSON_NULL,
+  optional: null,
+  adapted: JSON_NULL,
+  asserted: { user: 1, tags: [] },
+});
+jsonNullWriter.append({
+  // @ts-expect-error ordinary null means an absent Parquet value, not a required JSON document
+  required: null,
+  optional: null,
+  adapted: {},
+  asserted: { user: 1, tags: [] },
+});
+// @ts-expect-error generic json<TValue> remains the caller's asserted shape without sentinel widening
+jsonNullWriter.append({ required: {}, optional: null, adapted: {}, asserted: JSON_NULL });
+
+const jsonDocument: JsonDocument = JSON_NULL;
+const jsonNull: JsonNull = JSON_NULL;
+const nestedJsonNull: JsonDocument = { nested: null };
+// @ts-expect-error top-level ordinary null is not a JSON document value
+const absentJsonDocument: JsonDocument = null;
+void [jsonDocument, jsonNull, nestedJsonNull, absentJsonDocument];
 void notText;

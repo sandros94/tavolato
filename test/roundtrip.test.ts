@@ -16,7 +16,7 @@ import {
 } from "../src/index.ts";
 import type {
   AnyLogicalAdapter,
-  JsonValue,
+  JsonDocument,
   ParquetSchema,
   ReadOptions,
   ReadRow,
@@ -326,7 +326,7 @@ describe.each(LEGS)("$label", ({ codec }) => {
       // Every shape JSON has, including the scalars a document is allowed to be
       // all by itself. What comes back is deep-equal to what went in — the same
       // guarantee the other column types make, over a value with an inside.
-      const documents: JsonValue[] = [
+      const documents: JsonDocument[] = [
         {},
         [],
         42,
@@ -370,7 +370,7 @@ describe.each(LEGS)("$label", ({ codec }) => {
       const schema = defineSchema({ k: { type: "i64" }, doc: { type: "json" } });
       const document = { b: [1, { c: "d" }], a: null };
       const first = roundtrip(schema, [{ k: 0n, doc: document }]);
-      const second = roundtrip(schema, [{ k: 0n, doc: first.rows[0].doc as JsonValue }]);
+      const second = roundtrip(schema, [{ k: 0n, doc: first.rows[0].doc as JsonDocument }]);
       expect(second.rows).toEqual(first.rows);
     });
 

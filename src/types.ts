@@ -1,3 +1,5 @@
+import type { JsonNull } from "./json-null.ts";
+
 /**
  * The column types tavolato writes.
  *
@@ -43,6 +45,15 @@ export type JsonValue =
   | null
   | readonly JsonValue[]
   | { readonly [key: string]: JsonValue };
+
+/**
+ * A complete document accepted by a value-mode `json` column.
+ *
+ * Nested `null` remains an ordinary JSON value. At the top level, JavaScript
+ * `null` means a Parquet null, so the JSON document literal uses
+ * {@link JsonNull} instead.
+ */
+export type JsonDocument = Exclude<JsonValue, null> | JsonNull;
 
 /*
  * ---------------------------------------------------------------------------
@@ -216,7 +227,7 @@ export type ColumnInput<TType extends ColumnType | AnyLogicalAdapter> =
   TType extends LogicalAdapter<infer TIn, unknown>
     ? TIn
     : TType extends "json"
-      ? JsonValue
+      ? JsonDocument
       : TType extends "string"
         ? string
         : TType extends "f64" | "f32" | "i32"
@@ -256,7 +267,7 @@ export type Row<TDefinition extends SchemaDefinition> = {
  * | tavolato    | read back as |
  * | ----------- | ------------ |
  * | `string`    | `string`     |
- * | `json`      | `JsonValue`  |
+ * | `json`      | `JsonDocument` |
  * | `f64`       | `number`     |
  * | `f32`       | `number`     |
  * | `i64`       | `bigint`     |
@@ -270,7 +281,7 @@ export type ColumnOutput<TType extends ColumnType | AnyLogicalAdapter> =
   TType extends LogicalAdapter<never, infer TOut>
     ? TOut
     : TType extends "json"
-      ? JsonValue
+      ? JsonDocument
       : TType extends "string"
         ? string
         : TType extends "f64" | "f32" | "i32"
@@ -287,9 +298,9 @@ export type ColumnOutput<TType extends ColumnType | AnyLogicalAdapter> =
  * Any value the reader can produce for a **built-in** column type; `null` for a
  * null in an optional column.
  *
- * {@link JsonValue} carries the scalars — `string`, `number`, `boolean` and
- * `null` — and brings the objects and arrays a `json` column parses to along
- * with them.
+ * {@link JsonValue} carries the nested scalars, objects and arrays a `json`
+ * column parses. {@link JsonNull} represents the top-level document literal;
+ * ordinary `null` remains the absence of an optional Parquet value.
  *
  * `Uint8Array` is reserved for a future raw-binary column type and is listed
  * here so that adding one is not a breaking change to every `switch` over a
@@ -300,7 +311,7 @@ export type ColumnOutput<TType extends ColumnType | AnyLogicalAdapter> =
  * `read` returns, which the in-box adapters keep inside this union. One of your
  * own is free not to; {@link ReadRowOf} is where its real type is recovered.
  */
-export type ReadValue = JsonValue | bigint | Date | Uint8Array;
+export type ReadValue = JsonValue | JsonNull | bigint | Date | Uint8Array;
 
 /**
  * One row produced by the reader, keyed by column name in file order.

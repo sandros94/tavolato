@@ -7,6 +7,7 @@ import {
   date,
   decimal,
   integer,
+  JSON_NULL,
   readParquet,
   readRowGroups,
   time,
@@ -150,6 +151,24 @@ describe("files DuckDB writes inside the subset", () => {
         π: "日本",
       })),
     );
+  });
+
+  it("distinguishes DuckDB SQL null from its JSON document literal null", () => {
+    const bytes = copyTo(
+      "cross-json-null.parquet",
+      `SELECT k, CASE WHEN k = 0 THEN NULL::JSON ELSE 'null'::JSON END AS j
+       FROM range(2) tbl(k)`,
+    );
+    const { schema, rows } = readParquet(bytes);
+    expect(schema.columns).toEqual([
+      { name: "k", type: "i64", optional: true },
+      { name: "j", type: "json", optional: true },
+    ]);
+    expect(rows).toEqual([
+      { k: 0n, j: null },
+      { k: 1n, j: JSON_NULL },
+    ]);
+    expect(rows[1].j).toBe(JSON_NULL);
   });
 
   it("hands a DuckDB document back to DuckDB unchanged", () => {

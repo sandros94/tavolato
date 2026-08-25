@@ -5,7 +5,14 @@ import {
   logicalTypePhysicalProblem,
 } from "./internal/logical.ts";
 import { adapterUnsupported, describe, malformed, TavolatoError } from "./error.ts";
-import type { Annotation, JsonValue, LogicalAdapter, PhysicalKind, TimeUnitName } from "./types.ts";
+import { JSON_NULL } from "./json-null.ts";
+import type {
+  Annotation,
+  JsonDocument,
+  LogicalAdapter,
+  PhysicalKind,
+  TimeUnitName,
+} from "./types.ts";
 
 /*
  * ---------------------------------------------------------------------------
@@ -859,13 +866,32 @@ export const jsonReviver: JsonHook = (key, value) => (isDangerousKey(key) ? unde
  * @internal
  */
 export function jsonTextOf(value: unknown, column?: string, replacer?: JsonHook): string {
+  if (value === JSON_NULL) return "null";
+  const checkedReplacer: JsonHook = function (this: unknown, key, found) {
+    if (found === JSON_NULL) {
+      throw new TavolatoError(
+        "JSON_NULL is only valid as the complete top-level json document",
+        "ERR_ROW_VALUE_INVALID",
+        column,
+      );
+    }
+    const replaced = replacer === undefined ? found : Reflect.apply(replacer, this, [key, found]);
+    if (replaced === JSON_NULL) {
+      throw new TavolatoError(
+        "A json replacer cannot introduce JSON_NULL below the document boundary",
+        "ERR_ROW_VALUE_INVALID",
+        column,
+      );
+    }
+    return replaced;
+  };
   let text: string | undefined;
   try {
-    text = JSON.stringify(value, replacer);
+    text = JSON.stringify(value, checkedReplacer);
   } catch (cause) {
-    // A bigint anywhere in the document is the case that gets here: JSON has no
-    // spelling for one, and picking a string or a lossy number on somebody's
-    // behalf is exactly the guess tavolato refuses everywhere else.
+    // Bigints and nested JSON_NULL sentinels are the in-box cases that get
+    // here; caller hooks and cyclic documents may throw too. None may escape
+    // as an untyped platform or callback error.
     throw new TavolatoError(
       `A json value must be something JSON.stringify accepts, and ${describe(value)} is not: ${
         cause instanceof Error ? cause.message : describe(cause)
@@ -903,7 +929,8 @@ export function jsonValueOf(
   reviver: JsonHook = jsonReviver,
 ): unknown {
   try {
-    return JSON.parse(text, reviver) as unknown;
+    const value = JSON.parse(text, reviver) as unknown;
+    return value === null ? JSON_NULL : value;
   } catch (cause) {
     throw invalidJsonSource(text, column, cause);
   }
@@ -1002,8 +1029,8 @@ function jsonSourceBytesOf(value: unknown): Uint8Array {
  * every other byte of valid source rather than normalizing it.
  *
  * In value mode, `TValue` is what your hooks map to and from, and defaults to
- * {@link JsonValue}. Name it when your documents have a shape — that is also
- * the way out of `JsonValue`'s index-signature strictness, which an `interface`
+ * {@link JsonDocument}. Name it when your documents have a shape — that is also
+ * the way out of its recursive index-signature strictness, which an `interface`
  * cannot satisfy.
  *
  * @example
@@ -1019,14 +1046,16 @@ function jsonSourceBytesOf(value: unknown): Uint8Array {
 /*
  * Overloads rather than one default type argument: a defaulted parameter
  * does not survive `defineSchema`'s `const` inference, and a `json()` column
- * would come back out of `ReadRowOf` as `any` instead of a `JsonValue`. The
+ * would come back out of `ReadRowOf` as `any` instead of a `JsonDocument`. The
  * concrete signature is the one an unparameterized call picks; supplying a type
  * argument skips it on arity and lands on the generic one.
  */
 export function json(options: JsonTextOptions): LogicalAdapter<string, string>;
-export function json(options?: JsonValueOptions): LogicalAdapter<JsonValue, JsonValue>;
+export function json(options?: JsonValueOptions): LogicalAdapter<JsonDocument, JsonDocument>;
 export function json<TValue>(options?: JsonValueOptions): LogicalAdapter<TValue, TValue>;
-export function json(options: JsonOptions): LogicalAdapter<JsonValue | string, JsonValue | string>;
+export function json(
+  options: JsonOptions,
+): LogicalAdapter<JsonDocument | string, JsonDocument | string>;
 export function json<TValue>(
   options: JsonOptions = {},
 ): LogicalAdapter<TValue, TValue> | LogicalAdapter<string, string> {

@@ -489,7 +489,8 @@ function toValue(column: ReadColumn, values: ColumnValues, index: number): ReadV
       const text = decodeUtf8(values.items[index]);
       // A `string` column is the text; a `json` column is the document it
       // spells. Parsed with the default reviver, so what comes back is a
-      // `JsonValue` — the cast is that, and only that.
+      // `JsonDocument`, including JSON_NULL for the literal null — the cast is
+      // that, and only that.
       return type === "json" ? (jsonValueOf(text, column.name) as ReadValue) : text;
     }
     case "i64": {

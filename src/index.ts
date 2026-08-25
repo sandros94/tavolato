@@ -2,6 +2,8 @@ export { defineSchema } from "./schema.ts";
 export { readParquet, readRowGroups, readSchema } from "./reader.ts";
 export { createWriter, ParquetWriter } from "./writer.ts";
 export type { SyncParquetWriter } from "./writer.ts";
+export { JSON_NULL } from "./json-null.ts";
+export type { JsonNull } from "./json-null.ts";
 export {
   date,
   decimal,
