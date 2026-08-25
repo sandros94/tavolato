@@ -229,7 +229,7 @@ describe("files DuckDB compresses, read with a registered decompressor", () => {
 
       const refusal = expectError("ERR_READ_UNSUPPORTED", () => readParquet(bytes));
       expect(refusal.message).toContain(`compressed with ${name}`);
-      expect(refusal.message).toContain(`register a decompressor for ${name}`);
+      expect(refusal.message).toContain(`Register a decompressor for ${name}`);
 
       const { rows } = sync(readParquet(bytes, { codecs: { [name]: codec } }));
       expect(rows).toHaveLength(200);
@@ -473,7 +473,7 @@ describe("files DuckDB writes outside the subset", () => {
       const bytes = copyTo(file, select, options);
       const error = expectError("ERR_READ_UNSUPPORTED", () => readParquet(bytes));
       expect(error.message).toContain(names);
-      expect(error.message).toContain("tavolato only reads the files it writes");
+      expect(error.message).toMatch(/^Cannot read .+\. [A-Z].+\.$/);
     });
   }
 });
@@ -506,7 +506,7 @@ describe("files DuckDB annotates, read with a matching column type", () => {
     ];
 
     const refusal = expectError("ERR_READ_UNSUPPORTED", () => readParquet(bytes));
-    expect(refusal.message).toContain("pass a matching type in ReadOptions.types");
+    expect(refusal.message).toContain("Pass a matching type in ReadOptions.types");
 
     const { schema, rows } = readParquet(bytes, { types });
     expect(schema.columns.map((column) => (column.type as { name: string }).name)).toEqual([

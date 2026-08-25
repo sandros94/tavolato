@@ -418,9 +418,9 @@ describe("a codec that fails while writing", () => {
 describe("a file compressed with a codec that is not registered", () => {
   it("is refused by name, and says how to read it anyway", () => {
     const error = expectError("ERR_READ_UNSUPPORTED", () => readParquet(compressed()));
-    expect(error.message).toContain("compressed with GZIP");
-    expect(error.message).toContain("tavolato only reads the files it writes");
-    expect(error.message).toContain("register a decompressor for GZIP in ReadOptions.codecs");
+    expect(error.message).toBe(
+      'Cannot read column "n", compressed with GZIP. Register a decompressor for GZIP in ReadOptions.codecs to read it anyway.',
+    );
     expect(error.column).toBe("n");
   });
 
@@ -452,7 +452,7 @@ describe("a file compressed with a codec that is not registered", () => {
     patched[differing[0]] = 18; // zigzag(9): one past LZ4_RAW
     const error = expectError("ERR_READ_UNSUPPORTED", () => readParquet(patched));
     expect(error.message).toContain("codec 9");
-    expect(error.message).not.toContain("register a decompressor");
+    expect(error.message).not.toContain("Register a decompressor");
   });
 });
 

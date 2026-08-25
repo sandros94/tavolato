@@ -349,11 +349,11 @@ describe("unsupported features", () => {
     expect(error.column).toBe("n");
   });
 
-  it("always says that tavolato only reads what it writes", () => {
+  it("states when a feature is outside the supported Parquet subset", () => {
     const error = expectError("ERR_READ_UNSUPPORTED", () =>
       readParquet(patch(minimal(), ENCODING_VALUE, 0x00, 0x10)),
     );
-    expect(error.message).toContain("tavolato only reads the files it writes");
+    expect(error.message).toContain("outside tavolato's supported Parquet subset");
   });
 });
 
@@ -396,7 +396,7 @@ describe("types the reader refuses outright", () => {
     const error = expectError("ERR_READ_UNSUPPORTED", () => readParquet(bytes));
     expect(error.message).toContain("DECIMAL(precision=9, scale=2)");
     expect(error.message).toContain("INT32");
-    expect(error.message).toContain("pass a matching type in ReadOptions.types");
+    expect(error.message).toContain("Pass a matching type in ReadOptions.types");
     expect(error.column).toBe("p");
 
     // A type that claims a *different* decimal does not claim this one.

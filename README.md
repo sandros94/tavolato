@@ -411,12 +411,13 @@ try {
   writer.append({ at: Date.now(), n: "oops" });
 } catch (error) {
   if (isTavolatoError(error, "ERR_ROW_VALUE_INVALID")) {
-    console.error(error.column); // "n"
+    console.error(String(error));
+    // TavolatoError [ERR_ROW_VALUE_INVALID]: Column "n" of type i64 expects a bigint or a safe integer number, received "oops"
   }
 }
 ```
 
-Every error thrown by the library is a `TavolatoError` carrying a `code` and, where the problem belongs to one column, its `column`. New codes may be added in a minor version, so match on the ones you handle rather than assuming the list is closed.
+Every error thrown by the library is a `TavolatoError` carrying a `code` and, where the problem belongs to one column, its `column`. Native string and stack output includes the code as `TavolatoError [ERR_CODE]: message`; programmatic handling should still use `code` or `isTavolatoError`. New codes may be added in a minor version, so match on the ones you handle rather than assuming the list is closed.
 
 | family                    | thrown by                                                                            |
 | ------------------------- | ------------------------------------------------------------------------------------ |
@@ -431,8 +432,7 @@ Every error thrown by the library is a `TavolatoError` carrying a `code` and, wh
 An `ERR_READ_UNSUPPORTED` names the feature it found, and names the remedy where there is one: a compressed column says to register a decompressor in `ReadOptions.codecs`, an annotated one names the annotation with its parameters and says to pass a matching type in `ReadOptions.types`.
 
 ```
-Cannot read column "price", a INT64 annotated DECIMAL(precision=18, scale=2): tavolato only
-reads the files it writes — … — pass a matching type in ReadOptions.types to read it anyway
+TavolatoError [ERR_READ_UNSUPPORTED]: Cannot read column "price", a INT64 annotated DECIMAL(precision=18, scale=2). Pass a matching type in ReadOptions.types to read it anyway.
 ```
 
 **Malformed input is a typed throw, never a hang or a bare `RangeError`** — wrong magic, a truncated stream, a length that does not fit, a footer that contradicts itself. That covers the _contents_ of any real `Uint8Array`, however hostile. Two carve-outs, and both are code that is not tavolato's:

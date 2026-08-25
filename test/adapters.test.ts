@@ -568,7 +568,7 @@ describe("claiming a column", () => {
     // hands back neither a guess nor the raw bytes.
     const error = expectError("ERR_READ_UNSUPPORTED", () => readParquet(bytes));
     expect(error.message).toContain("an unannotated FIXED_LEN_BYTE_ARRAY(4)");
-    expect(error.message).toContain("pass a matching type in ReadOptions.types");
+    expect(error.message).toContain("Pass a matching type in ReadOptions.types");
   });
 
   it("refuses a types option that is not made of column types", () => {

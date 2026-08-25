@@ -31,6 +31,19 @@ export type TavolatoErrorCode =
   | "ERR_STORE_RANGE_UNSATISFIED" // a ranged read came back with bytes other than the ones asked for
   | (string & {}); // forward-compatible escape hatch
 
+const SAFE_CODE_CHARACTER = /^[A-Za-z0-9_.:-]$/;
+
+/** Keeps a caller-authored forward-compatible code inside one visible name delimiter. */
+function renderedCode(code: string): string {
+  let rendered = "";
+  for (const character of code) {
+    rendered += SAFE_CODE_CHARACTER.test(character)
+      ? character
+      : `\\u{${character.codePointAt(0)!.toString(16)}}`;
+  }
+  return rendered;
+}
+
 /**
  * Base error class for all tavolato errors. Every error thrown by the library
  * is an instance of `TavolatoError`, so a single `instanceof` check is enough
@@ -56,7 +69,7 @@ export class TavolatoError<TCode extends TavolatoErrorCode = TavolatoErrorCode> 
 
   constructor(message: string, code: TCode, column?: string, cause?: unknown) {
     super(message);
-    this.name = "TavolatoError";
+    this.name = `TavolatoError [${renderedCode(code)}]`;
     this.code = code;
     this.column = column;
     this.cause = cause;
@@ -134,8 +147,7 @@ export function malformed(message: string, column?: string, cause?: unknown): Ta
 
 /**
  * The file is valid Parquet, but uses something tavolato never writes and
- * therefore refuses to read. `found` names the offending feature; the rest of
- * the sentence — the scope promise — is worded here, once.
+ * therefore refuses to read. `found` names the offending feature.
  *
  * `remedy` is appended where the refusal is one the caller can lift: a codec
  * tavolato knows by name but cannot implement, or an annotation whose
@@ -144,13 +156,11 @@ export function malformed(message: string, column?: string, cause?: unknown): Ta
  * @internal
  */
 export function unsupported(found: string, column?: string, remedy?: string): TavolatoError {
-  return new TavolatoError(
-    `Cannot read ${found}: tavolato only reads the files it writes — flat schemas of string, json, f64, f32, i64, i32, bool and timestamp columns, PLAIN encoded, UNCOMPRESSED, in v1 data pages${
-      remedy === undefined ? "" : ` — ${remedy}`
-    }`,
-    "ERR_READ_UNSUPPORTED",
-    column,
-  );
+  const next =
+    remedy === undefined
+      ? "This feature is outside tavolato's supported Parquet subset."
+      : `${remedy.charAt(0).toUpperCase()}${remedy.slice(1)}.`;
+  return new TavolatoError(`Cannot read ${found}. ${next}`, "ERR_READ_UNSUPPORTED", column);
 }
 
 /** The file feature and remedy carried out of an in-box adapter's `read`. @internal */
