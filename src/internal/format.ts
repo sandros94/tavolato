@@ -1394,16 +1394,26 @@ function decodeRowGroup(reader: CompactReader): RowGroupInfo {
       }
     }
   });
+  const requiredColumns = requiredField(columns, "RowGroup.columns");
+  const requiredTotalByteSize = requiredField(totalByteSize, "RowGroup.total_byte_size");
+  let chunkTotal = 0n;
+  for (const chunk of requiredColumns) chunkTotal += BigInt(chunk.totalUncompressedSize);
+  if (chunkTotal !== BigInt(requiredTotalByteSize)) {
+    throw malformed(
+      `A row group declares total_byte_size ${requiredTotalByteSize} but its column chunks add up to ${chunkTotal}`,
+    );
+  }
   return {
-    columns: requiredField(columns, "RowGroup.columns"),
-    totalByteSize: requiredField(totalByteSize, "RowGroup.total_byte_size"),
+    columns: requiredColumns,
+    totalByteSize: requiredTotalByteSize,
     numRows: requiredField(numRows, "RowGroup.num_rows"),
   };
 }
 
 /** Parses the `FileMetaData` footer struct. */
 export function decodeFileMetadata(bytes: Uint8Array): FileMetadata {
-  const reader = new CompactReader(new ByteReader(bytes));
+  const input = new ByteReader(bytes);
+  const reader = new CompactReader(input);
   let version: number | undefined;
   let schema: SchemaElement[] | undefined;
   let numRows: number | undefined;
@@ -1456,6 +1466,10 @@ export function decodeFileMetadata(bytes: Uint8Array): FileMetadata {
       }
     }
   });
+
+  if (input.remaining !== 0) {
+    throw malformed(`FileMetaData has ${input.remaining} trailing bytes after its Thrift struct`);
+  }
 
   const requiredVersion = requiredField(version, "FileMetaData.version");
   if (requiredVersion !== 1 && requiredVersion !== 2) {

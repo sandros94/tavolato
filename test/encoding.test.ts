@@ -210,6 +210,30 @@ describe("RLE / bit-packing hybrid decoding", () => {
     expect(decodeRleBitPackedHybrid(unhex("03 05"), 1, 3)).toEqual([1, 0, 1]);
   });
 
+  it("refuses trailing encoded runs or bytes after the requested levels", () => {
+    expectError("ERR_READ_MALFORMED", () => decodeRleBitPackedHybrid(unhex("03 05 10 01"), 1, 3));
+    expectError("ERR_READ_MALFORMED", () => decodeRleBitPackedHybrid(unhex("03 05 ff"), 1, 3));
+  });
+
+  it("refuses an RLE run that exceeds the requested level count", () => {
+    expectError("ERR_READ_MALFORMED", () => decodeRleBitPackedHybrid(unhex("10 01"), 1, 3));
+  });
+
+  it("accepts a final bit-packed run padded to 32 groups", () => {
+    const bytes = new Uint8Array([0x41, 0x05, ...new Uint8Array(31)]);
+    expect(decodeRleBitPackedHybrid(bytes, 1, 3)).toEqual([1, 0, 1]);
+  });
+
+  it("refuses a bit-packed run beyond Parquet's signed-i32 value limit", () => {
+    // 268,435,456 groups => 2,147,483,648 values; the header is enough to
+    // reject it, without reading or allocating its impossible body.
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      decodeRleBitPackedHybrid(new Uint8Array([0x81, 0x80, 0x80, 0x80, 0x02]), 1, 1, "n"),
+    );
+    expect(error.message).toContain("268435456 groups");
+    expect(error.column).toBe("n");
+  });
+
   it("decodes a mix of bit-packed and RLE runs", () => {
     expect(decodeRleBitPackedHybrid(unhex("03 aa 10 01 03 00"), 1, 17)).toEqual([
       0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0,

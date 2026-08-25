@@ -561,7 +561,7 @@ export function createParquetStore(
       // A cursor per group, exactly as `readRowGroups` gives each of its steps
       // one: they are independent reads that happen to share a buffer.
       await readRowGroup(
-        new ByteReader(bytes),
+        new ByteReader(bytes.subarray(0, footer.pageBytesEnd), 0, undefined, MAGIC.length),
         footer,
         footer.rowGroups[index],
         rows,
@@ -770,15 +770,13 @@ function resolveGroups(groups: readonly number[], count: number): readonly numbe
  */
 function chunkSpan(chunk: ColumnChunkInfo, column: string, footerStart: number): Span {
   const size = chunk.totalCompressedSize;
-  if (size === 0) {
-    throw malformed(
-      `Column "${column}" states no usable total_compressed_size, so a read that fetches its bytes cannot tell where the chunk ends`,
-      column,
-    );
-  }
   const start = Math.min(chunk.dictionaryPageOffset ?? chunk.dataPageOffset, chunk.dataPageOffset);
   const end = start + size;
-  if (start < MAGIC.length || end > footerStart) {
+  const outside =
+    !Number.isSafeInteger(end) ||
+    end > footerStart ||
+    (size === 0 ? start < 0 : start < MAGIC.length);
+  if (outside) {
     throw malformed(
       `Column "${column}" holds ${size} bytes at offset ${start}, which is not inside the ${footerStart} bytes of pages this file has`,
       column,
@@ -800,6 +798,7 @@ function coalesce(spans: readonly Span[]): readonly Span[] {
   const sorted = [...spans].sort((left, right) => left.start - right.start);
   const ranges: Span[] = [];
   for (const span of sorted) {
+    if (span.start === span.end) continue;
     const last = ranges[ranges.length - 1];
     if (last !== undefined && span.start <= last.end) {
       if (span.end > last.end) ranges[ranges.length - 1] = { start: last.start, end: span.end };
@@ -814,12 +813,12 @@ function coalesce(spans: readonly Span[]): readonly Span[] {
  * Lays one row group's chunks out in a buffer of their own and points the group
  * at them.
  *
- * The decode seeks to absolute file offsets, and a sparse read has no file to
- * seek in — so the bytes that *were* fetched are copied into a window, and the
- * group's chunk offsets are rewritten to where they landed in it. The decode
- * that follows is the same `readRowGroup` a local read runs, over a buffer that
- * holds the wanted chunks and nothing else: memory is the bytes fetched for one
- * group, not the size of the object.
+ * A sparse read has no whole file behind its footer offsets, so the bytes that
+ * were fetched are copied into a window and each chunk offset is rewritten to
+ * where its bounded view begins. The decode that follows is the same
+ * `readRowGroup` a local read runs, over a buffer that holds the wanted chunks
+ * and nothing else: memory is the bytes fetched for one group, not the size of
+ * the object.
  *
  * Only the selected chunks move. The rest keep their file offsets, which is
  * harmless because nothing reads them — and keeps the chunk list the length the
@@ -839,7 +838,7 @@ function windowOf(
   for (const [position, column] of footer.columns.entries()) {
     const chunk = plan.group.columns[column.index];
     const span = plan.spans[position];
-    window.set(sliceOf(fetched, span), at);
+    if (span.start !== span.end) window.set(sliceOf(fetched, span), at);
     columns[column.index] = { ...chunk, dataPageOffset: at + (chunk.dataPageOffset - span.start) };
     at += span.end - span.start;
   }

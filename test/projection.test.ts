@@ -298,6 +298,25 @@ describe("refusals a projection lifts", () => {
 });
 
 describe("projection and codecs", () => {
+  it("validates row-group totals across unselected chunks", () => {
+    const bytes = mixedCodecs({ rowGroupTotalSizeDelta: 1 });
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readParquet(bytes, { columns: ["plain"] }),
+    );
+    expect(error.message).toContain("total_byte_size");
+  });
+
+  it("does not inspect an unselected chunk's byte boundaries", () => {
+    const bytes = mixedCodecs({ zippedCompressedSizeDelta: -1 });
+    const error = expectError("ERR_READ_MALFORMED", () => readParquet(bytes, { codecs }));
+    expect(error.column).toBe("zipped");
+    expect(readParquet(bytes, { columns: ["plain"] }).rows).toEqual([
+      { plain: 1n },
+      { plain: 2n },
+      { plain: 3n },
+    ]);
+  });
+
   it("does not need a codec for a column it never reads", () => {
     const bytes = mixedCodecs();
     const refusal = expectError("ERR_READ_UNSUPPORTED", () => readParquet(bytes));
@@ -388,7 +407,12 @@ describe("equivalence with the lazy read", () => {
  * A two column file where only `zipped` is compressed — which tavolato's own
  * writer cannot produce, since a codec applies to every column it writes.
  */
-function mixedCodecs(): Uint8Array {
+function mixedCodecs(
+  doctored: {
+    readonly rowGroupTotalSizeDelta?: number;
+    readonly zippedCompressedSizeDelta?: number;
+  } = {},
+): Uint8Array {
   const out = startFile();
   const plainAt = out.length;
   const plain = writeDataPage(out, [1n, 2n, 3n]);
@@ -417,11 +441,12 @@ function mixedCodecs(): Uint8Array {
         nullCount: 0,
         dataPageOffset: zippedAt,
         totalUncompressedSize: zipped.uncompressedSize,
-        totalCompressedSize: zipped.compressedSize,
+        totalCompressedSize: zipped.compressedSize + (doctored.zippedCompressedSizeDelta ?? 0),
       },
     ],
     numRows: 3,
-    totalByteSize: plain.uncompressedSize + zipped.uncompressedSize,
+    totalByteSize:
+      plain.uncompressedSize + zipped.uncompressedSize + (doctored.rowGroupTotalSizeDelta ?? 0),
     totalCompressedSize: plain.compressedSize + zipped.compressedSize,
     fileOffset: plainAt,
   };

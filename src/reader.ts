@@ -161,10 +161,12 @@ function hasMagic(bytes: Uint8Array, offset: number): boolean {
 }
 
 /**
- * Validates the file envelope and returns a view over the footer's
- * `FileMetaData` bytes.
+ * Validates the file envelope and locates the exact `FileMetaData` slice.
  */
-function locateFooter(bytes: Uint8Array): Uint8Array {
+function locateFooter(bytes: Uint8Array): {
+  readonly bytes: Uint8Array;
+  readonly start: number;
+} {
   if (!(bytes instanceof Uint8Array)) {
     throw malformed("readParquet expects a Uint8Array");
   }
@@ -186,7 +188,8 @@ function locateFooter(bytes: Uint8Array): Uint8Array {
     );
   }
   const end = bytes.length - MAGIC.length - 4;
-  return bytes.subarray(end - length, end);
+  const start = end - length;
+  return { bytes: bytes.subarray(start, end), start };
 }
 
 /**
@@ -659,6 +662,7 @@ function readPageBody(
       body.raw(body.u32()),
       MAX_DEFINITION_LEVEL_BIT_WIDTH,
       page.numValues,
+      column.name,
     );
     present = 0;
     for (const level of decoded) if (level === 1) present++;
@@ -672,6 +676,16 @@ function readPageBody(
   for (let index = 0; index < page.numValues; index++) {
     out.push(levels !== undefined && levels[index] === 0 ? null : toValue(column, values, next++));
   }
+  if (body.remaining !== 0) {
+    throw malformed(
+      `A data page for column "${column.name}" has ${body.remaining} trailing body bytes`,
+      column.name,
+    );
+  }
+}
+
+interface ChunkSizes {
+  uncompressed: bigint;
 }
 
 /**
@@ -694,7 +708,9 @@ function readDataPage(
   out: ReadValue[],
   remaining: number,
   decompress: PageDecompressor,
+  sizes: ChunkSizes,
 ): void | Promise<void> {
+  const headerOffset = input.offset;
   const page = decodePageHeader(input, column.name);
   if (page.pageType !== PageType.DATA_PAGE) {
     throw unsupported(
@@ -718,13 +734,13 @@ function readDataPage(
       column.name,
     );
   }
+  sizes.uncompressed += BigInt(input.offset - headerOffset + page.uncompressedSize);
 
-  // `raw` bounds the compressed length against the file *before* the hook sees
-  // a byte, which is the one guarantee tavolato can still make about a page it
-  // does not decode itself.
+  // The chunk reader gives `raw` a hard boundary before the hook sees a byte;
+  // no page can borrow from the next chunk or from the footer.
   const raw = input.raw(page.compressedSize);
   return chain(decompress(raw, page.uncompressedSize), (body) => {
-    readPageBody(new ByteReader(body), column, dataPage, out);
+    readPageBody(new ByteReader(body, 0, column.name), column, dataPage, out);
   });
 }
 
@@ -780,17 +796,39 @@ function readColumnChunk(
   const decompress = prepareColumnChunk(column, chunk, numRows, codecs);
 
   const out: ReadValue[] = [];
-  input.seek(chunk.dataPageOffset);
+  const chunkInput = input.view(chunk.dataPageOffset, chunk.totalCompressedSize, column.name);
+  const sizes: ChunkSizes = { uncompressed: 0n };
   // The writer emits exactly one page per chunk, but a chunk is a sequence of
   // pages in the format, so read until the row group's rows are covered. The
   // loop only turns into a promise chain if a decompressor defers.
   const readPages = (): void | Promise<void> => {
     while (out.length < numRows) {
-      const pending = readDataPage(input, column, out, numRows - out.length, decompress);
+      const pending = readDataPage(
+        chunkInput,
+        column,
+        out,
+        numRows - out.length,
+        decompress,
+        sizes,
+      );
       if (isThenable(pending)) return chain(pending, readPages);
     }
   };
-  return chain(readPages(), () => out);
+  return chain(readPages(), () => {
+    if (chunkInput.remaining !== 0) {
+      throw malformed(
+        `Column "${column.name}" has ${chunkInput.remaining} trailing bytes inside its declared chunk`,
+        column.name,
+      );
+    }
+    if (sizes.uncompressed !== BigInt(chunk.totalUncompressedSize)) {
+      throw malformed(
+        `Column "${column.name}" declares ${chunk.totalUncompressedSize} uncompressed chunk bytes but its pages add up to ${sizes.uncompressed}`,
+        column.name,
+      );
+    }
+    return out;
+  });
 }
 
 /**
@@ -816,10 +854,9 @@ export function readRowGroup(
 ): void | Promise<void> {
   assertChunkCount(file, group);
 
-  // Chunks share one cursor over the file, so they are read strictly in order —
-  // and a projection simply reads fewer of them. An unselected chunk is skipped
-  // whole: its pages are never touched, which is why a cursor that seeks to
-  // each chunk's own offset is what makes the skipping free.
+  // Each selected chunk gets its own bounded view over the shared file bytes.
+  // An unselected chunk is skipped whole: its pages and byte boundaries are
+  // never touched, while row-group aggregates remain footer-wide invariants.
   const { columns } = file;
   const values: ReadValue[][] = [];
   return chain(
@@ -879,6 +916,8 @@ export function assertChunkCount(file: FileColumns, group: RowGroupInfo): void {
 export interface FooterInfo extends FileSchema {
   readonly rowGroups: readonly RowGroupInfo[];
   readonly rowCount: number;
+  /** First footer byte; local chunk views may observe nothing at or beyond it. */
+  readonly pageBytesEnd: number;
 }
 
 /**
@@ -896,7 +935,8 @@ export function readFooter(bytes: Uint8Array, options: ReadOptions | undefined):
   // option that cannot be used is the caller's mistake whatever the file holds.
   const types = registeredTypes(options);
   const selection = requestedColumns(options);
-  const metadata = decodeFileMetadata(locateFooter(bytes));
+  const located = locateFooter(bytes);
+  const metadata = decodeFileMetadata(located.bytes);
   const { schema, columns, columnCount } = toSchema(metadata.schema, types, selection);
 
   // Cross-checked before a single page is touched: the row groups must account
@@ -916,6 +956,7 @@ export function readFooter(bytes: Uint8Array, options: ReadOptions | undefined):
     columnCount,
     rowGroups: metadata.rowGroups,
     rowCount: metadata.numRows,
+    pageBytesEnd: located.start,
   };
 }
 
@@ -996,7 +1037,7 @@ export function readParquet(
 ): ParquetFile | Promise<ParquetFile> {
   const file = readFooter(bytes, options);
   const { rowGroups } = file;
-  const input = new ByteReader(bytes);
+  const input = new ByteReader(bytes.subarray(0, file.pageBytesEnd), 0, undefined, MAGIC.length);
   const rows: ReadRow[] = [];
   const codecs = options?.codecs;
 
@@ -1120,7 +1161,12 @@ export function readRowGroups(bytes: Uint8Array, options?: ReadOptions): Parquet
           // The array is the step's for the same reason it is fresh: once it
           // has been yielded nothing here refers to it, which is what makes
           // the memory bound real.
-          const input = new ByteReader(bytes);
+          const input = new ByteReader(
+            bytes.subarray(0, file.pageBytesEnd),
+            0,
+            undefined,
+            MAGIC.length,
+          );
           const rows: ReadRow[] = [];
           return {
             done: false,
@@ -1156,7 +1202,7 @@ export function readRowGroups(bytes: Uint8Array, options?: ReadOptions): Parquet
  */
 export function readSchema(bytes: Uint8Array, options?: ReadOptions): ParquetSchema {
   const types = registeredTypes(options);
-  return toSchema(decodeFileMetadata(locateFooter(bytes)).schema, types, undefined).schema;
+  return toSchema(decodeFileMetadata(locateFooter(bytes).bytes).schema, types, undefined).schema;
 }
 
 /**

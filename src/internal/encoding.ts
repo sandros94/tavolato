@@ -227,22 +227,26 @@ export function encodeRleBitPackedHybrid(levels: readonly number[], bitWidth: nu
   return out.toBytes();
 }
 
+/** A bit-packed run's decoded value count is a signed i32 in the Parquet grammar. */
+const MAX_BIT_PACKED_RUN_GROUPS = Math.floor((2 ** 31 - 1) / 8);
+
 /**
  * Decodes exactly `count` levels written by {@link encodeRleBitPackedHybrid}.
  *
- * Runs are consumed until `count` levels have been produced; the trailing
- * padding of a final bit-packed group is read and discarded, which is what
- * makes the encoder's "pad the last group" strategy invisible here.
+ * Runs must describe exactly `count` logical levels and consume the whole
+ * substream. A final bit-packed run may physically contain any number of
+ * padded groups; all their bytes are consumed and values past `count` ignored.
  *
- * A run that would yield no values at all is rejected rather than retried:
- * that is the only shape of input that could otherwise loop forever.
+ * Empty and oversized runs are rejected rather than clipped: clipping would
+ * make a second encoded run or arbitrary trailing bytes invisible.
  */
 export function decodeRleBitPackedHybrid(
   bytes: Uint8Array,
   bitWidth: number,
   count: number,
+  column?: string,
 ): number[] {
-  const input = new ByteReader(bytes);
+  const input = new ByteReader(bytes, 0, column);
   const byteWidth = Math.ceil(bitWidth / 8);
   const levels: number[] = [];
 
@@ -252,8 +256,14 @@ export function decodeRleBitPackedHybrid(
     const header = input.varint();
     if (header % 2 === 1) {
       const groups = Math.floor(header / 2);
-      if (groups === 0) throw malformed("A bit-packed run declares zero groups");
-      for (let group = 0; group < groups && levels.length < count; group++) {
+      if (groups === 0) throw malformed("A bit-packed run declares zero groups", column);
+      if (groups > MAX_BIT_PACKED_RUN_GROUPS) {
+        throw malformed(
+          `A bit-packed run declares ${groups} groups, exceeding Parquet's 2^31-1 value limit`,
+          column,
+        );
+      }
+      for (let group = 0; group < groups; group++) {
         let accumulator = 0;
         let accumulatedBits = 0;
         for (let index = 0; index < 8; index++) {
@@ -268,11 +278,24 @@ export function decodeRleBitPackedHybrid(
       }
     } else {
       const runLength = header / 2;
-      if (runLength === 0) throw malformed("An RLE run declares zero values");
+      if (runLength === 0) throw malformed("An RLE run declares zero values", column);
+      if (runLength > count - levels.length) {
+        throw malformed(
+          `An RLE run declares ${runLength} values with ${count - levels.length} levels left`,
+          column,
+        );
+      }
       let value = 0;
       for (let index = 0; index < byteWidth; index++) value += input.u8() * 2 ** (8 * index);
-      for (let index = 0; index < runLength && levels.length < count; index++) levels.push(value);
+      for (let index = 0; index < runLength; index++) levels.push(value);
     }
+  }
+
+  if (input.remaining !== 0) {
+    throw malformed(
+      `A definition-level stream has ${input.remaining} trailing encoded bytes`,
+      column,
+    );
   }
 
   return levels;

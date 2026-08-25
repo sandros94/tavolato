@@ -143,11 +143,16 @@ export class ByteWriter {
 export class ByteReader {
   readonly #bytes: Uint8Array;
   readonly #view: DataView;
+  readonly #column: string | undefined;
+  /** Earliest offset a nonempty child view may expose. */
+  readonly #nonEmptyViewStart: number;
   #offset: number;
 
-  constructor(bytes: Uint8Array, offset = 0) {
+  constructor(bytes: Uint8Array, offset = 0, column?: string, nonEmptyViewStart = 0) {
     this.#bytes = bytes;
     this.#view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    this.#column = column;
+    this.#nonEmptyViewStart = nonEmptyViewStart;
     this.#offset = offset;
   }
 
@@ -161,10 +166,38 @@ export class ByteReader {
     return this.#bytes.length;
   }
 
-  /** Moves the read position; the target must lie inside the buffer. */
+  /** Bytes between the current position and this reader's hard boundary. */
+  get remaining(): number {
+    return this.#bytes.length - this.#offset;
+  }
+
+  /** A non-copying reader that can observe exactly `size` bytes from `offset`. */
+  view(offset: number, size: number, column: string | undefined = this.#column): ByteReader {
+    const readableStart = size === 0 ? 0 : this.#nonEmptyViewStart;
+    if (
+      !Number.isSafeInteger(offset) ||
+      !Number.isSafeInteger(size) ||
+      offset < 0 ||
+      size < 0 ||
+      offset < readableStart ||
+      !Number.isSafeInteger(offset + size) ||
+      offset + size > this.#bytes.length
+    ) {
+      throw malformed(
+        `Byte range ${offset}..${offset + size} lies outside the readable region ${readableStart}..${this.#bytes.length}`,
+        column,
+      );
+    }
+    return new ByteReader(this.#bytes.subarray(offset, offset + size), 0, column);
+  }
+
+  /** Moves the read position; the target must lie inside this reader's input. */
   seek(offset: number): void {
     if (!Number.isSafeInteger(offset) || offset < 0 || offset > this.#bytes.length) {
-      throw malformed(`Offset ${offset} lies outside the ${this.#bytes.length} byte file`);
+      throw malformed(
+        `Offset ${offset} lies outside the ${this.#bytes.length} byte input`,
+        this.#column,
+      );
     }
     this.#offset = offset;
   }
@@ -177,6 +210,7 @@ export class ByteReader {
         `Truncated input: ${size} bytes were needed at offset ${offset}, ${
           this.#bytes.length - offset
         } are left`,
+        this.#column,
       );
     }
     this.#offset = offset + size;
@@ -240,13 +274,19 @@ export class ByteReader {
       result += (byte % 128) * scale;
       if (byte < 0x80) {
         if (!Number.isSafeInteger(result)) {
-          throw malformed(`Varint ending at offset ${this.#offset} is too large to be a length`);
+          throw malformed(
+            `Varint ending at offset ${this.#offset} is too large to be a length`,
+            this.#column,
+          );
         }
         return result;
       }
       scale *= 128;
     }
-    throw malformed(`Varint ending at offset ${this.#offset} is longer than ten bytes`);
+    throw malformed(
+      `Varint ending at offset ${this.#offset} is longer than ten bytes`,
+      this.#column,
+    );
   }
 
   /** Reads an unsigned LEB128 (varint) encoded integer of arbitrary width. */
@@ -259,7 +299,10 @@ export class ByteReader {
       if (byte < 0x80) return result;
       shift += 7n;
     }
-    throw malformed(`Varint ending at offset ${this.#offset} is longer than ten bytes`);
+    throw malformed(
+      `Varint ending at offset ${this.#offset} is longer than ten bytes`,
+      this.#column,
+    );
   }
 }
 

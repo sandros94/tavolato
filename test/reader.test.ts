@@ -12,8 +12,17 @@ import {
   uuid,
 } from "../src/index.ts";
 import type { ReadRow } from "../src/index.ts";
-import type { ByteWriter } from "../src/internal/bytes.ts";
-import { Encoding, PageType, PhysicalType } from "../src/internal/format.ts";
+import { ByteWriter } from "../src/internal/bytes.ts";
+import {
+  CompressionCodec,
+  encodeDataPageHeader,
+  encodeFileMetadata,
+  Encoding,
+  PageType,
+  PhysicalType,
+  type RowGroupMeta,
+  snapshotColumn,
+} from "../src/internal/format.ts";
 import { CompactWriter, ThriftType } from "../src/internal/thrift.ts";
 import { plainBody, sealFile, startFile, withPhysicalType } from "./_build.ts";
 import { expectError } from "./_errors.ts";
@@ -66,6 +75,48 @@ function minimal(): Uint8Array {
   const writer = createWriter(defineSchema({ n: { type: "i64" } }));
   writer.append({ n: 1n });
   return sync(writer.finish());
+}
+
+/** A three-null optional i64 page carrying caller-spelled definition-level bytes. */
+function optionalLevelsFile(levelBytes: Uint8Array): Uint8Array {
+  const out = startFile();
+  const dataPageOffset = out.length;
+  const body = new ByteWriter();
+  body.u32(levelBytes.length);
+  body.raw(levelBytes);
+  const bodyBytes = body.toBytes();
+  const header = encodeDataPageHeader(bodyBytes.length, bodyBytes.length, 3);
+  out.raw(header);
+  out.raw(bodyBytes);
+  const size = header.length + bodyBytes.length;
+  const group: RowGroupMeta = {
+    columns: [
+      {
+        name: "n",
+        physical: "i64",
+        optional: true,
+        codec: CompressionCodec.UNCOMPRESSED,
+        numValues: 3,
+        nullCount: 3,
+        dataPageOffset,
+        totalUncompressedSize: size,
+        totalCompressedSize: size,
+      },
+    ],
+    numRows: 3,
+    totalByteSize: size,
+    totalCompressedSize: size,
+    fileOffset: dataPageOffset,
+  };
+  return sealFile(
+    out,
+    encodeFileMetadata(
+      [snapshotColumn({ name: "n", type: "i64", optional: true })],
+      [group],
+      3,
+      "probe",
+    ),
+  );
 }
 
 /**
@@ -128,6 +179,25 @@ describe("file envelope", () => {
     expect(view.getUint32(bytes.length - 8, true)).toBeGreaterThan(0);
     expect(readParquet(bytes).rows).toEqual([{ n: 1n }]);
   });
+
+  it("rejects bytes after the compact FileMetaData struct inside its declared slice", () => {
+    const bytes = minimal();
+    const suffix = bytes.length - 8;
+    const length = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(
+      suffix,
+      true,
+    );
+    const copy = new Uint8Array(bytes.length + 1);
+    copy.set(bytes.subarray(0, suffix), 0);
+    copy[suffix] = 0xff;
+    new DataView(copy.buffer).setUint32(suffix + 1, length + 1, true);
+    copy.set(bytes.subarray(suffix + 4), suffix + 5);
+
+    const error = expectError("ERR_READ_MALFORMED", () => readParquet(copy));
+    expect(error.message).toContain("FileMetaData");
+    expect(error.message).toContain("trailing");
+    expectError("ERR_READ_MALFORMED", () => readSchema(copy));
+  });
 });
 
 describe("uncompressed page sizes", () => {
@@ -167,8 +237,7 @@ describe("uncompressed page sizes", () => {
       readParquet(contradictPageSize(minimal(), 0, 1, "compressed")),
     );
     expect(error.column).toBe("n");
-    expect(error.message).toContain("8 uncompressed bytes");
-    expect(error.message).toContain("9 compressed bytes");
+    expect(error.message).toContain("Truncated input");
   });
 
   it("does not inspect a contradictory page projected away", () => {
@@ -178,6 +247,45 @@ describe("uncompressed page sizes", () => {
 
     expectError("ERR_READ_MALFORMED", () => readParquet(bytes));
     expect(readParquet(bytes, { columns: ["kept"] }).rows).toEqual([{ kept: 1n }]);
+  });
+});
+
+describe("definition-level boundaries", () => {
+  it("accepts one final padded bit-packed group", () => {
+    expect(readParquet(optionalLevelsFile(new Uint8Array([0x03, 0x00]))).rows).toEqual([
+      { n: null },
+      { n: null },
+      { n: null },
+    ]);
+  });
+
+  it("accepts a final bit-packed run padded to DuckDB's 32-group block", () => {
+    const levels = new Uint8Array([0x41, ...new Uint8Array(32)]);
+    expect(readParquet(optionalLevelsFile(levels)).rows).toEqual([
+      { n: null },
+      { n: null },
+      { n: null },
+    ]);
+  });
+
+  it("refuses a trailing encoded run or byte inside the declared level substream", () => {
+    for (const levels of [
+      new Uint8Array([0x03, 0x00, 0x10, 0x00]),
+      new Uint8Array([0x03, 0x00, 0xff]),
+    ]) {
+      const error = expectError("ERR_READ_MALFORMED", () =>
+        readParquet(optionalLevelsFile(levels)),
+      );
+      expect(error.column).toBe("n");
+    }
+  });
+
+  it("refuses an RLE run larger than the page's value count", () => {
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readParquet(optionalLevelsFile(new Uint8Array([0x10, 0x00]))),
+    );
+    expect(error.message).toContain("8 values");
+    expect(error.column).toBe("n");
   });
 });
 
@@ -432,6 +540,7 @@ describe("a footer whose fields are the wrong Thrift type", () => {
   function writeDoctoredPage(
     out: ByteWriter,
     header: (writer: CompactWriter) => void,
+    trailingBodyByte = false,
   ): { readonly uncompressedSize: number; readonly compressedSize: number } {
     const writer = new CompactWriter();
     writer.structBegin();
@@ -441,7 +550,8 @@ describe("a footer whose fields are the wrong Thrift type", () => {
     const body = plainBody([7n]);
     out.raw(encoded);
     out.raw(body);
-    const size = encoded.length + body.length;
+    if (trailingBodyByte) out.u8(0xff);
+    const size = encoded.length + body.length + (trailingBodyByte ? 1 : 0);
     return { uncompressedSize: size, compressedSize: size };
   }
 
@@ -483,6 +593,10 @@ describe("a footer whose fields are the wrong Thrift type", () => {
       offsetIndexOffset?: boolean;
       createdBy?: boolean;
       unknownOptional?: boolean;
+      bodyTrailingByte?: boolean;
+      totalCompressedSizeDelta?: number;
+      totalUncompressedSizeDelta?: number;
+      rowGroupTotalSizeDelta?: number;
     } = {},
   ): Uint8Array {
     const required = (
@@ -505,35 +619,48 @@ describe("a footer whose fields are the wrong Thrift type", () => {
     const dataPageOffset = out.length;
     const page =
       doctored.pageHeader === undefined
-        ? writeDoctoredPage(out, (writer) => {
-            required(writer, "PageHeader.type", 1, ThriftType.I32, () =>
-              writer.fieldI32(1, PageType.DATA_PAGE),
-            );
-            required(writer, "PageHeader.uncompressed_page_size", 2, ThriftType.I32, () =>
-              writer.fieldI32(2, 8),
-            );
-            required(writer, "PageHeader.compressed_page_size", 3, ThriftType.I32, () =>
-              writer.fieldI32(3, 8),
-            );
-            required(writer, "PageHeader.data_page_header", 5, ThriftType.STRUCT, () => {
-              writer.fieldStructBegin(5);
-              required(writer, "DataPageHeader.num_values", 1, ThriftType.I32, () =>
-                writer.fieldI32(1, 1),
+        ? writeDoctoredPage(
+            out,
+            (writer) => {
+              required(writer, "PageHeader.type", 1, ThriftType.I32, () =>
+                writer.fieldI32(1, PageType.DATA_PAGE),
               );
-              required(writer, "DataPageHeader.encoding", 2, ThriftType.I32, () =>
-                writer.fieldI32(2, Encoding.PLAIN),
+              const bodySize = doctored.bodyTrailingByte ? 9 : 8;
+              required(writer, "PageHeader.uncompressed_page_size", 2, ThriftType.I32, () =>
+                writer.fieldI32(2, bodySize),
               );
-              required(writer, "DataPageHeader.definition_level_encoding", 3, ThriftType.I32, () =>
-                writer.fieldI32(3, Encoding.RLE),
+              required(writer, "PageHeader.compressed_page_size", 3, ThriftType.I32, () =>
+                writer.fieldI32(3, bodySize),
               );
-              required(writer, "DataPageHeader.repetition_level_encoding", 4, ThriftType.I32, () =>
-                writer.fieldI32(4, Encoding.RLE),
-              );
+              required(writer, "PageHeader.data_page_header", 5, ThriftType.STRUCT, () => {
+                writer.fieldStructBegin(5);
+                required(writer, "DataPageHeader.num_values", 1, ThriftType.I32, () =>
+                  writer.fieldI32(1, 1),
+                );
+                required(writer, "DataPageHeader.encoding", 2, ThriftType.I32, () =>
+                  writer.fieldI32(2, Encoding.PLAIN),
+                );
+                required(
+                  writer,
+                  "DataPageHeader.definition_level_encoding",
+                  3,
+                  ThriftType.I32,
+                  () => writer.fieldI32(3, Encoding.RLE),
+                );
+                required(
+                  writer,
+                  "DataPageHeader.repetition_level_encoding",
+                  4,
+                  ThriftType.I32,
+                  () => writer.fieldI32(4, Encoding.RLE),
+                );
+                if (doctored.unknownOptional) writer.fieldString(99, "future");
+                writer.structEnd();
+              });
               if (doctored.unknownOptional) writer.fieldString(99, "future");
-              writer.structEnd();
-            });
-            if (doctored.unknownOptional) writer.fieldString(99, "future");
-          })
+            },
+            doctored.bodyTrailingByte,
+          )
         : writeDoctoredPage(out, doctored.pageHeader);
 
     const writer = new CompactWriter();
@@ -621,10 +748,16 @@ describe("a footer whose fields are the wrong Thrift type", () => {
             );
           } else doctored.numValues(writer);
           required(writer, "ColumnMetaData.total_uncompressed_size", 6, ThriftType.I64, () =>
-            writer.fieldI64(6, BigInt(page.uncompressedSize)),
+            writer.fieldI64(
+              6,
+              BigInt(page.uncompressedSize + (doctored.totalUncompressedSizeDelta ?? 0)),
+            ),
           );
           required(writer, "ColumnMetaData.total_compressed_size", 7, ThriftType.I64, () =>
-            writer.fieldI64(7, BigInt(page.compressedSize)),
+            writer.fieldI64(
+              7,
+              BigInt(page.compressedSize + (doctored.totalCompressedSizeDelta ?? 0)),
+            ),
           );
           required(writer, "ColumnMetaData.data_page_offset", 9, ThriftType.I64, () =>
             writer.fieldI64(9, BigInt(dataPageOffset)),
@@ -648,7 +781,14 @@ describe("a footer whose fields are the wrong Thrift type", () => {
         writer.structEnd();
       });
       required(writer, "RowGroup.total_byte_size", 2, ThriftType.I64, () =>
-        writer.fieldI64(2, BigInt(page.uncompressedSize)),
+        writer.fieldI64(
+          2,
+          BigInt(
+            page.uncompressedSize +
+              (doctored.totalUncompressedSizeDelta ?? 0) +
+              (doctored.rowGroupTotalSizeDelta ?? 0),
+          ),
+        ),
       );
       required(writer, "RowGroup.num_rows", 3, ThriftType.I64, () => writer.fieldI64(3, 1n));
       if (doctored.unknownOptional) writer.fieldString(99, "future");
@@ -699,6 +839,36 @@ describe("a footer whose fields are the wrong Thrift type", () => {
 
   it("reads the undoctored file, including required fields whose value is zero", () => {
     expect(readParquet(handBuilt()).rows).toEqual([{ n: 7n }]);
+  });
+
+  it("refuses trailing bytes in an otherwise internally consistent page and chunk", () => {
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readParquet(handBuilt({ bodyTrailingByte: true })),
+    );
+    expect(error.message).toContain("trailing body bytes");
+    expect(error.column).toBe("n");
+  });
+
+  it.each([-1, 1])("refuses a total_compressed_size offset by %i", (delta) => {
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readParquet(handBuilt({ totalCompressedSizeDelta: delta })),
+    );
+    expect(error.column).toBe("n");
+  });
+
+  it("refuses total_uncompressed_size that differs from its serialized pages", () => {
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readParquet(handBuilt({ totalUncompressedSizeDelta: 1 })),
+    );
+    expect(error.message).toContain("uncompressed chunk bytes");
+    expect(error.column).toBe("n");
+  });
+
+  it("refuses a row group's total_byte_size that differs from every chunk", () => {
+    const bytes = handBuilt({ rowGroupTotalSizeDelta: 1 });
+    const error = expectError("ERR_READ_MALFORMED", () => readParquet(bytes));
+    expect(error.message).toContain("total_byte_size");
+    expectError("ERR_READ_MALFORMED", () => readSchema(bytes));
   });
 
   it.each(REQUIRED_FIELDS)("refuses a missing required %s", (field) => {

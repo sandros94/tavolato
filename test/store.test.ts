@@ -6,6 +6,7 @@ import {
   defineSchema,
   readParquet,
   readRowGroups,
+  readSchema,
   uuid,
 } from "../src/index.ts";
 import type { ParquetFile, ReadOptions, ReadRow, Row, SchemaDefinition } from "../src/types.ts";
@@ -13,12 +14,14 @@ import type { ParquetSchema } from "../src/types.ts";
 import {
   type ColumnChunkMeta,
   CompressionCodec,
+  encodeDataPageHeader,
   encodeFileMetadata,
+  MAGIC,
   type RowGroupMeta,
   snapshotColumn,
 } from "../src/internal/format.ts";
 import { createParquetStore, PARQUET_CONTENT_TYPE, type ParquetStore } from "../src/uns3.ts";
-import { sealFile, startFile, writeDataPage } from "./_build.ts";
+import { plainBody, sealFile, startFile, writeDataPage } from "./_build.ts";
 import { expectError, expectRejection } from "./_errors.ts";
 import { FakeS3, FakeS3Error, racing, wrap } from "./_store.ts";
 import { sync } from "./_sync.ts";
@@ -718,17 +721,40 @@ describe("createParquetStore: head", () => {
 });
 
 describe("createParquetStore: files a ranged read cannot take apart", () => {
+  type HandBuiltOptions = Partial<ColumnChunkMeta> & {
+    readonly totalCompressedSizeDelta?: number;
+    readonly totalUncompressedSizeDelta?: number;
+    readonly rowGroupTotalSizeDelta?: number;
+    readonly multiPage?: boolean;
+  };
+
   /**
    * A one column, one group file with the chunk metadata under the test's
    * control, padded so that it is larger than the tail below and therefore
    * genuinely read in pieces.
    */
-  function handBuilt(chunk: Partial<ColumnChunkMeta> = {}): Uint8Array {
+  function handBuilt(options: HandBuiltOptions = {}): Uint8Array {
+    const {
+      totalCompressedSizeDelta = 0,
+      totalUncompressedSizeDelta = 0,
+      rowGroupTotalSizeDelta = 0,
+      multiPage = false,
+      ...chunk
+    } = options;
     const out = startFile();
     out.raw(new Uint8Array(2048));
     const values = [1n, 2n, 3n];
     const dataPageOffset = out.length;
-    const page = writeDataPage(out, values);
+    let totalUncompressedSize = 0;
+    let totalCompressedSize = 0;
+    const pages = multiPage ? [values.slice(0, 2), values.slice(2)] : [values];
+    for (const pageValues of pages) {
+      const page = writeDataPage(out, pageValues);
+      totalUncompressedSize += page.uncompressedSize;
+      totalCompressedSize += page.compressedSize;
+    }
+    totalUncompressedSize += totalUncompressedSizeDelta;
+    totalCompressedSize += totalCompressedSizeDelta;
     const group: RowGroupMeta = {
       columns: [
         {
@@ -739,14 +765,14 @@ describe("createParquetStore: files a ranged read cannot take apart", () => {
           numValues: values.length,
           nullCount: 0,
           dataPageOffset,
-          totalUncompressedSize: page.uncompressedSize,
-          totalCompressedSize: page.compressedSize,
+          totalUncompressedSize,
+          totalCompressedSize,
           ...chunk,
         },
       ],
       numRows: values.length,
-      totalByteSize: page.uncompressedSize,
-      totalCompressedSize: page.compressedSize,
+      totalByteSize: totalUncompressedSize + rowGroupTotalSizeDelta,
+      totalCompressedSize,
       fileOffset: dataPageOffset,
     };
     const footer = encodeFileMetadata(
@@ -761,11 +787,286 @@ describe("createParquetStore: files a ranged read cannot take apart", () => {
   const tight = (s3: FakeS3): ParquetStore =>
     createParquetStore(s3, { bucket: "b", tailBytes: 512 });
 
+  /** A chunk that claims four bytes from the footer as a five-byte compressed body. */
+  function footerOverlap(): Uint8Array {
+    const out = startFile();
+    out.raw(new Uint8Array(2048));
+    const dataPageOffset = out.length;
+    const header = encodeDataPageHeader(8, 5, 1);
+    out.raw(header);
+    out.u8(0); // the only real compressed payload byte
+    const totalCompressedSize = header.length + 5;
+    const totalUncompressedSize = header.length + 8;
+    const group: RowGroupMeta = {
+      columns: [
+        {
+          name: "n",
+          physical: "i64",
+          optional: false,
+          codec: CompressionCodec.GZIP,
+          numValues: 1,
+          nullCount: 0,
+          dataPageOffset,
+          totalUncompressedSize,
+          totalCompressedSize,
+        },
+      ],
+      numRows: 1,
+      totalByteSize: totalUncompressedSize,
+      totalCompressedSize,
+      fileOffset: dataPageOffset,
+    };
+    return sealFile(
+      out,
+      encodeFileMetadata(
+        [snapshotColumn({ name: "n", type: "i64", optional: false })],
+        [group],
+        1,
+        "probe",
+      ),
+    );
+  }
+
+  /** A legal zero-row group whose one column chunk occupies no bytes. */
+  function emptyChunk(dataPageOffset = 0): Uint8Array {
+    const out = startFile();
+    out.raw(new Uint8Array(2048));
+    const group: RowGroupMeta = {
+      columns: [
+        {
+          name: "n",
+          physical: "i64",
+          optional: false,
+          codec: CompressionCodec.UNCOMPRESSED,
+          numValues: 0,
+          nullCount: 0,
+          dataPageOffset,
+          totalUncompressedSize: 0,
+          totalCompressedSize: 0,
+        },
+      ],
+      numRows: 0,
+      totalByteSize: 0,
+      totalCompressedSize: 0,
+      fileOffset: dataPageOffset,
+    };
+    return sealFile(
+      out,
+      encodeFileMetadata(
+        [snapshotColumn({ name: "n", type: "i64", optional: false })],
+        [group],
+        0,
+        "probe",
+      ),
+    );
+  }
+
+  /** A valid page only if the reader illegally treats bytes 1..3 of PAR1 as its header. */
+  function leadingMagicOverlap(): Uint8Array {
+    const out = startFile();
+    // At offset 1, `A`, `R`, `1` are three unknown compact bool fields. The
+    // first real PageHeader field then uses long form because its id falls from
+    // 12 back to 1.
+    const restOfHeader = new Uint8Array([
+      0x05,
+      0x02,
+      0x00, // type = DATA_PAGE, long-form field id 1
+      0x15,
+      0x10, // uncompressed_page_size = 8
+      0x15,
+      0x10, // compressed_page_size = 8
+      0x2c, // data_page_header
+      0x15,
+      0x02, // num_values = 1
+      0x15,
+      0x00, // encoding = PLAIN
+      0x15,
+      0x06, // definition_level_encoding = RLE
+      0x15,
+      0x06, // repetition_level_encoding = RLE
+      0x00,
+      0x00,
+    ]);
+    out.raw(restOfHeader);
+    out.raw(plainBody([7n]));
+    const headerSize = MAGIC.length - 1 + restOfHeader.length;
+    const chunkSize = headerSize + 8;
+    out.raw(new Uint8Array(2048));
+    const group: RowGroupMeta = {
+      columns: [
+        {
+          name: "n",
+          physical: "i64",
+          optional: false,
+          codec: CompressionCodec.UNCOMPRESSED,
+          numValues: 1,
+          nullCount: 0,
+          dataPageOffset: 1,
+          totalUncompressedSize: chunkSize,
+          totalCompressedSize: chunkSize,
+        },
+      ],
+      numRows: 1,
+      totalByteSize: chunkSize,
+      totalCompressedSize: chunkSize,
+      fileOffset: 1,
+    };
+    return sealFile(
+      out,
+      encodeFileMetadata(
+        [snapshotColumn({ name: "n", type: "i64", optional: false })],
+        [group],
+        1,
+        "probe",
+      ),
+    );
+  }
+
+  it("never lets a nonempty chunk consume the leading PAR1 bytes", async () => {
+    const bytes = leadingMagicOverlap();
+    const local = expectError("ERR_READ_MALFORMED", () => readParquet(bytes));
+    expect(local.column).toBe("n");
+    const lazy = expectError("ERR_READ_MALFORMED", () => [...readRowGroups(bytes)]);
+    expect(lazy.column).toBe("n");
+
+    const s3 = new FakeS3();
+    s3.seed("leading-overlap.parquet", bytes);
+    const remote = await expectRejection(
+      "ERR_READ_MALFORMED",
+      tight(s3).get("leading-overlap.parquet", { columns: ["n"] }),
+    );
+    expect(remote.column).toBe("n");
+
+    s3.reset();
+    s3.quirks.ignoreRange = true;
+    const wholeFallback = await expectRejection(
+      "ERR_READ_MALFORMED",
+      tight(s3).get("leading-overlap.parquet", { groups: [0] }),
+    );
+    expect(wholeFallback.column).toBe("n");
+  });
+
+  it("reads an empty chunk locally and remotely without requesting an empty range", async () => {
+    const bytes = emptyChunk();
+    expect(sync(readParquet(bytes)).rows).toEqual([]);
+    expect([...readRowGroups(bytes)]).toEqual([[]]);
+
+    const s3 = new FakeS3();
+    s3.seed("empty.parquet", bytes);
+    expect((await tight(s3).get("empty.parquet", { columns: ["n"] })).rows).toEqual([]);
+    expect(
+      s3.requests.filter(
+        (request) => request.method === "GET" && request.range?.start !== undefined,
+      ),
+    ).toEqual([]);
+
+    s3.reset();
+    expect((await tight(s3).get("empty.parquet", { groups: [0] })).rows).toEqual([]);
+    expect(
+      s3.requests.filter(
+        (request) => request.method === "GET" && request.range?.start !== undefined,
+      ),
+    ).toEqual([]);
+  });
+
+  it("refuses an empty chunk whose offset lies beyond the page region", async () => {
+    const bytes = emptyChunk(10_000_000);
+    const local = expectError("ERR_READ_MALFORMED", () => readParquet(bytes));
+    expect(local.column).toBe("n");
+
+    const s3 = new FakeS3();
+    s3.seed("empty-outside.parquet", bytes);
+    const remote = await expectRejection(
+      "ERR_READ_MALFORMED",
+      tight(s3).get("empty-outside.parquet", { columns: ["n"] }),
+    );
+    expect(remote.column).toBe("n");
+  });
+
+  it("never lets a compressed chunk overlap FileMetaData locally or remotely", async () => {
+    const s3 = new FakeS3();
+    const bytes = footerOverlap();
+    const permissive = { GZIP: { decompress: () => plainBody([7n]) } };
+
+    const local = expectError("ERR_READ_MALFORMED", () =>
+      sync(readParquet(bytes, { codecs: permissive })),
+    );
+    expect(local.column).toBe("n");
+    const lazy = expectError("ERR_READ_MALFORMED", () => [
+      ...readRowGroups(bytes, { codecs: permissive }),
+    ]);
+    expect(lazy.column).toBe("n");
+    expect(readSchema(bytes).columns).toHaveLength(1);
+
+    s3.seed("overlap.parquet", bytes);
+    const remote = await expectRejection(
+      "ERR_READ_MALFORMED",
+      tight(s3).get("overlap.parquet", { columns: ["n"], codecs: permissive }),
+    );
+    expect(remote.column).toBe("n");
+  });
+
   it("reads a chunk whose total_compressed_size the file states properly", async () => {
     const s3 = new FakeS3();
     s3.seed("hand.parquet", handBuilt());
     const file = await tight(s3).get("hand.parquet", { columns: ["n"] });
     expect(file.rows).toEqual([{ n: 1n }, { n: 2n }, { n: 3n }]);
+  });
+
+  it("reads an exact multi-page chunk through ranged fetching", async () => {
+    const s3 = new FakeS3();
+    const bytes = handBuilt({ multiPage: true });
+    expect(sync(readParquet(bytes)).rows).toEqual([{ n: 1n }, { n: 2n }, { n: 3n }]);
+    s3.seed("multi.parquet", bytes);
+    const file = await tight(s3).get("multi.parquet", { columns: ["n"] });
+    expect(file.rows).toEqual([{ n: 1n }, { n: 2n }, { n: 3n }]);
+  });
+
+  it.each([-1, 1])(
+    "refuses total_compressed_size offset by %i locally and remotely",
+    async (delta) => {
+      const s3 = new FakeS3();
+      const bytes = handBuilt({ totalCompressedSizeDelta: delta });
+      const local = expectError("ERR_READ_MALFORMED", () => readParquet(bytes));
+      expect(local.column).toBe("n");
+
+      s3.seed("sized.parquet", bytes);
+      const remote = await expectRejection(
+        "ERR_READ_MALFORMED",
+        tight(s3).get("sized.parquet", { columns: ["n"] }),
+      );
+      expect(remote.column).toBe("n");
+    },
+  );
+
+  it("refuses total_uncompressed_size mismatch locally and remotely", async () => {
+    const s3 = new FakeS3();
+    const bytes = handBuilt({ totalUncompressedSizeDelta: 1 });
+    const local = expectError("ERR_READ_MALFORMED", () => readParquet(bytes));
+    expect(local.message).toContain("uncompressed chunk bytes");
+    expect(local.column).toBe("n");
+
+    s3.seed("uncompressed.parquet", bytes);
+    const remote = await expectRejection(
+      "ERR_READ_MALFORMED",
+      tight(s3).get("uncompressed.parquet", { columns: ["n"] }),
+    );
+    expect(remote.message).toContain("uncompressed chunk bytes");
+    expect(remote.column).toBe("n");
+  });
+
+  it("refuses a row-group total mismatch locally and remotely", async () => {
+    const s3 = new FakeS3();
+    const bytes = handBuilt({ rowGroupTotalSizeDelta: 1 });
+    const local = expectError("ERR_READ_MALFORMED", () => readParquet(bytes));
+    expect(local.message).toContain("total_byte_size");
+
+    s3.seed("group-size.parquet", bytes);
+    const remote = await expectRejection(
+      "ERR_READ_MALFORMED",
+      tight(s3).get("group-size.parquet", { columns: ["n"] }),
+    );
+    expect(remote.message).toContain("total_byte_size");
   });
 
   it("refuses a negative required total_compressed_size in every read path", async () => {
