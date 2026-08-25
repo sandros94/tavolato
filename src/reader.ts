@@ -26,7 +26,7 @@ import {
   type RowGroupInfo,
   type SchemaElement,
 } from "./internal/format.ts";
-import { adapterProblem, jsonValueOf } from "./adapters.ts";
+import { type AdapterInspection, inspectAdapter, jsonValueOf } from "./adapters.ts";
 import {
   adapterUnsupportedDetails,
   assertOptionalOptionsObject,
@@ -73,11 +73,9 @@ const MAX_DATE_MILLIS = 8_640_000_000_000_000n;
  * kept here — the one an adapter had to agree with to claim the column at all —
  * and every page is read from that.
  */
-interface ReadColumn {
+interface ReadColumnBase {
   readonly name: string;
   readonly optional: boolean;
-  /** The column type as the schema hands it back: a built-in name, or the adapter. */
-  readonly type: ColumnType | AnyLogicalAdapter;
   /** Byte width of a `FIXED_LEN_BYTE_ARRAY` column, as the file declares it. */
   readonly typeLength: number | undefined;
   /** Where the values are read from. */
@@ -89,6 +87,17 @@ interface ReadColumn {
    */
   readonly index: number;
 }
+
+type ReadColumn = ReadColumnBase &
+  (
+    | { readonly type: ColumnType; readonly adapter?: undefined }
+    | {
+        /** Original adapter identity exposed through the returned schema. */
+        readonly type: AnyLogicalAdapter;
+        /** Stable metadata and hooks captured at the read-options boundary. */
+        readonly adapter: AdapterInspection;
+      }
+  );
 
 /**
  * The columns a read decodes, and the count that says where their chunks are.
@@ -245,14 +254,16 @@ function isPlainInteger(annotation: Annotation, bitWidth: 32 | 64): boolean {
 
 /** Runs one adapter decision hook and holds its runtime answer to `boolean`. */
 function adapterDecision(
-  adapter: AnyLogicalAdapter,
+  adapter: AdapterInspection,
   hook: "acceptsPhysical" | "matches",
   column: string,
-  decide: () => unknown,
+  args: readonly unknown[],
 ): boolean {
+  const decide = adapter[hook];
+  if (decide === undefined) return false;
   let result: unknown;
   try {
-    result = decide();
+    result = Reflect.apply(decide, adapter.adapter, args);
   } catch (cause) {
     throw badOption(
       `The column type ${adapter.name} threw from ${hook}() on column "${column}"`,
@@ -281,28 +292,20 @@ function claimedBy(
   physical: PhysicalKind,
   typeLength: number | undefined,
   annotation: Annotation,
-  types: readonly AnyLogicalAdapter[],
-): AnyLogicalAdapter | undefined {
+  types: readonly AdapterInspection[],
+): AdapterInspection | undefined {
   for (const adapter of types) {
     const exactLayout =
       adapter.physical === physical && (physical !== "fixed" || adapter.typeLength === typeLength);
     if (!exactLayout) {
-      const acceptsPhysical: unknown = Reflect.get(adapter, "acceptsPhysical");
-      if (acceptsPhysical === undefined) continue;
-      if (typeof acceptsPhysical !== "function") {
-        throw badOption(
-          `The column type ${adapter.name} has a non-function acceptsPhysical property on column "${element.name}"`,
-          element.name,
-        );
-      }
-      const acceptsAlternative = adapterDecision(adapter, "acceptsPhysical", element.name, () =>
-        Reflect.apply(acceptsPhysical, adapter, [physical, typeLength]),
-      );
+      if (adapter.acceptsPhysical === undefined) continue;
+      const acceptsAlternative = adapterDecision(adapter, "acceptsPhysical", element.name, [
+        physical,
+        typeLength,
+      ]);
       if (!acceptsAlternative) continue;
     }
-    const claimed = adapterDecision(adapter, "matches", element.name, () =>
-      adapter.matches(annotation, physical),
-    );
+    const claimed = adapterDecision(adapter, "matches", element.name, [annotation, physical]);
     if (claimed) return adapter;
   }
   return undefined;
@@ -317,7 +320,7 @@ function claimedBy(
  */
 function columnOf(
   element: SchemaElement,
-  types: readonly AnyLogicalAdapter[],
+  types: readonly AdapterInspection[],
   index: number,
 ): ReadColumn {
   const { name, physical } = element;
@@ -359,7 +362,15 @@ function columnOf(
   }
   const adapter = claimedBy(element, kind, typeLength, annotation, types);
   if (adapter !== undefined) {
-    return { name, type: adapter, optional, typeLength, physical: kind, index };
+    return {
+      name,
+      type: adapter.adapter,
+      adapter,
+      optional,
+      typeLength,
+      physical: kind,
+      index,
+    };
   }
 
   const builtin = builtinTypeOf(kind, annotation);
@@ -393,7 +404,7 @@ function columnOf(
  */
 function toSchema(
   elements: readonly SchemaElement[],
-  types: readonly AnyLogicalAdapter[],
+  types: readonly AdapterInspection[],
   selection: ReadonlySet<string> | undefined,
 ): FileSchema {
   const root = elements[0];
@@ -502,7 +513,7 @@ function publicColumn(column: ReadColumn): SchemaColumn {
 /** Converts one decoded PLAIN value into the type the column promises. */
 function toValue(column: ReadColumn, values: ColumnValues, index: number): ReadValue {
   const { type } = column;
-  if (typeof type !== "string") return adapt(column, type, values.items[index]);
+  if (typeof type !== "string") return adapt(column, column.adapter, values.items[index]);
   switch (values.kind) {
     case "bytes": {
       const text = decodeUtf8(values.items[index]);
@@ -541,9 +552,9 @@ function toValue(column: ReadColumn, values: ColumnValues, index: number): ReadV
  * The value is cast on the way out: what an adapter returns is its own
  * business, and `ReadRowOf` is where its real type comes back.
  */
-function adapt(column: ReadColumn, adapter: AnyLogicalAdapter, raw: unknown): ReadValue {
+function adapt(column: ReadColumn, adapter: AdapterInspection, raw: unknown): ReadValue {
   try {
-    return adapter.read(raw) as ReadValue;
+    return Reflect.apply(adapter.read, adapter.adapter, [raw]) as ReadValue;
   } catch (cause) {
     const refusal = adapterUnsupportedDetails(cause);
     if (refusal !== undefined) {
@@ -1225,27 +1236,41 @@ export function readSchema(bytes: Uint8Array, options?: ReadOptions): ParquetSch
 }
 
 /**
- * Validates `options.types` once, before a footer is looked at, and freezes
- * each of them.
+ * Validates `options.types` once, before a footer is looked at, freezes each
+ * adapter, and retains the exact metadata and hooks that passed inspection.
  *
  * An entry that is not a column type would otherwise surface as a `TypeError`
  * from somewhere inside a column, breaking the one promise that holds
  * everywhere else: everything this library throws is a `TavolatoError`. The
- * freeze is the cheap half of the same idea as `ReadColumn`: a column type is a
- * value, and the read it takes part in should not depend on when it was asked.
+ * The snapshot is the other half of the same idea as `ReadColumn`: a column
+ * type is a value, and the read it takes part in should not depend on when a
+ * getter was asked.
  */
-function registeredTypes(options: ReadOptions | undefined): readonly AnyLogicalAdapter[] {
+function registeredTypes(options: ReadOptions | undefined): readonly AdapterInspection[] {
   const types = options?.types;
   if (types === undefined) return [];
   if (!Array.isArray(types)) {
     throw badOption(`ReadOptions.types must be an array, received ${describe(types)}`);
   }
+  const registered: AdapterInspection[] = [];
   for (const [index, adapter] of types.entries()) {
-    const problem = adapterProblem(adapter);
-    if (problem !== undefined) throw badOption(`ReadOptions.types[${index}] ${problem}`);
-    Object.freeze(adapter);
+    let inspected: AdapterInspection | string;
+    try {
+      inspected = inspectAdapter(adapter);
+    } catch (cause) {
+      throw badOption(`ReadOptions.types[${index}] threw while being inspected`, undefined, cause);
+    }
+    if (typeof inspected === "string") {
+      throw badOption(`ReadOptions.types[${index}] ${inspected}`);
+    }
+    try {
+      Object.freeze(adapter);
+    } catch (cause) {
+      throw badOption(`ReadOptions.types[${index}] could not be frozen`, undefined, cause);
+    }
+    registered.push(inspected);
   }
-  return types;
+  return registered;
 }
 
 /**

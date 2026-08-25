@@ -144,6 +144,12 @@ export interface AdapterInspection {
   readonly physical: PhysicalKind;
   readonly typeLength: number | undefined;
   readonly annotation: Annotation;
+  readonly acceptsPhysical:
+    | ((physical: PhysicalKind, typeLength: number | undefined) => boolean)
+    | undefined;
+  readonly matches: (annotation: Annotation, physical: PhysicalKind) => boolean;
+  readonly read: (raw: unknown) => unknown;
+  readonly write: (value: unknown) => unknown;
 }
 
 /**
@@ -215,6 +221,10 @@ export function inspectAdapter(spec: unknown): AdapterInspection | string {
     physical,
     typeLength,
     annotation: inspectedAnnotation,
+    acceptsPhysical: acceptsPhysical as AdapterInspection["acceptsPhysical"],
+    matches: matches as AdapterInspection["matches"],
+    read: read as AdapterInspection["read"],
+    write: write as AdapterInspection["write"],
   };
 }
 

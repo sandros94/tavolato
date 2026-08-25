@@ -110,6 +110,34 @@ function annotatedAs(
   });
 }
 
+function statefulDecision(
+  hook: "acceptsPhysical" | "matches",
+  throwAt: number,
+): { readonly adapter: AnyLogicalAdapter; readonly reads: () => number; readonly failure: Error } {
+  const annotation = { kind: "decimal", precision: 9, scale: 0 } as const;
+  const failure = new Error(`${hook} getter failed`);
+  let reads = 0;
+  const spec: AnyLogicalAdapter = {
+    name: `volatile-${hook}`,
+    physical: hook === "acceptsPhysical" ? "i64" : "i32",
+    matches: () => true,
+    annotate: (): Annotation => annotation,
+    read: (raw) => raw,
+    write: (value) => value,
+  };
+  Object.defineProperty(spec, hook, {
+    configurable: true,
+    enumerable: true,
+    get(): (value: Annotation | PhysicalKind) => boolean {
+      if (++reads === throwAt) throw failure;
+      return hook === "acceptsPhysical"
+        ? (physical) => physical === "i32"
+        : (found) => (found as Annotation).kind === "decimal";
+    },
+  });
+  return { adapter: defineColumnType(spec), reads: () => reads, failure };
+}
+
 describe("defineColumnType", () => {
   const MAX_TYPE_LENGTH = 0x7f_ff_ff_ff;
   const valid = {
@@ -680,6 +708,113 @@ describe("claiming a column", () => {
       expect(error.message).toContain("an object");
       expect(error.cause).toBeUndefined();
     }
+  });
+
+  it.each(["acceptsPhysical", "matches"] as const)(
+    "types a %s getter that throws during read-option inspection",
+    (hook) => {
+      const { adapter, failure } = statefulDecision(hook, 2);
+      const annotation = { kind: "decimal", precision: 9, scale: 0 } as const;
+      const bytes = write(annotatedAs(annotation, "i32"), [7]);
+
+      const error = expectError("ERR_READ_OPTION_INVALID", () =>
+        readParquet(bytes, { types: [adapter] }),
+      );
+      expect(error.column).toBeUndefined();
+      expect(error.cause).toBe(failure);
+      expect(error.message).toContain("ReadOptions.types[0]");
+    },
+  );
+
+  it.each(["acceptsPhysical", "matches"] as const)(
+    "snapshots a %s getter once for the whole read",
+    (hook) => {
+      const { adapter, reads } = statefulDecision(hook, 3);
+      const annotation = { kind: "decimal", precision: 9, scale: 0 } as const;
+      const bytes = write(annotatedAs(annotation, "i32"), [7]);
+
+      const file = readParquet(bytes, { types: [adapter] });
+      expect(file.rows).toEqual([{ v: 7 }]);
+      expect(file.schema.columns[0].type).toBe(adapter);
+      expect(reads()).toBe(2);
+    },
+  );
+
+  it("snapshots read() while preserving its adapter receiver", () => {
+    const annotation = { kind: "decimal", precision: 9, scale: 0 } as const;
+    let reads = 0;
+    const adapter = defineColumnType({
+      name: "volatile-read",
+      physical: "i32",
+      matches: (found) => found.kind === "decimal",
+      annotate: (): Annotation => annotation,
+      get read(): (raw: unknown) => unknown {
+        if (++reads === 3) throw new Error("read getter failed");
+        return function (this: { readonly name: string }, raw: unknown): unknown {
+          return this.name === "volatile-read" ? raw : "wrong receiver";
+        };
+      },
+      write: (value: number) => value,
+    });
+    const bytes = write(annotatedAs(annotation, "i32"), [7, 8]);
+
+    const file = readParquet(bytes, { types: [adapter] });
+    expect(file.rows).toEqual([{ v: 7 }, { v: 8 }]);
+    expect(file.schema.columns[0].type).toBe(adapter);
+    expect(reads).toBe(2);
+  });
+
+  it("keeps the hook failure typed when the adapter name getter also traps", () => {
+    const failure = new Error("matches failed");
+    let nameReads = 0;
+    const adapter = defineColumnType({
+      get name(): string {
+        if (++nameReads === 3) throw new Error("name failed");
+        return "volatile-name";
+      },
+      physical: "fixed",
+      typeLength: 16,
+      matches: () => {
+        throw failure;
+      },
+      annotate: (): Annotation => ({ kind: "uuid" }),
+      read: (raw) => raw as Uint8Array,
+      write: (value: Uint8Array) => value,
+    });
+    const bytes = write(uuid(), ["b3f2c1a0-1111-4222-8333-444455556666"]);
+
+    const error = expectError("ERR_READ_OPTION_INVALID", () =>
+      readParquet(bytes, { types: [adapter] }),
+    );
+    expect(error.column).toBe("v");
+    expect(error.cause).toBe(failure);
+    expect(error.message).toContain("volatile-name");
+    expect(nameReads).toBe(2);
+  });
+
+  it("types a trap raised while freezing a registered adapter", () => {
+    const failure = new Error("cannot freeze");
+    const target = {
+      name: "unfreezable",
+      physical: "fixed" as const,
+      typeLength: 16,
+      matches: (annotation: Annotation) => annotation.kind === "uuid",
+      annotate: (): Annotation => ({ kind: "uuid" }),
+      read: (raw: unknown) => raw,
+      write: (value: Uint8Array) => value,
+    };
+    const adapter = new Proxy(target, {
+      preventExtensions: () => {
+        throw failure;
+      },
+    });
+    const bytes = write(uuid(), ["b3f2c1a0-1111-4222-8333-444455556666"]);
+
+    const error = expectError("ERR_READ_OPTION_INVALID", () =>
+      readParquet(bytes, { types: [adapter] }),
+    );
+    expect(error.column).toBeUndefined();
+    expect(error.cause).toBe(failure);
   });
 
   it("holds acceptsPhysical() to a boolean answer and typed failures", () => {
