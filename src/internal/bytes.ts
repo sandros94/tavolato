@@ -267,10 +267,14 @@ export class ByteReader {
 export const utf8: TextEncoder = /* @__PURE__ */ new TextEncoder();
 
 /**
- * Shared UTF-8 decoder, the mirror of {@link utf8}. `fatal` so that garbage
- * bytes surface as a malformed file instead of replacement characters.
+ * Shared UTF-8 decoder, the mirror of {@link utf8}. `fatal` makes garbage
+ * bytes malformed; `ignoreBOM` keeps a leading U+FEFF as content rather than
+ * treating its bytes as a transport signature.
  */
-const utf8Decoder: TextDecoder = /* @__PURE__ */ new TextDecoder("utf-8", { fatal: true });
+const utf8Decoder: TextDecoder = /* @__PURE__ */ new TextDecoder("utf-8", {
+  fatal: true,
+  ignoreBOM: true,
+});
 
 /** Decodes UTF-8 bytes, turning a decoding failure into a typed error. */
 export function decodeUtf8(bytes: Uint8Array): string {

@@ -4,6 +4,7 @@ import {
   createWriter,
   date,
   decimal,
+  defineColumnType,
   defineSchema,
   float16,
   integer,
@@ -23,6 +24,7 @@ import type {
   SchemaDefinition,
   WriterCodec,
 } from "../src/index.ts";
+import { expectError } from "./_errors.ts";
 import { sync } from "./_sync.ts";
 
 /**
@@ -286,6 +288,7 @@ describe.each(LEGS)("$label", ({ codec }) => {
       const values = [
         "",
         "ascii",
+        "\uFEFFleading BOM content",
         "é",
         "日本語テキスト",
         "🎉🚀",
@@ -300,6 +303,23 @@ describe.each(LEGS)("$label", ({ codec }) => {
         values.map((value, index) => ({ k: BigInt(index), s: value })),
       );
       expect(rows.map((row) => row.s)).toEqual(values);
+    });
+
+    it("still rejects malformed UTF-8 in a string column", () => {
+      const rawString = defineColumnType<Uint8Array, Uint8Array>({
+        name: "raw-string",
+        physical: "bytes",
+        matches: (annotation) => annotation.kind === "string",
+        annotate: () => ({ kind: "string" }),
+        read: (raw) => raw as Uint8Array,
+        write: (value) => value,
+      });
+      const writer = createWriter(defineSchema({ s: { type: rawString } }), { codec });
+      sync(writer.append({ s: new Uint8Array([0xff]) }));
+      const error = expectError("ERR_READ_MALFORMED", () =>
+        readParquet(sync(writer.finish()), read),
+      );
+      expect(error.cause).toBeInstanceOf(TypeError);
     });
 
     it("round-trips json documents as the structures they were given", () => {
