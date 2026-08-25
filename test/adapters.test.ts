@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 import {
   createWriter,
   date,
@@ -18,9 +18,16 @@ import {
 import type {
   Annotation,
   AnyLogicalAdapter,
+  DateOptions,
+  DateRepresentation,
+  DateValue,
+  Float16Options,
+  Float16Representation,
   LogicalAdapter,
   PhysicalKind,
+  ReadRowOf,
   ReadRow,
+  Row,
 } from "../src/index.ts";
 import { expectError } from "./_errors.ts";
 import { sync } from "./_sync.ts";
@@ -500,6 +507,18 @@ describe("claiming a column", () => {
       hex: { type: kinds.bytes },
     });
     const writer = createWriter(schema);
+    expectTypeOf<Row<typeof schema.definition>>().toExtend<{
+      flag: string;
+      share: string;
+      rough: string;
+      hex: string;
+    }>();
+    expectTypeOf<ReadRowOf<typeof schema.definition>>().toExtend<{
+      flag: string;
+      share: string;
+      rough: string;
+      hex: string;
+    }>();
     writer.append({ flag: "yes", share: "25%", rough: "0.5", hex: "0f10" });
     writer.append({ flag: "no", share: "50%", rough: "-2", hex: "" });
     const { rows } = readParquet(sync(writer.finish()), { types: Object.values(kinds) });
@@ -1018,13 +1037,26 @@ describe("date", () => {
   const maxDateDays = 100_000_000;
 
   it("round-trips UTC midnights on both sides of the epoch", () => {
+    const defaultDate = date();
+    const emptyOptions = date({});
+    const explicitDate = date({ as: "date" });
+    const numericDate = date({ as: "number" });
+    const options: DateOptions<DateRepresentation> = { as: "date" };
+    const either = date(options);
     const days = [
       new Date(Date.UTC(1970, 0, 1)),
       new Date(Date.UTC(1969, 6, 20)),
       new Date(Date.UTC(2026, 7, 24)),
       new Date(Date.UTC(9999, 11, 31)),
     ];
-    expect(roundtrip(date(), days)).toEqual(days);
+    expectTypeOf(defaultDate).toEqualTypeOf<LogicalAdapter<Date, Date>>();
+    expectTypeOf(emptyOptions).toEqualTypeOf<LogicalAdapter<Date, Date>>();
+    expectTypeOf(explicitDate).toEqualTypeOf<LogicalAdapter<Date, Date>>();
+    expectTypeOf(numericDate).toEqualTypeOf<LogicalAdapter<number, number>>();
+    expectTypeOf(either).toEqualTypeOf<LogicalAdapter<Date | number, Date | number>>();
+    expectTypeOf<DateValue<"number">>().toEqualTypeOf<number>();
+    expectTypeOf<"timestamp">().not.toExtend<DateRepresentation>();
+    expect(roundtrip(defaultDate, days)).toEqual(days);
   });
 
   it("round-trips the full Parquet DATE domain as signed day counts", () => {
@@ -1099,6 +1131,9 @@ describe("date", () => {
 
 describe("decimal", () => {
   it("round-trips the canonical form at every physical width", () => {
+    expectTypeOf(decimal({ precision: 9, scale: 2 })).toEqualTypeOf<
+      LogicalAdapter<string, string>
+    >();
     expect(roundtrip(decimal({ precision: 9, scale: 2 }), ["0.00", "-1.25", "9999999.99"])).toEqual(
       ["0.00", "-1.25", "9999999.99"],
     );
@@ -1269,6 +1304,7 @@ describe("decimal", () => {
 
 describe("uuid", () => {
   it("round-trips the canonical lowercase form", () => {
+    expectTypeOf(uuid()).toEqualTypeOf<LogicalAdapter<string, string>>();
     const ids = [
       "00000000-0000-0000-0000-000000000000",
       "ffffffff-ffff-ffff-ffff-ffffffffffff",
@@ -1296,6 +1332,10 @@ describe("time and timestamp", () => {
   it("preserves the UTC flag and claims only the exact TIME annotation", () => {
     const local = time({ unit: "micros", isAdjustedToUTC: false });
     const utc = time({ unit: "micros", isAdjustedToUTC: true });
+    const millis = time({ unit: "millis", isAdjustedToUTC: false });
+
+    expectTypeOf(local).toEqualTypeOf<LogicalAdapter<bigint, bigint>>();
+    expectTypeOf(millis).toEqualTypeOf<LogicalAdapter<number, number>>();
 
     expect(local.annotate()).toEqual({
       kind: "time",
@@ -1312,6 +1352,9 @@ describe("time and timestamp", () => {
   it("preserves the UTC flag and claims only the exact TIMESTAMP annotation", () => {
     const local = timestamp({ unit: "micros", isAdjustedToUTC: false });
     const utc = timestamp({ unit: "micros", isAdjustedToUTC: true });
+
+    expectTypeOf(local).toEqualTypeOf<LogicalAdapter<bigint, bigint>>();
+    expectTypeOf(utc).toEqualTypeOf<LogicalAdapter<bigint, bigint>>();
 
     expect(local.annotate()).toEqual({
       kind: "timestamp",
@@ -1498,6 +1541,18 @@ describe("float16", () => {
   it("maps 1.5 between its numeric value and exact bit pattern", () => {
     const number = float16();
     const bits = float16({ as: "bits" });
+    const options: Float16Options = { as: "bits" };
+    const rejectMutation = (value: Float16Options): void => {
+      // @ts-expect-error adapter options are immutable
+      value.as = "number";
+    };
+
+    expectTypeOf(number).toEqualTypeOf<LogicalAdapter<number, number>>();
+    expectTypeOf(bits).toEqualTypeOf<LogicalAdapter<number, number>>();
+    expectTypeOf(options.as).toEqualTypeOf<Float16Representation | undefined>();
+    expectTypeOf<"raw">().not.toExtend<Float16Representation>();
+    expectTypeOf<null>().not.toExtend<Float16Options>();
+    expectTypeOf(rejectMutation).toBeFunction();
     expect(bits.read(number.write(1.5))).toBe(0x3e00);
     expect(number.read(bits.write(0x3e00))).toBe(1.5);
     expect(bits.write(0x3e00)).toEqual(new Uint8Array([0x00, 0x3e]));
@@ -1565,6 +1620,7 @@ describe("integer", () => {
     [32, false, [0, 4_294_967_295]],
   ] as const)("round-trips the %i bit range (signed: %s)", (bitWidth, signed, [low, high]) => {
     const type = integer({ bitWidth, signed });
+    expectTypeOf(type).toEqualTypeOf<LogicalAdapter<number, number>>();
     expect(roundtrip(type, [low, 0, high])).toEqual([low, 0, high]);
     expectError("ERR_ROW_VALUE_INVALID", appendOne(type, low - 1));
     expectError("ERR_ROW_VALUE_INVALID", appendOne(type, high + 1));
@@ -1574,6 +1630,7 @@ describe("integer", () => {
 
   it("round-trips the 64 bit ranges as bigints", () => {
     const signed = integer({ bitWidth: 64 });
+    expectTypeOf(signed).toEqualTypeOf<LogicalAdapter<bigint, bigint>>();
     expect(roundtrip(signed, [-(2n ** 63n), 0n, 2n ** 63n - 1n])).toEqual([
       -(2n ** 63n),
       0n,
@@ -1617,9 +1674,16 @@ describe("nulls", () => {
         return value;
       },
     });
-    const writer = createWriter(
-      defineSchema({ k: { type: "i64" }, v: { type: counting, optional: true } }),
-    );
+    const schema = defineSchema({ k: { type: "i64" }, v: { type: counting, optional: true } });
+    const writer = createWriter(schema);
+    expectTypeOf<Row<typeof schema.definition>>().toExtend<{
+      k: bigint | number;
+      v?: number | null;
+    }>();
+    expectTypeOf<ReadRowOf<typeof schema.definition>>().toExtend<{
+      k: bigint;
+      v: number | null;
+    }>();
     writer.append({ k: 0n, v: 1 });
     writer.append({ k: 1n, v: null });
     writer.append({ k: 2n });

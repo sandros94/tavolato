@@ -1,5 +1,5 @@
 import { gunzipSync, gzipSync } from "node:zlib";
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 import {
   createWriter,
   decimal,
@@ -9,7 +9,13 @@ import {
   readSchema,
   uuid,
 } from "../src/index.ts";
-import type { ReaderCodec, ReadRow, ReadValue, SyncParquetRowGroups } from "../src/index.ts";
+import type {
+  ParquetFile,
+  ReaderCodec,
+  ReadRow,
+  ReadValue,
+  SyncParquetRowGroups,
+} from "../src/index.ts";
 import {
   CODEC_IDS,
   CompressionCodec,
@@ -114,10 +120,10 @@ describe("what a projected read hands back", () => {
 
   it("reads every column, which is the unprojected read again", () => {
     const bytes = sample(5);
-    const all = schema.columns.map((column) => column.name);
-    expect(readParquet(bytes, { columns: all, types: TYPES })).toEqual(
-      readParquet(bytes, { types: TYPES }),
-    );
+    const all: readonly string[] = schema.columns.map((column) => column.name);
+    const projected = readParquet(bytes, { columns: all, types: TYPES });
+    expectTypeOf(projected).toEqualTypeOf<ParquetFile>();
+    expect(projected).toEqual(readParquet(bytes, { types: TYPES }));
     // Asked for backwards, and still the file's order.
     expect(readParquet(bytes, { columns: [...all].reverse(), types: TYPES }).rows).toEqual(
       readParquet(bytes, { types: TYPES }).rows,
@@ -143,6 +149,7 @@ describe("what a projected read hands back", () => {
     const whole = readRowGroups(bytes, { types: TYPES });
     const projected = readRowGroups(bytes, { columns: ["i"] });
 
+    expectTypeOf(projected).toEqualTypeOf<SyncParquetRowGroups>();
     expect(projected.rowCount).toBe(whole.rowCount);
     expect(projected.groupCount).toBe(whole.groupCount);
     expect(readParquet(bytes, { columns: ["i"] }).rows).toHaveLength(7);

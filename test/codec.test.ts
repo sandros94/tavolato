@@ -1,13 +1,14 @@
 import { gunzipSync, gzipSync } from "node:zlib";
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 import {
   createWriter,
   defineSchema,
   isTavolatoError,
   readParquet,
+  uuid,
   TavolatoError,
 } from "../src/index.ts";
-import type { ParquetFile, ReaderCodec, Row, WriterCodec } from "../src/index.ts";
+import type { ParquetFile, ReaderCodec, ReadOptions, Row, WriterCodec } from "../src/index.ts";
 import { errorCode, expectError, expectRejection } from "./_errors.ts";
 import { sync } from "./_sync.ts";
 
@@ -85,6 +86,35 @@ describe("codec option", () => {
 describe("synchronous codecs", () => {
   it("never returns a promise, anywhere", () => {
     const writer = createWriter(schema, { codec: gzip, rowGroupSize: 4 });
+    const plainWriter = createWriter(schema);
+    const plainRead = (bytes: Uint8Array) => readParquet(bytes);
+    const typedRead = (bytes: Uint8Array) => readParquet(bytes, { types: [uuid()] });
+    const hookedRead = (bytes: Uint8Array) => readParquet(bytes, { codecs: readerCodecs(gzip) });
+    const dual = {
+      name: "GZIP",
+      compress: gzipSync,
+      decompress: (page: Uint8Array) => gunzipSync(page),
+    } as const;
+
+    expectTypeOf<ReturnType<typeof plainWriter.append>>().toEqualTypeOf<void>();
+    expectTypeOf<ReturnType<typeof plainWriter.finish>>().toEqualTypeOf<Uint8Array>();
+    expectTypeOf<ReturnType<typeof writer.append>>().toEqualTypeOf<void | Promise<void>>();
+    expectTypeOf<ReturnType<typeof writer.finish>>().toEqualTypeOf<
+      Uint8Array | Promise<Uint8Array>
+    >();
+    expectTypeOf<ReturnType<typeof plainRead>>().toEqualTypeOf<ParquetFile>();
+    expectTypeOf<ReturnType<typeof typedRead>>().toEqualTypeOf<ParquetFile>();
+    expectTypeOf<ReturnType<typeof hookedRead>>().toEqualTypeOf<
+      ParquetFile | Promise<ParquetFile>
+    >();
+    expectTypeOf(dual).toExtend<WriterCodec>();
+    expectTypeOf(dual).toExtend<ReaderCodec>();
+    expectTypeOf<{
+      name: "GZIP";
+      decompress(page: Uint8Array): Uint8Array;
+    }>().not.toExtend<WriterCodec>();
+    expectTypeOf<{ compress(page: Uint8Array): Uint8Array }>().not.toExtend<ReaderCodec>();
+    expectTypeOf<"DEFLATE">().not.toExtend<keyof NonNullable<ReadOptions["codecs"]>>();
     for (const row of rows()) expect(writer.append(row)).not.toBeInstanceOf(Promise);
     const bytes = writer.finish();
     expect(bytes).not.toBeInstanceOf(Promise);

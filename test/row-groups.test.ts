@@ -1,5 +1,5 @@
 import { gunzipSync, gzipSync } from "node:zlib";
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 import {
   createWriter,
   decimal,
@@ -369,6 +369,18 @@ describe("what a step can throw", () => {
 describe("staying synchronous", () => {
   it("never yields a thenable, and never crosses a microtask", () => {
     const file = readRowGroups(sample(6, 2), { types: TYPES });
+    const open = (bytes: Uint8Array) => readRowGroups(bytes);
+    const rejectCountMutation = (groups: SyncParquetRowGroups): void => {
+      // @ts-expect-error footer counts are immutable
+      groups.rowCount = 1;
+    };
+
+    expectTypeOf<ReturnType<typeof open>>().toEqualTypeOf<SyncParquetRowGroups>();
+    expectTypeOf(file).toEqualTypeOf<SyncParquetRowGroups>();
+    expectTypeOf(file).toExtend<Iterable<ReadRow[]>>();
+    expectTypeOf(file.groupCount).toEqualTypeOf<number>();
+    expectTypeOf(file.rowCount).toEqualTypeOf<number>();
+    expectTypeOf(rejectCountMutation).toBeFunction();
 
     // If any step deferred, this microtask would run before the walk ended.
     let deferred = false;
@@ -387,7 +399,9 @@ describe("staying synchronous", () => {
     queueMicrotask(() => {
       deferred = true;
     });
-    const groups = walk(readRowGroups(bytes, { types: TYPES, codecs: syncCodecs }));
+    const file = readRowGroups(bytes, { types: TYPES, codecs: syncCodecs });
+    expectTypeOf(file).toEqualTypeOf<ParquetRowGroups>();
+    const groups = walk(file);
 
     expect(deferred).toBe(false);
     expect(groups).toEqual(expected(6, 2));
@@ -398,6 +412,9 @@ describe("with an asynchronous decompressor", () => {
   it("yields a promise per step, and the very same rows", async () => {
     const bytes = sample(7, 3, gzip);
     const file: ParquetRowGroups = readRowGroups(bytes, { types: TYPES, codecs: asyncCodecs });
+    expectTypeOf(file).toEqualTypeOf<ParquetRowGroups>();
+    expectTypeOf(file).toExtend<Iterable<ReadRow[] | Promise<ReadRow[]>>>();
+    expectTypeOf(file).not.toExtend<SyncParquetRowGroups>();
     const groups: ReadRow[][] = [];
     for (const rows of file) {
       expect(rows).toBeInstanceOf(Promise);

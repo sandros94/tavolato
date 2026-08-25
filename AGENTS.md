@@ -25,7 +25,7 @@ Follow Oxfmt output: UTF-8, LF endings, final newline, two-space indentation, do
 
 ## Testing Guidelines
 
-Use Vitest `describe`/`it` blocks and name files `<feature>.test.ts`; type-only assertions belong in `*.test-d.ts`. Add focused unit tests beside cross-reader checks when changing encoded output. Every emitted Parquet shape should round-trip through tavolato and remain readable by DuckDB. Run lint, typecheck, tests, and build before opening a PR.
+Use Vitest `describe`/`it` blocks and name files `<feature>.test.ts`; colocate `expectTypeOf` assertions with the runtime tests for the same contract. `pnpm typecheck` remains the compiler gate. Add focused unit tests beside cross-reader checks when changing encoded output. Every emitted Parquet shape should round-trip through tavolato and remain readable by DuckDB. Run lint, typecheck, tests, and build before opening a PR.
 
 ## Commit & Pull Request Guidelines
 

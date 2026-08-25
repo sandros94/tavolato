@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 import {
   createWriter,
   defineColumnType,
@@ -9,7 +9,19 @@ import {
   readParquet,
   readSchema,
 } from "../src/index.ts";
-import type { JsonDocument, ParquetSchema, ReadRow, SchemaDefinition } from "../src/index.ts";
+import type {
+  JsonDangerousKeys,
+  JsonDocument,
+  JsonNull,
+  JsonOptions,
+  JsonRepresentation,
+  LogicalAdapter,
+  ParquetSchema,
+  ReadRow,
+  ReadRowOf,
+  Row,
+  SchemaDefinition,
+} from "../src/index.ts";
 import { decodeUtf8, utf8 } from "../src/internal/bytes.ts";
 import { expectError } from "./_errors.ts";
 import { sync } from "./_sync.ts";
@@ -26,6 +38,11 @@ import { sync } from "./_sync.ts";
  */
 
 const schema = defineSchema({ k: { type: "i64" }, doc: { type: "json" } });
+
+interface Payload {
+  user: number;
+  tags: string[];
+}
 
 /** Writes one document and reads it back. */
 function roundtrip(document: unknown): unknown {
@@ -196,6 +213,25 @@ describe("top-level JSON null", () => {
       { k: 2n, doc: { nested: null } },
     ]);
     const documents = readParquet(bytes).rows.map((row) => row.doc);
+    expectTypeOf<Row<typeof schema.definition>>().toExtend<{
+      k: bigint | number;
+      doc: JsonDocument;
+    }>();
+    expectTypeOf<Row<typeof declared.definition>>().toExtend<{
+      k: bigint | number;
+      doc?: JsonDocument | null;
+    }>();
+    expectTypeOf<ReadRowOf<typeof declared.definition>>().toExtend<{
+      k: bigint;
+      doc: JsonDocument | null;
+    }>();
+    expectTypeOf<{ k: bigint }>().toExtend<Row<typeof declared.definition>>();
+    expectTypeOf<{ k: bigint }>().not.toExtend<Row<typeof schema.definition>>();
+    expectTypeOf<{ k: bigint; doc: null }>().not.toExtend<Row<typeof schema.definition>>();
+    expectTypeOf(JSON_NULL).toEqualTypeOf<JsonNull>();
+    expectTypeOf(JSON_NULL).toExtend<JsonDocument>();
+    expectTypeOf<{ nested: null }>().toExtend<JsonDocument>();
+    expectTypeOf<null>().not.toExtend<JsonDocument>();
     expect(documents).toEqual([null, JSON_NULL, { nested: null }]);
     expect(documents[1]).toBe(JSON_NULL);
   });
@@ -599,8 +635,25 @@ describe("dangerous keys inside a document", () => {
 describe("the json column type", () => {
   it("writes exactly the bytes the built-in writes", () => {
     const document = { a: [1, 2], b: "café", c: null };
+    const value = json();
+    const explicit = json({ as: "value" });
+    const shaped = json<Payload>();
+    const declared = defineSchema({ loose: { type: value }, shaped: { type: shaped } });
+
+    expectTypeOf(value).toEqualTypeOf<LogicalAdapter<JsonDocument, JsonDocument>>();
+    expectTypeOf(explicit).toEqualTypeOf<LogicalAdapter<JsonDocument, JsonDocument>>();
+    expectTypeOf(shaped).toEqualTypeOf<LogicalAdapter<Payload, Payload>>();
+    expectTypeOf<Row<typeof declared.definition>>().toExtend<{
+      loose: JsonDocument;
+      shaped: Payload;
+    }>();
+    expectTypeOf<ReadRowOf<typeof declared.definition>>().toExtend<{
+      loose: JsonDocument;
+      shaped: Payload;
+    }>();
+    expectTypeOf<"bytes">().not.toExtend<JsonRepresentation>();
     const builtin = write(defineSchema({ doc: { type: "json" } }), [{ doc: document }]);
-    const adapted = write(defineSchema({ doc: { type: json() } }), [{ doc: document }]);
+    const adapted = write(defineSchema({ doc: { type: value } }), [{ doc: document }]);
     expect(adapted).toEqual(builtin);
   });
 
@@ -657,6 +710,23 @@ describe("the json column type", () => {
   });
 
   it("refuses an unknown dangerous-key policy", () => {
+    const options: JsonOptions = {
+      as: "value",
+      dangerousKeys: "preserve",
+      reviver: jsonReviver,
+    };
+    const rejectMutation = (value: JsonOptions): void => {
+      // @ts-expect-error adapter options are immutable
+      value.reviver = jsonReviver;
+    };
+    const fromOptions = (value: JsonOptions) => json(value);
+
+    expectTypeOf(options.dangerousKeys).toEqualTypeOf<JsonDangerousKeys | undefined>();
+    expectTypeOf<"remove">().not.toExtend<JsonDangerousKeys>();
+    expectTypeOf(rejectMutation).toBeFunction();
+    expectTypeOf<ReturnType<typeof fromOptions>>().toEqualTypeOf<
+      LogicalAdapter<JsonDocument | string, JsonDocument | string>
+    >();
     expectError("ERR_SCHEMA_COLUMN_INVALID", () => json({ dangerousKeys: "remove" as never }));
   });
 
@@ -702,6 +772,10 @@ describe("the json text representation", () => {
   });
 
   it("preserves each complete document exactly, without normalization", () => {
+    expectTypeOf(text).toEqualTypeOf<LogicalAdapter<string, string>>();
+    expectTypeOf<{ as: "text"; reviver: typeof jsonReviver }>().not.toExtend<JsonOptions>();
+    expectTypeOf<{ as: "text"; replacer: typeof jsonReviver }>().not.toExtend<JsonOptions>();
+    expectTypeOf<{ as: "text"; dangerousKeys: "preserve" }>().not.toExtend<JsonOptions>();
     const declared = defineSchema({ doc: { type: text } });
     const documents = ['{ "b": 2, "a": 1 }\n', "  [1, 2, 3]  ", '"café"', '"\\ud800"', "null"];
     const bytes = write(

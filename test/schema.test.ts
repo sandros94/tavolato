@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 import {
   createWriter,
   date,
@@ -10,7 +10,7 @@ import {
   TavolatoError,
   uuid,
 } from "../src/index.ts";
-import type { ParquetSchema } from "../src/types.ts";
+import type { JsonDocument, ParquetSchema, ReadRowOf, ReadValue, Row } from "../src/types.ts";
 import { expectError } from "./_errors.ts";
 
 describe("defineSchema", () => {
@@ -369,6 +369,37 @@ describe("row validation", () => {
 
   it("accepts a well-formed row", () => {
     const writer = createWriter(schema);
+    type Definition = typeof schema.definition;
+    type Written = {
+      s: string;
+      j: JsonDocument;
+      f: number;
+      g: number;
+      i: bigint | number;
+      n: number;
+      b: boolean;
+      t: Date | number;
+      opt?: string | null;
+    };
+    type Read = {
+      s: string;
+      j: JsonDocument;
+      f: number;
+      g: number;
+      i: bigint;
+      n: number;
+      b: boolean;
+      t: Date;
+      opt: string | null;
+    };
+
+    expectTypeOf<Row<Definition>>().toExtend<Written>();
+    expectTypeOf<Written>().toExtend<Row<Definition>>();
+    expectTypeOf<Parameters<typeof writer.append>[0]>().toEqualTypeOf<Row<Definition>>();
+    expectTypeOf<ReadRowOf<Definition>>().toExtend<Read>();
+    expectTypeOf<Read>().toExtend<ReadRowOf<Definition>>();
+    expectTypeOf<Uint8Array>().toExtend<ReadValue>();
+    expectTypeOf<{ a: readonly [1, null, "two"] }>().toExtend<ReadValue>();
     expect(() => writer.append({ ...valid })).not.toThrow();
     expect(writer.rowCount).toBe(1);
   });
