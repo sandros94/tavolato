@@ -5,6 +5,7 @@ import {
   type ColumnValues,
   decodeRleBitPackedHybrid,
   encodeRleBitPackedHybrid,
+  maxOneBitRleBitPackedHybridBytes,
   readPlain,
   writePlain,
 } from "../src/internal/encoding.ts";
@@ -42,6 +43,23 @@ describe("bitWidthForMaxLevel", () => {
 });
 
 describe("RLE / bit-packing hybrid", () => {
+  it.each([1, 8, 504, 505])("bounds bit-packed output at %i definition levels", (count) => {
+    const alternating = Array.from({ length: count }, (_, index) => index % 2);
+    expect(encodeRleBitPackedHybrid(alternating, 1).length).toBeLessThanOrEqual(
+      maxOneBitRleBitPackedHybridBytes(count),
+    );
+  });
+
+  it.each([16, 64, 504, 505])(
+    "bounds alternating eight-value RLE runs at %i definition levels",
+    (count) => {
+      const runs = Array.from({ length: count }, (_, index) => Math.floor(index / 8) % 2);
+      expect(encodeRleBitPackedHybrid(runs, 1)).toHaveLength(
+        maxOneBitRleBitPackedHybridBytes(count),
+      );
+    },
+  );
+
   it("emits an RLE run for eight identical values", () => {
     // rle-header = varint(8 << 1) = 0x10, then the repeated value on one byte.
     expect(

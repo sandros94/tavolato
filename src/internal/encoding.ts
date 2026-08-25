@@ -138,6 +138,18 @@ export function bitWidthForMaxLevel(maxLevel: number): number {
 }
 
 /**
+ * Largest byte length the encoder below can produce for `valueCount` one-bit
+ * values, the shape used by nullable definition levels.
+ *
+ * A group may become either two bytes of RLE header plus payload or part of a
+ * bit-packed run, where one data byte is amortized with its run header. So one
+ * two-byte RLE run per group is the exact maximum.
+ */
+export function maxOneBitRleBitPackedHybridBytes(valueCount: number): number {
+  return valueCount === 0 ? 0 : 2 * Math.ceil(valueCount / 8);
+}
+
+/**
  * Encodes definition/repetition levels with the RLE / bit-packing hybrid
  * encoding.
  *

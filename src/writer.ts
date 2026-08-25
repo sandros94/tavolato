@@ -1,6 +1,11 @@
 import { ByteWriter, encodeUtf8Exact, utf8 } from "./internal/bytes.ts";
 import { chain, chainEach, isThenable } from "./internal/chain.ts";
-import { type ColumnValues, encodeRleBitPackedHybrid, writePlain } from "./internal/encoding.ts";
+import {
+  type ColumnValues,
+  encodeRleBitPackedHybrid,
+  maxOneBitRleBitPackedHybridBytes,
+  writePlain,
+} from "./internal/encoding.ts";
 import {
   CODEC_IDS,
   codecId,
@@ -168,7 +173,10 @@ function stage(state: ColumnState, value: unknown, present: boolean): StagedValu
   const { type } = column;
   // An adapter column runs the caller's transform first, then holds what comes
   // back to the physical type it promised. Nulls never get this far.
-  if (typeof type !== "string") return stageRaw(state, type, adapt(column, type, value));
+  if (typeof type !== "string") {
+    assertFixedValueFitsPage(state);
+    return stageRaw(state, type, adapt(column, type, value));
+  }
   switch (type) {
     case "string": {
       if (typeof value !== "string") throw invalid(column, value, "a string");
@@ -301,27 +309,34 @@ function commit(state: ColumnState, staged: StagedValue): void {
   (state.values.items as unknown[]).push(staged.value);
 }
 
-/**
- * Upper bound, in bytes, of the page body (level stream plus PLAIN values) the
- * column chunk would need if `staged` were committed on top of what is already
- * buffered. Values are counted exactly; the level stream is bounded by its
- * worst case, an all-bit-packed run set (one byte per group of eight levels
- * plus one header byte per 63 groups).
- */
-function projectedPageSize(state: ColumnState, staged: StagedValue): number {
+/** Exact fixed-width PLAIN body plus optional v1 definition-level bound. @internal */
+export function fixedPageBodySize(
+  typeLength: number,
+  valueCount: number,
+  levelCount: number,
+  optional: boolean,
+): number {
+  return (
+    valueCount * typeLength + (optional ? 4 + maxOneBitRleBitPackedHybridBytes(levelCount) : 0)
+  );
+}
+
+/** Exact upper bound for one page body at the supplied counts. */
+function pageBodySize(
+  state: ColumnState,
+  valueCount: number,
+  byteArraySize: number,
+  levelCount: number,
+): number {
   const { values } = state;
-  const valueCount = values.items.length + (staged === null ? 0 : 1);
   let bytes: number;
   switch (values.kind) {
     case "bytes": {
-      bytes =
-        state.byteArraySize +
-        (staged !== null && staged.kind === "bytes" ? 4 + staged.value.length : 0);
+      bytes = byteArraySize;
       break;
     }
     case "fixed": {
-      bytes = valueCount * values.typeLength;
-      break;
+      return fixedPageBodySize(values.typeLength, valueCount, levelCount, state.column.optional);
     }
     case "bool": {
       bytes = Math.ceil(valueCount / 8);
@@ -337,10 +352,37 @@ function projectedPageSize(state: ColumnState, staged: StagedValue): number {
     }
   }
   if (state.column.optional) {
-    const levelCount = state.levels.length + 1;
-    bytes += 4 + Math.ceil(levelCount / 8) + Math.ceil(levelCount / 504) + 1;
+    // Data page v1 prefixes the encoded definition levels with their u32 byte
+    // length. Sharing the encoder bound keeps this budget aligned with the
+    // bytes that are eventually produced.
+    bytes += 4 + maxOneBitRleBitPackedHybridBytes(levelCount);
   }
   return bytes;
+}
+
+/**
+ * Upper bound, in bytes, of the page body (level stream plus PLAIN values) the
+ * column chunk would need if `staged` were committed on top of what is already
+ * buffered.
+ */
+function projectedPageSize(state: ColumnState, staged: StagedValue): number {
+  const valueCount = state.values.items.length + (staged === null ? 0 : 1);
+  const byteArraySize =
+    state.byteArraySize +
+    (staged !== null && staged.kind === "bytes" ? 4 + staged.value.length : 0);
+  return pageBodySize(state, valueCount, byteArraySize, state.levels.length + 1);
+}
+
+/** Refuses an inherently unwritable fixed value before its adapter is called. */
+function assertFixedValueFitsPage(state: ColumnState): void {
+  if (state.values.kind !== "fixed") return;
+  const size = pageBodySize(state, 1, 0, 1);
+  if (size <= MAX_PAGE_BYTES) return;
+  throw new TavolatoError(
+    `Column "${state.column.name}" has a ${state.values.typeLength} byte fixed-width value, which cannot fit a Parquet data page`,
+    "ERR_ROW_VALUE_INVALID",
+    state.column.name,
+  );
 }
 
 /**

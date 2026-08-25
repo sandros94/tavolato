@@ -1,9 +1,27 @@
 import { describe, expect, it } from "vitest";
-import { createWriter, defineSchema } from "../src/index.ts";
+import { createWriter, defineColumnType, defineSchema, readParquet } from "../src/index.ts";
+import type { Annotation, LogicalAdapter } from "../src/index.ts";
+import { fixedPageBodySize } from "../src/writer.ts";
 import { expectError } from "./_errors.ts";
 import { sync } from "./_sync.ts";
 
 const MAGIC = "PAR1";
+const MAX_PAGE_BYTES = 0x7f_ff_00_00;
+
+function fixedType(
+  typeLength: number,
+  write: (value: number) => Uint8Array,
+): LogicalAdapter<number, Uint8Array> {
+  return defineColumnType({
+    name: `fixed-${typeLength}`,
+    physical: "fixed",
+    typeLength,
+    matches: (annotation) => annotation.kind === "none",
+    annotate: (): Annotation => ({ kind: "none" }),
+    read: (raw) => raw as Uint8Array,
+    write,
+  });
+}
 
 function ascii(bytes: Uint8Array, start: number, end: number): string {
   return String.fromCodePoint(...bytes.subarray(start, end));
@@ -269,5 +287,77 @@ describe("row groups", () => {
     // One page (and one chunk of metadata) per row group makes the
     // row-group-per-row file strictly larger.
     expect(sync(small.finish()).length).toBeGreaterThan(sync(large.finish()).length);
+  });
+});
+
+describe("single-page fixed-width values", () => {
+  it("projects the exact flush boundary without allocating a fixed value", () => {
+    const levelCount = 504;
+    const definitionLevelBytes = 4 + 2 * Math.ceil(levelCount / 8);
+    const typeLength = (MAX_PAGE_BYTES - definitionLevelBytes) / 2;
+
+    expect(fixedPageBodySize(typeLength, 2, levelCount, true)).toBe(MAX_PAGE_BYTES);
+    expect(fixedPageBodySize(typeLength + 1, 2, levelCount, true)).toBeGreaterThan(MAX_PAGE_BYTES);
+  });
+
+  it.each([
+    ["required", false, MAX_PAGE_BYTES],
+    ["optional", true, MAX_PAGE_BYTES - 6],
+  ] as const)("checks the %s boundary before invoking the adapter", (_, optional, largestWidth) => {
+    const reached = new Error("adapter reached");
+    let exactCalls = 0;
+    const exact = fixedType(largestWidth, () => {
+      exactCalls++;
+      throw reached;
+    });
+    const exactWriter = createWriter(defineSchema({ v: { type: exact, optional } }));
+    const adapted = expectError("ERR_ROW_VALUE_INVALID", () => exactWriter.append({ v: 1 }));
+    expect(adapted.cause).toBe(reached);
+    expect(exactCalls).toBe(1);
+
+    let oversizedCalls = 0;
+    const oversized = fixedType(largestWidth + 1, () => {
+      oversizedCalls++;
+      throw new Error("must not run");
+    });
+    const writer = createWriter(defineSchema({ v: { type: oversized, optional } }));
+    const error = expectError("ERR_ROW_VALUE_INVALID", () => writer.append({ v: 1 }));
+    expect(error.column).toBe("v");
+    expect(error.message).toContain("cannot fit a Parquet data page");
+    expect(oversizedCalls).toBe(0);
+    expect(writer.rowCount).toBe(0);
+  });
+
+  it("keeps empty and all-null maximum-width files usable without invoking the adapter", () => {
+    let calls = 0;
+    const widest = fixedType(0x7f_ff_ff_ff, () => {
+      calls++;
+      throw new Error("must not run");
+    });
+
+    const empty = createWriter(defineSchema({ v: { type: widest } }));
+    expect(readParquet(sync(empty.finish()), { types: [widest] }).rows).toEqual([]);
+
+    const nullable = createWriter(defineSchema({ v: { type: widest, optional: true } }));
+    nullable.append({ v: null });
+    nullable.append({});
+    expect(readParquet(sync(nullable.finish()), { types: [widest] }).rows).toEqual([
+      { v: null },
+      { v: null },
+    ]);
+    expect(calls).toBe(0);
+  });
+
+  it("remains usable after refusing an oversized nullable fixed value", () => {
+    const oversized = fixedType(MAX_PAGE_BYTES, () => {
+      throw new Error("must not run");
+    });
+    const writer = createWriter(defineSchema({ v: { type: oversized, optional: true } }));
+
+    expectError("ERR_ROW_VALUE_INVALID", () => writer.append({ v: 1 }));
+    writer.append({ v: null });
+
+    expect(writer.rowCount).toBe(1);
+    expect(readParquet(sync(writer.finish()), { types: [oversized] }).rows).toEqual([{ v: null }]);
   });
 });
