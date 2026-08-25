@@ -1,7 +1,7 @@
 {
   "name": "tavolato",
-  "version": "0.0.0",
-  "description": "A small Parquet writer, and a reader for the files it writes, that works anywhere.",
+  "version": "0.0.1",
+  "description": "A small Parquet reader and writer that works anywhere.",
   "keywords": [
     "analytics",
     "columnar-storage",
