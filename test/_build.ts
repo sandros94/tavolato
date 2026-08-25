@@ -1,0 +1,84 @@
+import { ByteWriter } from "../src/internal/bytes.ts";
+import { writePlain } from "../src/internal/encoding.ts";
+import { encodeDataPageHeader, MAGIC } from "../src/internal/format.ts";
+
+/**
+ * Hand-building Parquet files, for the shapes tavolato's own writer cannot
+ * produce.
+ *
+ * The writer emits exactly one data page per column chunk, so no file it makes
+ * can exercise the reader's page loop — and a multi-page chunk is what every
+ * other writer produces, `parquet-mr` and Arrow cutting a page roughly every
+ * megabyte. The suite gets one from here instead.
+ */
+
+/** What one written page cost, in the two sizes a column chunk has to add up. */
+export interface WrittenPage {
+  readonly uncompressedSize: number;
+  readonly compressedSize: number;
+}
+
+/** Opens a hand-built file: the leading magic, and nothing else yet. */
+export function startFile(): ByteWriter {
+  const out = new ByteWriter(1024);
+  out.raw(MAGIC);
+  return out;
+}
+
+/**
+ * Appends one v1 PLAIN data page of required `INT64` values, optionally passing
+ * the body through `compress` exactly as the writer would.
+ */
+export function writeDataPage(
+  out: ByteWriter,
+  values: readonly bigint[],
+  compress?: (body: Uint8Array) => Uint8Array,
+): WrittenPage {
+  const raw = plainBody(values);
+  const stored = compress === undefined ? raw : compress(raw);
+  const header = encodeDataPageHeader(raw.length, stored.length, values.length);
+  out.raw(header);
+  out.raw(stored);
+  return {
+    uncompressedSize: header.length + raw.length,
+    compressedSize: header.length + stored.length,
+  };
+}
+
+/** The PLAIN bytes of required `INT64` values: what a data page body holds. */
+export function plainBody(values: readonly bigint[]): Uint8Array {
+  const body = new ByteWriter(64);
+  writePlain(body, { kind: "i64", items: [...values] });
+  return body.toBytes();
+}
+
+/** Closes a hand-built file: the footer, its length, and the trailing magic. */
+export function sealFile(out: ByteWriter, footer: Uint8Array): Uint8Array {
+  out.raw(footer);
+  out.u32(footer.length);
+  out.raw(MAGIC);
+  return out.toBytes();
+}
+
+/**
+ * Rewrites the physical type of the file's **first `INT64` column**, standing
+ * in for a file no writer here can produce: an `INT96`, or a type Parquet never
+ * defined at all.
+ *
+ * The leaf's `SchemaElement` is `15 04 25 …`: type INT64 (zigzag 2 = 4), then
+ * the repetition, then the name. Only the schema element spells the type that
+ * way — the column chunk's copy is followed by its encodings list — so the
+ * pattern is unambiguous, and the schema is the first list the footer carries.
+ */
+export function withPhysicalType(bytes: Uint8Array, physical: number): Uint8Array {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const footer = bytes.length - 8 - view.getUint32(bytes.length - 8, true);
+  for (let offset = footer; offset < bytes.length - 8; offset++) {
+    if (bytes[offset] === 0x15 && bytes[offset + 1] === 0x04 && bytes[offset + 2] === 0x25) {
+      const copy = bytes.slice();
+      copy[offset + 1] = physical * 2; // zigzag of a small positive number
+      return copy;
+    }
+  }
+  throw new Error("no INT64 schema element found");
+}

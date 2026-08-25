@@ -24,6 +24,6 @@
     // `src/` stays runtime agnostic.
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "include": ["src/**/*.ts", "test/**/*.ts", "playgrounds/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }

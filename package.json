@@ -1,13 +1,16 @@
 {
   "name": "tavolato",
   "version": "0.0.1",
-  "description": "A small Parquet writer that works anywhere.",
+  "description": "A small Parquet reader and writer that works anywhere.",
   "keywords": [
-    "columnar",
+    "analytics",
+    "columnar-storage",
+    "javascript",
     "parquet",
+    "parquet-reader",
+    "parquet-writer",
     "runtime-agnostic",
-    "thrift",
-    "writer"
+    "typescript"
   ],
   "license": "MIT",
   "author": {
@@ -58,11 +61,11 @@
     "oxlint-tsgolint": "^7.0.2001",
     "simple-git-hooks": "^2.13.1",
     "typescript": "^7.0.2",
-    "uns3": "^0.0.7",
+    "uns3": "^0.0.8",
     "vitest": "^4.1.10"
   },
   "peerDependencies": {
-    "uns3": "^0.0.7"
+    "uns3": "^0.0.8"
   },
   "peerDependenciesMeta": {
     "uns3": {

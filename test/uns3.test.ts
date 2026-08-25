@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { PutObjectParams, S3Client } from "uns3";
 import { createWriter, defineSchema } from "../src/index.ts";
 import { PARQUET_CONTENT_TYPE, putParquet } from "../src/uns3.ts";
+import { expectRejection } from "./_errors.ts";
+import { sync } from "./_sync.ts";
 import * as root from "../src/index.ts";
 
 /**
@@ -22,11 +24,31 @@ function stubClient(): { client: S3Client; calls: PutObjectParams[] } {
 const schema = defineSchema({ n: { type: "i64" } });
 
 describe("putParquet", () => {
+  it("refuses every non-object params value", async () => {
+    for (const params of [
+      undefined,
+      null,
+      false,
+      0,
+      1n,
+      "params",
+      Symbol("params"),
+      () => undefined,
+    ]) {
+      const { client, calls } = stubClient();
+      await expectRejection(
+        "ERR_STORE_INPUT_INVALID",
+        putParquet(client, params as never, new Uint8Array()),
+      );
+      expect(calls).toHaveLength(0);
+    }
+  });
+
   it("uploads raw bytes with the Parquet media type", async () => {
     const { client, calls } = stubClient();
     const writer = createWriter(schema);
     writer.append({ n: 1n });
-    const bytes = writer.finish();
+    const bytes = sync(writer.finish());
 
     const response = await putParquet(client, { bucket: "b", key: "a.parquet" }, bytes);
 
@@ -95,11 +117,25 @@ describe("putParquet", () => {
 describe("export map", () => {
   it("keeps the uns3 helper out of the root entry point", () => {
     expect(Object.keys(root).sort()).toEqual([
+      "JSON_NULL",
       "ParquetWriter",
       "TavolatoError",
       "createWriter",
+      "date",
+      "decimal",
+      "defineColumnType",
       "defineSchema",
+      "float16",
+      "integer",
       "isTavolatoError",
+      "json",
+      "jsonReviver",
+      "readParquet",
+      "readRowGroups",
+      "readSchema",
+      "time",
+      "timestamp",
+      "uuid",
     ]);
   });
 });

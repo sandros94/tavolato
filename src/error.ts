@@ -1,9 +1,11 @@
 /**
  * All known error codes thrown by tavolato.
  *
- *   ERR_SCHEMA_* — problems with the schema handed to `defineSchema`
+ *   ERR_SCHEMA_* — problems found by `defineSchema`, adapters or `createWriter`
  *   ERR_ROW_*    — problems with a row handed to `append` / `appendAll`
  *   ERR_WRITER_* — problems with how the writer itself is being driven
+ *   ERR_READ_*   — problems with the bytes handed to `readParquet` / `readSchema`
+ *   ERR_STORE_*  — problems a `tavolato/uns3` store hits talking to object storage
  */
 export type TavolatoErrorCode =
   // Schema definition
@@ -17,7 +19,30 @@ export type TavolatoErrorCode =
   // Writer lifecycle / options
   | "ERR_WRITER_FINISHED" // `append` / `finish` called after `finish`
   | "ERR_WRITER_OPTION_INVALID" // bad `createWriter` option
+  | "ERR_WRITER_BUSY" // used again before the promise a previous call returned settled
+  | "ERR_WRITER_CODEC_FAILED" // the compression hook threw, rejected, or returned something unusable
+  // File reading
+  | "ERR_READ_OPTION_INVALID" // bad `readParquet` option
+  | "ERR_READ_MALFORMED" // the bytes are not a well-formed Parquet file
+  | "ERR_READ_UNSUPPORTED" // well-formed Parquet, but outside the subset tavolato writes
+  // Object storage, through `tavolato/uns3`
+  | "ERR_STORE_INPUT_INVALID" // `store.put` was handed something it cannot upload
+  | "ERR_STORE_OBJECT_CHANGED" // the object was replaced between two of a read's requests
+  | "ERR_STORE_RANGE_UNSATISFIED" // a ranged read came back with bytes other than the ones asked for
   | (string & {}); // forward-compatible escape hatch
+
+const SAFE_CODE_CHARACTER = /^[A-Za-z0-9_.:-]$/;
+
+/** Keeps a caller-authored forward-compatible code inside one visible name delimiter. */
+function renderedCode(code: string): string {
+  let rendered = "";
+  for (const character of code) {
+    rendered += SAFE_CODE_CHARACTER.test(character)
+      ? character
+      : `\\u{${character.codePointAt(0)!.toString(16)}}`;
+  }
+  return rendered;
+}
 
 /**
  * Base error class for all tavolato errors. Every error thrown by the library
@@ -44,11 +69,137 @@ export class TavolatoError<TCode extends TavolatoErrorCode = TavolatoErrorCode> 
 
   constructor(message: string, code: TCode, column?: string, cause?: unknown) {
     super(message);
-    this.name = "TavolatoError";
+    this.name = `TavolatoError [${renderedCode(code)}]`;
     this.code = code;
     this.column = column;
     this.cause = cause;
   }
+}
+
+/**
+ * Renders an offending value for an error message, without ever stringifying
+ * an object: a message about a bad value must not run somebody's `toString`.
+ *
+ * @internal
+ */
+export function describe(value: unknown): string {
+  if (value === null) return "null";
+  switch (typeof value) {
+    case "undefined": {
+      return "undefined";
+    }
+    case "bigint": {
+      return `${value}n`;
+    }
+    case "string": {
+      return JSON.stringify(value);
+    }
+    case "number":
+    case "boolean": {
+      return String(value);
+    }
+    case "symbol": {
+      return value.toString();
+    }
+    default: {
+      // object and function
+      try {
+        return Object.prototype.toString.call(value);
+      } catch {
+        // A proxy or Symbol.toStringTag accessor can trap the ordinary tag
+        // lookup. `typeof` performs no property access, so this fallback stays
+        // total even for a hostile value supplied by a callback.
+        return typeof value === "function" ? "a function" : "an object";
+      }
+    }
+  }
+}
+
+/** Validates a required public options bag at its API boundary. @internal */
+export function assertOptionsObject(
+  value: unknown,
+  label: string,
+  code: TavolatoErrorCode,
+): asserts value is object {
+  if (typeof value !== "object" || value === null) {
+    throw new TavolatoError(`${label} must be an object, received ${describe(value)}`, code);
+  }
+}
+
+/** Validates an optional public options bag while preserving omission. @internal */
+export function assertOptionalOptionsObject(
+  value: unknown,
+  label: string,
+  code: TavolatoErrorCode,
+): asserts value is object | undefined {
+  if (value !== undefined) assertOptionsObject(value, label, code);
+}
+
+/**
+ * The bytes are not a well-formed Parquet file: wrong magic, a truncated
+ * stream, a length that does not fit, a structure that contradicts itself.
+ *
+ * @internal
+ */
+export function malformed(message: string, column?: string, cause?: unknown): TavolatoError {
+  return new TavolatoError(message, "ERR_READ_MALFORMED", column, cause);
+}
+
+/**
+ * The file is valid Parquet, but uses something tavolato never writes and
+ * therefore refuses to read. `found` names the offending feature.
+ *
+ * `remedy` is appended where the refusal is one the caller can lift: a codec
+ * tavolato knows by name but cannot implement, or an annotation whose
+ * JavaScript type is a decision only the caller can make.
+ *
+ * @internal
+ */
+export function unsupported(found: string, column?: string, remedy?: string): TavolatoError {
+  const next =
+    remedy === undefined
+      ? "This feature is outside tavolato's supported Parquet subset."
+      : `${remedy.charAt(0).toUpperCase()}${remedy.slice(1)}.`;
+  return new TavolatoError(`Cannot read ${found}. ${next}`, "ERR_READ_UNSUPPORTED", column);
+}
+
+/** The file feature and remedy carried out of an in-box adapter's `read`. @internal */
+export interface AdapterUnsupportedDetails {
+  readonly found: string;
+  readonly remedy: string;
+}
+
+/*
+ * Only errors made here enter this map. A caller-authored adapter throwing an
+ * `ERR_READ_UNSUPPORTED` remains a failed callback and is wrapped as malformed;
+ * in-box adapters can instead hand a valid but unrepresentable value back to
+ * the reader, which adds the column context before exposing the refusal.
+ */
+const ADAPTER_UNSUPPORTED = new WeakMap<TavolatoError, AdapterUnsupportedDetails>();
+
+/** Creates a refusal an in-box adapter can hand back to the reader. @internal */
+export function adapterUnsupported(found: string, remedy: string): TavolatoError {
+  const error = unsupported(found, undefined, remedy);
+  ADAPTER_UNSUPPORTED.set(error, { found, remedy });
+  return error;
+}
+
+/** Recovers an in-box adapter refusal without trusting caller-thrown errors. @internal */
+export function adapterUnsupportedDetails(error: unknown): AdapterUnsupportedDetails | undefined {
+  return error instanceof TavolatoError ? ADAPTER_UNSUPPORTED.get(error) : undefined;
+}
+
+/** The remedy for a column whose meaning is a decision only the caller can make. */
+export const TYPES_REMEDY: string = "pass a matching type in ReadOptions.types to read it anyway";
+
+/**
+ * Something handed to `readParquet` in its options cannot be used as given —
+ * as opposed to the *file* being unreadable, which is what the other two say.
+ *
+ * @internal
+ */
+export function badOption(message: string, column?: string, cause?: unknown): TavolatoError {
+  return new TavolatoError(message, "ERR_READ_OPTION_INVALID", column, cause);
 }
 
 /**

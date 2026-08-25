@@ -1,4 +1,5 @@
-import { ByteWriter, utf8 } from "./bytes.ts";
+import { ByteReader, ByteWriter, decodeUtf8, utf8 } from "./bytes.ts";
+import { malformed } from "../error.ts";
 
 /**
  * Thrift *compact protocol* type ids, as used both in struct field headers and
@@ -46,14 +47,25 @@ export function zigzag64(value: bigint): bigint {
   return BigInt.asUintN(64, (value << 1n) ^ (value >> 63n));
 }
 
+/** Inverse of {@link zigzag32}. Truncates to 32 bits, exactly as Thrift does. */
+export function unzigzag32(value: number): number {
+  return (value >>> 1) ^ -(value & 1);
+}
+
+/** Inverse of {@link zigzag64}. */
+export function unzigzag64(value: bigint): bigint {
+  return BigInt.asIntN(64, (value >> 1n) ^ -(value & 1n));
+}
+
 /**
  * A minimal Thrift compact protocol *writer*.
  *
  * Only the subset Parquet footers actually need is implemented: structs
- * (including nested ones and unions, which encode identically), `bool`, `i32`,
- * `i64`, `double`, `binary` / `string`, and homogeneous `list`s of `i32`,
- * `binary` and `struct`. Maps, sets, `i8`/`i16`, `uuid` and the RPC message
- * envelope are intentionally absent — Parquet metadata never uses them.
+ * (including nested ones and unions, which encode identically), `bool`, `i8`,
+ * `i32`, `i64`, `double`, `binary` / `string`, and homogeneous `list`s of
+ * `i32`, `binary` and `struct`. Maps, sets, `i16`, `uuid` and the RPC message
+ * envelope are intentionally absent — Parquet metadata never uses them. `i8`
+ * earns its place with a single field in the whole format: `IntType.bitWidth`.
  *
  * Field ids must be written in ascending order within a struct, which is what
  * lets the encoder always take the compact one-byte "field id delta" form.
@@ -96,6 +108,12 @@ export class CompactWriter {
   /** Booleans carry their value in the field header itself, so they add no bytes. */
   fieldBool(id: number, value: boolean): void {
     this.#header(id, value ? ThriftType.BOOLEAN_TRUE : ThriftType.BOOLEAN_FALSE);
+  }
+
+  /** An `i8` is the one integer the compact protocol stores raw, not as a zigzag varint. */
+  fieldI8(id: number, value: number): void {
+    this.#header(id, ThriftType.I8);
+    this.out.u8(value);
   }
 
   fieldI32(id: number, value: number): void {
@@ -163,5 +181,211 @@ export class CompactWriter {
   /** Returns a copy of the encoded bytes. */
   toBytes(): Uint8Array {
     return this.out.toBytes();
+  }
+}
+
+/** A struct field header: the field id and the compact type id of its value. */
+export interface ThriftField {
+  readonly id: number;
+  readonly type: number;
+}
+
+/**
+ * How deep {@link CompactReader.skip} will follow nested containers before
+ * calling the file malformed. Parquet metadata never nests past a handful of
+ * levels; the cap is what keeps a hostile file from exhausting the JS stack.
+ */
+const MAX_SKIP_DEPTH = 64;
+
+/**
+ * A minimal Thrift compact protocol *reader*, the mirror of
+ * {@link CompactWriter}.
+ *
+ * It decodes the same subset the writer emits — structs, `bool`, `i8`, `i32`,
+ * `i64`, `double`, `binary` / `string` and `list` — and can additionally *skip* any
+ * value of any compact type, including maps, sets and types it has no accessor
+ * for. Skipping is what the Thrift protocol prescribes for unrecognised
+ * fields, and it is what lets a future Parquet release add footer fields
+ * without breaking this reader.
+ *
+ * Usage is a pull loop per struct:
+ *
+ * ```ts
+ * reader.structBegin();
+ * for (let field = reader.fieldBegin(); field !== null; field = reader.fieldBegin()) {
+ *   if (field.id === 1) value = reader.i32();
+ *   else reader.skip(field.type);
+ * }
+ * reader.structEnd();
+ * ```
+ */
+export class CompactReader {
+  readonly in: ByteReader;
+  #lastFieldId = 0;
+  #stack: number[] = [];
+  #depth = 0;
+
+  constructor(input: ByteReader) {
+    this.in = input;
+  }
+
+  /** Opens a struct: field id deltas restart from zero. */
+  structBegin(): void {
+    this.#stack.push(this.#lastFieldId);
+    this.#lastFieldId = 0;
+  }
+
+  /** Restores the enclosing struct's field id state. */
+  structEnd(): void {
+    this.#lastFieldId = this.#stack.pop() ?? 0;
+  }
+
+  /** Reads the next field header, or returns `null` at the struct's stop field. */
+  fieldBegin(): ThriftField | null {
+    const byte = this.in.u8();
+    if (byte === 0) return null;
+    const type = byte & 0x0f;
+    const delta = byte >> 4;
+    // A zero delta means the long form: the absolute field id follows.
+    const id = delta === 0 ? unzigzag32(this.in.varint()) : this.#lastFieldId + delta;
+    this.#lastFieldId = id;
+    return { id, type };
+  }
+
+  /** Booleans carry their value in the field header, so the type id *is* the value. */
+  bool(type: number): boolean {
+    return type === ThriftType.BOOLEAN_TRUE;
+  }
+
+  /** The mirror of {@link CompactWriter.fieldI8}: one raw byte, sign extended. */
+  i8(): number {
+    return (this.in.u8() << 24) >> 24;
+  }
+
+  i32(): number {
+    return unzigzag32(this.in.varint());
+  }
+
+  i64(): bigint {
+    return unzigzag64(this.in.varintBig());
+  }
+
+  double(): number {
+    return this.in.f64();
+  }
+
+  /** Returns a view over the field's bytes; the underlying buffer is not copied. */
+  binary(): Uint8Array {
+    return this.in.raw(this.in.varint());
+  }
+
+  string(): string {
+    return decodeUtf8(this.binary());
+  }
+
+  /** Reads a list header. The caller then reads exactly `size` elements. */
+  listBegin(): { readonly elementType: number; readonly size: number } {
+    const byte = this.in.u8();
+    const elementType = byte & 0x0f;
+    const short = byte >> 4;
+    return { elementType, size: short === 0x0f ? this.in.varint() : short };
+  }
+
+  /**
+   * Skips one value of the given compact type.
+   *
+   * Every branch consumes at least one byte, so a bogus container size cannot
+   * spin: the underlying {@link ByteReader} runs out and throws. Depth is
+   * capped separately because nesting costs stack, not bytes.
+   */
+  skip(type: number): void {
+    if (++this.#depth > MAX_SKIP_DEPTH) {
+      throw malformed(
+        `Thrift value at offset ${this.in.offset} nests more than ${MAX_SKIP_DEPTH} deep`,
+      );
+    }
+    switch (type) {
+      case ThriftType.BOOLEAN_TRUE:
+      case ThriftType.BOOLEAN_FALSE: {
+        break; // the value was the type id
+      }
+      case ThriftType.I8: {
+        this.in.skip(1);
+        break;
+      }
+      case ThriftType.I16:
+      case ThriftType.I32: {
+        this.in.varint();
+        break;
+      }
+      case ThriftType.I64: {
+        this.in.varintBig();
+        break;
+      }
+      case ThriftType.DOUBLE: {
+        this.in.skip(8);
+        break;
+      }
+      case ThriftType.BINARY: {
+        this.in.skip(this.in.varint());
+        break;
+      }
+      case ThriftType.UUID: {
+        this.in.skip(16);
+        break;
+      }
+      case ThriftType.LIST:
+      case ThriftType.SET: {
+        const { elementType, size } = this.listBegin();
+        for (let index = 0; index < size; index++) this.#skipElement(elementType);
+        break;
+      }
+      case ThriftType.MAP: {
+        const size = this.in.varint();
+        // An empty map omits the key/value type byte entirely.
+        if (size > 0) {
+          const kinds = this.in.u8();
+          for (let index = 0; index < size; index++) {
+            this.#skipElement(kinds >> 4);
+            this.#skipElement(kinds & 0x0f);
+          }
+        }
+        break;
+      }
+      case ThriftType.STRUCT: {
+        this.structBegin();
+        for (let field = this.fieldBegin(); field !== null; field = this.fieldBegin()) {
+          this.skip(field.type);
+        }
+        this.structEnd();
+        break;
+      }
+      default: {
+        throw malformed(`Unknown Thrift compact type ${type} at offset ${this.in.offset}`);
+      }
+    }
+    this.#depth--;
+  }
+
+  /**
+   * Skips `size` elements of a container the caller has opened but cannot read.
+   *
+   * An element type only arrives *with* the container header, by which point
+   * the header is gone — so a caller that finds a list of the wrong thing
+   * cannot hand it back to {@link CompactReader.skip}, which would read a
+   * second header that is not there. This consumes the elements instead, and
+   * that is what keeps the fields after the container aligned.
+   */
+  skipElements(elementType: number, size: number): void {
+    for (let index = 0; index < size; index++) this.#skipElement(elementType);
+  }
+
+  /** Container elements differ from fields in one place: a `bool` costs a byte. */
+  #skipElement(type: number): void {
+    if (type === ThriftType.BOOLEAN_TRUE || type === ThriftType.BOOLEAN_FALSE) {
+      this.in.skip(1);
+      return;
+    }
+    this.skip(type);
   }
 }

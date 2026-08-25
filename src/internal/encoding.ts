@@ -1,13 +1,23 @@
-import { ByteWriter } from "./bytes.ts";
+import { ByteReader, ByteWriter } from "./bytes.ts";
+import { malformed } from "../error.ts";
+import type { PhysicalKind } from "../types.ts";
 
 /**
  * Non-null column values, kept in the shape the PLAIN encoder wants so no
  * per-value type checks are needed when a page is flushed.
+ *
+ * One member per {@link PhysicalKind}: the buffer's kind *is* the column's
+ * physical type, which is what lets an adapter name its storage and get the
+ * right buffer without a second table.
  */
 export type ColumnValues =
   | { readonly kind: "bytes"; readonly items: Uint8Array[] }
+  /** Every item is exactly `typeLength` bytes long; the writer checks that before it buffers one. */
+  | { readonly kind: "fixed"; readonly typeLength: number; readonly items: Uint8Array[] }
   | { readonly kind: "f64"; readonly items: number[] }
+  | { readonly kind: "f32"; readonly items: number[] }
   | { readonly kind: "i64"; readonly items: bigint[] }
+  | { readonly kind: "i32"; readonly items: number[] }
   | { readonly kind: "bool"; readonly items: boolean[] };
 
 /**
@@ -25,12 +35,25 @@ export function writePlain(out: ByteWriter, values: ColumnValues): void {
       }
       break;
     }
+    case "fixed": {
+      // FIXED_LEN_BYTE_ARRAY: the width is in the schema, so no length prefix.
+      for (const item of values.items) out.raw(item);
+      break;
+    }
     case "f64": {
       for (const item of values.items) out.f64(item);
       break;
     }
+    case "f32": {
+      for (const item of values.items) out.f32(item);
+      break;
+    }
     case "i64": {
       for (const item of values.items) out.i64(item);
+      break;
+    }
+    case "i32": {
+      for (const item of values.items) out.i32(item);
       break;
     }
     case "bool": {
@@ -49,9 +72,81 @@ export function writePlain(out: ByteWriter, values: ColumnValues): void {
   }
 }
 
+/**
+ * Reads `count` values written by {@link writePlain}.
+ *
+ * `count` is the number of *present* values, which for a nullable column is
+ * fewer than the page's `num_values`: nulls occupy a definition level but no
+ * bytes in the value stream.
+ *
+ * `typeLength` is the schema's `type_length` and is only read for `"fixed"`,
+ * the one kind whose values carry no width of their own.
+ */
+export function readPlain(
+  input: ByteReader,
+  kind: PhysicalKind,
+  count: number,
+  typeLength = 0,
+): ColumnValues {
+  switch (kind) {
+    case "bytes": {
+      const items: Uint8Array[] = [];
+      for (let index = 0; index < count; index++) items.push(input.raw(input.u32()));
+      return { kind, items };
+    }
+    case "fixed": {
+      const items: Uint8Array[] = [];
+      for (let index = 0; index < count; index++) items.push(input.raw(typeLength));
+      return { kind, typeLength, items };
+    }
+    case "f64": {
+      const items: number[] = [];
+      for (let index = 0; index < count; index++) items.push(input.f64());
+      return { kind, items };
+    }
+    case "f32": {
+      const items: number[] = [];
+      for (let index = 0; index < count; index++) items.push(input.f32());
+      return { kind, items };
+    }
+    case "i64": {
+      const items: bigint[] = [];
+      for (let index = 0; index < count; index++) items.push(input.i64());
+      return { kind, items };
+    }
+    case "i32": {
+      const items: number[] = [];
+      for (let index = 0; index < count; index++) items.push(input.i32());
+      return { kind, items };
+    }
+    case "bool": {
+      const items: boolean[] = [];
+      for (let index = 0; index < count; index += 8) {
+        const byte = input.u8();
+        for (let bit = 0; bit < 8 && index + bit < count; bit++) {
+          items.push((byte & (1 << bit)) !== 0);
+        }
+      }
+      return { kind, items };
+    }
+  }
+}
+
 /** Minimum number of bits needed to hold every level up to `maxLevel`. */
 export function bitWidthForMaxLevel(maxLevel: number): number {
   return maxLevel <= 0 ? 0 : 32 - Math.clz32(maxLevel);
+}
+
+/**
+ * Largest byte length the encoder below can produce for `valueCount` one-bit
+ * values, the shape used by nullable definition levels.
+ *
+ * A group may become either two bytes of RLE header plus payload or part of a
+ * bit-packed run, where one data byte is amortized with its run header. So one
+ * two-byte RLE run per group is the exact maximum.
+ */
+export function maxOneBitRleBitPackedHybridBytes(valueCount: number): number {
+  return valueCount === 0 ? 0 : 2 * Math.ceil(valueCount / 8);
 }
 
 /**
@@ -142,4 +237,78 @@ export function encodeRleBitPackedHybrid(levels: readonly number[], bitWidth: nu
   endBitPackedRun();
 
   return out.toBytes();
+}
+
+/** A bit-packed run's decoded value count is a signed i32 in the Parquet grammar. */
+const MAX_BIT_PACKED_RUN_GROUPS = Math.floor((2 ** 31 - 1) / 8);
+
+/**
+ * Decodes exactly `count` levels written by {@link encodeRleBitPackedHybrid}.
+ *
+ * Runs must describe exactly `count` logical levels and consume the whole
+ * substream. A final bit-packed run may physically contain any number of
+ * padded groups; all their bytes are consumed and values past `count` ignored.
+ *
+ * Empty and oversized runs are rejected rather than clipped: clipping would
+ * make a second encoded run or arbitrary trailing bytes invisible.
+ */
+export function decodeRleBitPackedHybrid(
+  bytes: Uint8Array,
+  bitWidth: number,
+  count: number,
+  column?: string,
+): number[] {
+  const input = new ByteReader(bytes, 0, column);
+  const byteWidth = Math.ceil(bitWidth / 8);
+  const levels: number[] = [];
+
+  while (levels.length < count) {
+    // As in the encoder, `%` and `Math.floor` stand in for bitwise operators so
+    // run lengths above 2^31 survive.
+    const header = input.varint();
+    if (header % 2 === 1) {
+      const groups = Math.floor(header / 2);
+      if (groups === 0) throw malformed("A bit-packed run declares zero groups", column);
+      if (groups > MAX_BIT_PACKED_RUN_GROUPS) {
+        throw malformed(
+          `A bit-packed run declares ${groups} groups, exceeding Parquet's 2^31-1 value limit`,
+          column,
+        );
+      }
+      for (let group = 0; group < groups; group++) {
+        let accumulator = 0;
+        let accumulatedBits = 0;
+        for (let index = 0; index < 8; index++) {
+          while (accumulatedBits < bitWidth) {
+            accumulator += input.u8() * 2 ** accumulatedBits;
+            accumulatedBits += 8;
+          }
+          if (levels.length < count) levels.push(accumulator % 2 ** bitWidth);
+          accumulator = Math.floor(accumulator / 2 ** bitWidth);
+          accumulatedBits -= bitWidth;
+        }
+      }
+    } else {
+      const runLength = header / 2;
+      if (runLength === 0) throw malformed("An RLE run declares zero values", column);
+      if (runLength > count - levels.length) {
+        throw malformed(
+          `An RLE run declares ${runLength} values with ${count - levels.length} levels left`,
+          column,
+        );
+      }
+      let value = 0;
+      for (let index = 0; index < byteWidth; index++) value += input.u8() * 2 ** (8 * index);
+      for (let index = 0; index < runLength; index++) levels.push(value);
+    }
+  }
+
+  if (input.remaining !== 0) {
+    throw malformed(
+      `A definition-level stream has ${input.remaining} trailing encoded bytes`,
+      column,
+    );
+  }
+
+  return levels;
 }
