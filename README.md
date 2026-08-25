@@ -91,7 +91,8 @@ Each in-box factory maps by one rule: the value must survive the round trip unch
 | `float16()`                                            | `number`    | `FLBA(2)` / `FLOAT16`                             |
 | `integer({ bitWidth: 8 \| 16 \| 32, signed })`         | `number`    | `INT32` / `INTEGER(…)`                            |
 | `integer({ bitWidth: 64, signed })`                    | `bigint`    | `INT64` / `INTEGER(64, …)`                        |
-| `json({ reviver, replacer })`                          | `JsonValue` | `BYTE_ARRAY` / `JSON`                             |
+| `json()` or `json({ as: "value", reviver, replacer })` | `JsonValue` | `BYTE_ARRAY` / `JSON`                             |
+| `json({ as: "text" })`                                 | `string`    | `BYTE_ARRAY` / `JSON`                             |
 
 ```ts
 date(); // new Date(Date.UTC(2026, 7, 24)) — exactly UTC midnight, never a truncated instant
@@ -103,6 +104,7 @@ time({ unit: "millis", isAdjustedToUTC: false }); // 43_200_000 — local time s
 timestamp({ unit: "micros", isAdjustedToUTC: true }); // 1_756_000_000_000_000n — an instant
 float16(); // 1.5 — rounded to half precision once, on write
 integer({ bitWidth: 8, signed: false }); // 255 — a domain, range-checked on the way in
+json({ as: "text" }); // '{ "exact": true }\n' — validated JSON source, preserved exactly
 json<Payload>(); // your document type, with the reviver and replacer opened up
 ```
 
@@ -165,9 +167,11 @@ writer.append({ at: Date.now(), payload: { user: 1, tags: ["a"] } });
 // reads back as { user: 1, tags: ["a"] }
 ```
 
-The value is the **document itself**, in and out: `JSON.stringify` on the way in, `JSON.parse` on the way out, and the stored form is the JSON string Parquet's `JSON` annotation describes. Which means the round-trip semantics are **JSON's, not tavolato's** — `NaN` and the infinities become `null`, an `undefined` property vanishes, a `Date` becomes its ISO string and stays a string, a `Map` becomes `{}`, and `toJSON()` is honoured. The two things JSON cannot express at all are typed errors instead: a `bigint` anywhere in the document, and a value that serializes to nothing. A top-level `null` is not a document — it means the column is null, which is what `optional` is for.
+The built-in `json` type and `json()` use the **document value** in and out: `JSON.stringify` on write, `JSON.parse` on read. The round-trip semantics are therefore **JSON's, not tavolato's** — `NaN` and infinities become `null`, an `undefined` property vanishes, a `Date` becomes its ISO string, a `Map` becomes `{}`, and `toJSON()` is honoured. A `bigint` or a value that serializes to nothing is a typed error. A top-level `null` means the Parquet column is null; use the source text `"null"` when that distinction matters.
 
-Parsing uses a sanitizing reviver that drops `__proto__`, `prototype` and `constructor` keys from the documents it parses. That is a different layer from a **column** named `__proto__`, which round-trips faithfully. `jsonReviver` is exported to compose with, and `json({ reviver, replacer })` takes both hooks — a custom reviver **replaces** the default rather than running after it:
+`json({ as: "text" })` instead accepts and returns a complete JSON source string. It validates syntax and UTF-8 on both sides while preserving valid text exactly, including whitespace, key order, and `"null"`; it never parses and re-stringifies. Because no value is materialized, text mode refuses `reviver` and `replacer` options.
+
+Value-mode parsing uses a sanitizing reviver that drops `__proto__`, `prototype` and `constructor` keys from the documents it parses. That is a different layer from a **column** named `__proto__`, which round-trips faithfully. `jsonReviver` is exported to compose with, and `json({ reviver, replacer })` takes both hooks — a custom reviver **replaces** the default rather than running after it:
 
 ```ts
 import { json, jsonReviver } from "tavolato";

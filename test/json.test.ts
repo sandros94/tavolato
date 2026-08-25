@@ -349,3 +349,75 @@ describe("the json column type", () => {
     ]);
   });
 });
+
+describe("the json text representation", () => {
+  const text = json({ as: "text" });
+
+  it("preserves each complete document exactly, without normalization", () => {
+    const declared = defineSchema({ doc: { type: text } });
+    const documents = ['{ "b": 2, "a": 1 }\n', "  [1, 2, 3]  ", '"café"', '"\\ud800"', "null"];
+    const bytes = write(
+      declared,
+      documents.map((doc) => ({ doc })),
+    );
+    expect(readParquet(bytes, { types: [text] }).rows.map((row) => row.doc)).toEqual(documents);
+  });
+
+  it("reads valid text written by another JSON adapter unchanged", () => {
+    const document = '{\n  "ordered": true,\n  "n": 1\n}\n';
+    const bytes = write(defineSchema({ doc: { type: rawJson } }), [{ doc: document }]);
+    expect(readParquet(bytes, { types: [text] }).rows).toEqual([{ doc: document }]);
+  });
+
+  it("writes the exact validated text bytes", () => {
+    const document = '{ "b": 2, "a": 1 }\n';
+    const expected = write(defineSchema({ doc: { type: rawJson } }), [{ doc: document }]);
+    const actual = write(defineSchema({ doc: { type: text } }), [{ doc: document }]);
+    expect(actual).toEqual(expected);
+  });
+
+  it.each(["", "{", "undefined", "1 2"])("refuses invalid write text %j", (document) => {
+    const error = expectError("ERR_ROW_VALUE_INVALID", () =>
+      createWriter(defineSchema({ doc: { type: text } })).append({ doc: document }),
+    );
+    expect(error.column).toBe("doc");
+    expect(error.cause).toBeInstanceOf(Error);
+  });
+
+  it("refuses a non-string instead of serializing it", () => {
+    expectError("ERR_ROW_VALUE_INVALID", () =>
+      createWriter(defineSchema({ doc: { type: text } })).append({
+        doc: { parsed: true } as never,
+      }),
+    );
+  });
+
+  it("refuses source text that UTF-8 cannot preserve exactly", () => {
+    expectError("ERR_ROW_VALUE_INVALID", () =>
+      createWriter(defineSchema({ doc: { type: text } })).append({ doc: '"\ud800"' }),
+    );
+  });
+
+  it("refuses invalid JSON on read as a malformed, column-scoped file", () => {
+    const bytes = write(defineSchema({ doc: { type: rawJson } }), [{ doc: "{" }]);
+    const error = expectError("ERR_READ_MALFORMED", () => readParquet(bytes, { types: [text] }));
+    expect(error.column).toBe("doc");
+  });
+
+  it("refuses a leading UTF-8 BOM instead of stripping it from JSON source", () => {
+    const bytes = write(defineSchema({ doc: { type: rawJson } }), [{ doc: "\uFEFF{}" }]);
+    const error = expectError("ERR_READ_MALFORMED", () => readParquet(bytes, { types: [text] }));
+    expect(error.column).toBe("doc");
+    expect((error.cause as Error).message).toContain("not valid JSON");
+  });
+
+  it("structurally refuses value hooks and unknown representations", () => {
+    expectError("ERR_SCHEMA_COLUMN_INVALID", () =>
+      json({ as: "text", reviver: (_key: string, value: unknown) => value } as never),
+    );
+    expectError("ERR_SCHEMA_COLUMN_INVALID", () =>
+      json({ as: "text", replacer: (_key: string, value: unknown) => value } as never),
+    );
+    expectError("ERR_SCHEMA_COLUMN_INVALID", () => json({ as: "bytes" } as never));
+  });
+});

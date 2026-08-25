@@ -790,9 +790,10 @@ export function integer<TWidth extends IntegerWidth>(
  *
  * A `json` column is stored as a JSON *string* in a `BYTE_ARRAY` annotated
  * `JSON` — that is the wire format, and it is the same one every other engine
- * writes — while the JavaScript value is the structure. The serializing is
- * `JSON.stringify`'s and the parsing is `JSON.parse`'s, so **the round-trip
- * semantics are JSON's, not tavolato's**: see {@link jsonTextOf}.
+ * writes. JavaScript may see either the parsed value or that exact source text.
+ * Value-mode serializing is `JSON.stringify`'s and parsing is `JSON.parse`'s,
+ * so **its round-trip semantics are JSON's, not tavolato's**: see
+ * {@link jsonTextOf}.
  *
  * The two halves below are shared by the built-in `json` column type and by
  * {@link json}, which is what keeps a hand-configured reviver an *override* of
@@ -805,6 +806,9 @@ export function integer<TWidth extends IntegerWidth>(
  * both, which is why {@link JsonOptions} spells it once.
  */
 export type JsonHook = (key: string, value: unknown) => unknown;
+
+/** JavaScript representation used by {@link json}. */
+export type JsonRepresentation = "value" | "text";
 
 /** The three keys that can reach `Object.prototype` when a parsed object is used. */
 const isDangerousKey = (key: string): boolean =>
@@ -901,41 +905,103 @@ export function jsonValueOf(
   try {
     return JSON.parse(text, reviver) as unknown;
   } catch (cause) {
-    throw malformed(
-      `A JSON-annotated column holds ${describe(text.length > 64 ? `${text.slice(0, 64)}…` : text)}, which is not valid JSON`,
-      column,
-      cause,
-    );
+    throw invalidJsonSource(text, column, cause);
   }
 }
 
-/** Options for {@link json}. */
-export interface JsonOptions {
+/** One malformed-file contract for every representation of JSON source. */
+function invalidJsonSource(
+  text: string,
+  column: string | undefined,
+  cause: unknown,
+): TavolatoError {
+  return malformed(
+    `A JSON-annotated column holds ${describe(text.length > 64 ? `${text.slice(0, 64)}…` : text)}, which is not valid JSON`,
+    column,
+    cause,
+  );
+}
+
+/** Options for the parsed-value representation of {@link json}. */
+export interface JsonValueOptions {
+  /** Parse to and serialize from a JavaScript value. Defaults to `"value"`. */
+  readonly as?: "value";
   /**
    * Reviver handed to `JSON.parse`. **Replaces** {@link jsonReviver} rather
    * than running after it: bringing your own means owning it, dangerous keys
    * included. Composing is one call — `jsonReviver` is exported for exactly
    * that.
    */
-  reviver?: JsonHook;
+  readonly reviver?: JsonHook;
   /** Replacer handed to `JSON.stringify`. */
-  replacer?: JsonHook;
+  readonly replacer?: JsonHook;
+}
+
+/** Options for the exact-text representation of {@link json}. */
+export interface JsonTextOptions {
+  /** Preserve the complete JSON document as source text. */
+  readonly as: "text";
+  /** Text is not parsed into a value, so a reviver has no meaning. */
+  readonly reviver?: never;
+  /** Text is not serialized from a value, so a replacer has no meaning. */
+  readonly replacer?: never;
+}
+
+/** Options for {@link json}, discriminated by its JavaScript representation. */
+export type JsonOptions = JsonValueOptions | JsonTextOptions;
+
+/** Validates a JSON source string without replacing the source it spells. */
+function jsonSourceOf(text: string, column?: string): string {
+  try {
+    JSON.parse(text);
+    return text;
+  } catch (cause) {
+    throw invalidJsonSource(text, column, cause);
+  }
+}
+
+/** Validates exact JSON source and returns the bytes that preserve it. */
+function jsonSourceBytesOf(value: unknown): Uint8Array {
+  if (typeof value !== "string") {
+    reject(`json as text expects a string, received ${describe(value)}`);
+  }
+  try {
+    JSON.parse(value);
+  } catch (cause) {
+    throw new TavolatoError(
+      `json as text expects a complete valid JSON document, received ${describe(value.length > 64 ? `${value.slice(0, 64)}…` : value)}`,
+      "ERR_ROW_VALUE_INVALID",
+      undefined,
+      cause,
+    );
+  }
+  const bytes = utf8.encode(value);
+  if (decodeUtf8(bytes) !== value) {
+    throw new TavolatoError(
+      "json as text expects source that has an exact UTF-8 representation",
+      "ERR_ROW_VALUE_INVALID",
+    );
+  }
+  return bytes;
 }
 
 /**
- * `JSON` ⇄ the parsed document, with a reviver and a replacer of your own.
+ * `JSON` ⇄ a parsed value or its exact source text.
  *
- * The built-in `json` column type already parses and serializes; this is the
- * same column with the two hooks opened up, the way `ofetch` lets a caller
- * take over response parsing without giving up the default. It claims the
- * `JSON` annotation exactly as the built-in does, and writes the identical
- * bytes — the difference is only which functions run either side of them.
+ * The built-in `json` column type already parses and serializes; this factory
+ * makes that representation explicit, opens its two hooks, or exposes the
+ * validated source text instead. Every representation claims the same `JSON`
+ * annotation and writes the same wire format.
  *
  * Registered in `ReadOptions.types` it wins over the built-in, because adapters
  * are consulted first; in a schema it is chosen by declaring it as the column's
  * `type`.
  *
- * `TValue` is what your hooks map to and from, and defaults to
+ * The default `"value"` representation parses on read and serializes on write.
+ * `"text"` validates both directions but preserves whitespace, key order and
+ * every other byte of valid source rather than normalizing it.
+ *
+ * In value mode, `TValue` is what your hooks map to and from, and defaults to
  * {@link JsonValue}. Name it when your documents have a shape — that is also
  * the way out of `JsonValue`'s index-signature strictness, which an `interface`
  * cannot satisfy.
@@ -947,18 +1013,47 @@ export interface JsonOptions {
  * // Keeps the dangerous keys the default reviver drops:
  * const raw = json({ reviver: (_key, value) => value });
  *
- * @throws {TavolatoError} `ERR_SCHEMA_COLUMN_INVALID` when a hook is not a function.
+ * @throws {TavolatoError} `ERR_SCHEMA_COLUMN_INVALID` for an unknown
+ * representation, an invalid hook, or a hook supplied in text mode.
  */
 /*
- * Two overloads rather than one default type argument: a defaulted parameter
+ * Overloads rather than one default type argument: a defaulted parameter
  * does not survive `defineSchema`'s `const` inference, and a `json()` column
  * would come back out of `ReadRowOf` as `any` instead of a `JsonValue`. The
  * concrete signature is the one an unparameterized call picks; supplying a type
  * argument skips it on arity and lands on the generic one.
  */
-export function json(options?: JsonOptions): LogicalAdapter<JsonValue, JsonValue>;
-export function json<TValue>(options?: JsonOptions): LogicalAdapter<TValue, TValue>;
-export function json<TValue>(options: JsonOptions = {}): LogicalAdapter<TValue, TValue> {
+export function json(options: JsonTextOptions): LogicalAdapter<string, string>;
+export function json(options?: JsonValueOptions): LogicalAdapter<JsonValue, JsonValue>;
+export function json<TValue>(options?: JsonValueOptions): LogicalAdapter<TValue, TValue>;
+export function json(options: JsonOptions): LogicalAdapter<JsonValue | string, JsonValue | string>;
+export function json<TValue>(
+  options: JsonOptions = {},
+): LogicalAdapter<TValue, TValue> | LogicalAdapter<string, string> {
+  if (typeof options !== "object" || options === null) {
+    throw invalid(`json options must be an object, received ${describe(options)}`);
+  }
+  const { as = "value" } = options;
+  if (as !== "value" && as !== "text") {
+    throw invalid(`json as must be "value" or "text", received ${describe(as)}`);
+  }
+  if (as === "text") {
+    if (options.reviver !== undefined) {
+      throw invalid("json as text does not accept a reviver");
+    }
+    if (options.replacer !== undefined) {
+      throw invalid("json as text does not accept a replacer");
+    }
+    return defineColumnType<string, string>({
+      name: "json",
+      physical: "bytes",
+      matches: (annotation) => annotation.kind === "json",
+      annotate: () => ({ kind: "json" }),
+      read: (raw) => jsonSourceOf(decodeUtf8(raw as Uint8Array)),
+      write: jsonSourceBytesOf,
+    });
+  }
+
   const { reviver = jsonReviver, replacer } = options;
   if (typeof reviver !== "function") {
     throw invalid(`json reviver must be a function, received ${describe(reviver)}`);

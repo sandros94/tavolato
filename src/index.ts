@@ -24,6 +24,9 @@ export type {
   IntegerWidth,
   JsonHook,
   JsonOptions,
+  JsonRepresentation,
+  JsonTextOptions,
+  JsonValueOptions,
   TimeOptions,
   TimeValue,
 } from "./adapters.ts";

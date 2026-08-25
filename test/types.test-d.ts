@@ -19,6 +19,8 @@ import type {
   DateOptions,
   DateRepresentation,
   DateValue,
+  JsonOptions,
+  JsonRepresentation,
   JsonValue,
   ParquetFile,
   ParquetRowGroups,
@@ -402,18 +404,20 @@ interface Payload {
 
 const documents = defineSchema({
   loose: { type: json() },
+  explicit: { type: json({ as: "value" }) },
   shaped: { type: json<Payload>() },
   hooked: { type: json({ reviver: jsonReviver, replacer: (_key, value) => value }) },
 });
 const documentWriter = createWriter(documents);
 documentWriter.append({
   loose: { anything: [1, null] },
+  explicit: [1, 2],
   shaped: { user: 1, tags: ["a"] },
   hooked: "text",
 });
 
 // @ts-expect-error a shaped json column takes its shape
-documentWriter.append({ loose: {}, shaped: { user: "one", tags: [] }, hooked: null });
+documentWriter.append({ loose: {}, explicit: {}, shaped: { user: "one", tags: [] }, hooked: null });
 
 // Through `unknown`, because `Payload` is an interface and therefore outside
 // `ReadValue` — which is exactly what the note on `ReadValue` says: a column
@@ -428,4 +432,28 @@ void [asLoose, asShaped, asTag];
 
 // @ts-expect-error a json column's document is not a string unless it holds one
 const notText: string = documentRows[0].loose;
+
+const textDocuments = defineSchema({ raw: { type: json({ as: "text" }) } });
+const textWriter = createWriter(textDocuments);
+textWriter.append({ raw: '{ "exact": true }\n' });
+// @ts-expect-error text representation takes complete JSON source, not a parsed value
+textWriter.append({ raw: { exact: true } });
+const textRows = readParquet(new Uint8Array(), { types: [json({ as: "text" })] })
+  .rows as unknown as ReadRowOf<typeof textDocuments.definition>[];
+const exactText: string = textRows[0].raw;
+void exactText;
+
+// @ts-expect-error text representation has no parsed value for a reviver to transform
+json({ as: "text", reviver: jsonReviver });
+// @ts-expect-error text representation preserves source and cannot apply a replacer
+json({ as: "text", replacer: (_key, value) => value });
+// @ts-expect-error representations are a closed explicit choice
+json({ as: "bytes" });
+
+const jsonRepresentation: JsonRepresentation = "text";
+const jsonOptions: JsonOptions = { as: "value", reviver: jsonReviver };
+const jsonFromOptions = (options: JsonOptions) => json(options);
+// @ts-expect-error representation options are immutable contracts
+jsonOptions.reviver = jsonReviver;
+void [jsonRepresentation, jsonOptions, jsonFromOptions];
 void notText;
