@@ -685,6 +685,24 @@ describe("logical column types", () => {
     );
   });
 
+  it("gives DuckDB the minimal valid fixed-width DECIMAL layout", () => {
+    const compact = defineSchema({ value: { type: decimal({ precision: 30, scale: 2 }) } });
+    const writer = createWriter(compact);
+    writer.append({ value: "1234567890123456789012345678.90" });
+    writer.append({ value: "-1.25" });
+    const file = emit("compact-decimal.parquet", writer.finish());
+
+    expect(
+      duckdb(
+        `SELECT type, type_length, precision, scale
+         FROM parquet_schema(${file}) WHERE name = 'value';`,
+      ),
+    ).toEqual([{ type: "FIXED_LEN_BYTE_ARRAY", type_length: "13", precision: 30, scale: 2 }]);
+    expect(
+      duckdb(`SELECT value::VARCHAR AS value FROM read_parquet(${file}) ORDER BY value;`),
+    ).toEqual([{ value: "-1.25" }, { value: "1234567890123456789012345678.90" }]);
+  });
+
   it("stays readable through a codec", () => {
     // Adapters transform values, codecs transform the page those values land
     // in, and neither knows about the other — DuckDB is the one asked to agree.

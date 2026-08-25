@@ -135,14 +135,22 @@ export type PhysicalKind = "bool" | "i32" | "i64" | "f32" | "f64" | "bytes" | "f
 export interface LogicalAdapter<TIn, TOut> {
   /** Used in error messages and wherever a schema is displayed. */
   readonly name: string;
-  /** Which physical type the values are stored as. */
+  /** Which physical type this adapter writes. */
   readonly physical: PhysicalKind;
-  /** Byte width, required when `physical` is `"fixed"` and rejected otherwise. */
+  /** Byte width this adapter writes, required for `"fixed"` and rejected otherwise. */
   readonly typeLength?: number;
   /**
+   * Whether this adapter can read a physical layout other than the one it
+   * writes. When absent, reads require `physical` and `typeLength` to match the
+   * write layout exactly. Exact matches are accepted without calling this hook;
+   * the file's annotation-to-physical contract is validated before alternatives
+   * reach it.
+   */
+  acceptsPhysical?(physical: PhysicalKind, typeLength: number | undefined): boolean;
+  /**
    * Whether this adapter claims a column carrying `annotation`. The physical
-   * type (and, for `"fixed"`, the byte width) is checked before this is called,
-   * so it only has the annotation left to judge.
+   * layout is accepted before this is called, so it only has the annotation
+   * left to judge.
    */
   matches(annotation: Annotation, physical: PhysicalKind): boolean;
   /** The annotation to stamp on a column written through this adapter. */

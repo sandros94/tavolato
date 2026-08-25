@@ -1,5 +1,9 @@
 import { decodeUtf8, utf8 } from "./internal/bytes.ts";
-import { logicalTypePhysicalProblem } from "./internal/logical.ts";
+import {
+  decimalFixedLength,
+  decimalPhysicalCanHold,
+  logicalTypePhysicalProblem,
+} from "./internal/logical.ts";
 import { adapterUnsupported, describe, malformed, TavolatoError } from "./error.ts";
 import type { Annotation, JsonValue, LogicalAdapter, PhysicalKind, TimeUnitName } from "./types.ts";
 
@@ -53,8 +57,6 @@ const WRITABLE_ANNOTATIONS: ReadonlySet<string> = new Set<Annotation["kind"]>([
 
 const TIME_UNITS: ReadonlySet<string> = new Set<TimeUnitName>(["millis", "micros", "nanos"]);
 
-/** Digits the built-in adapter can carry in its widest, 16-byte representation. */
-const MAX_BUILTIN_DECIMAL_PRECISION = 38;
 const MAX_ANNOTATION_INTEGER = 2 ** 31 - 1;
 
 function invalid(message: string): TavolatoError {
@@ -138,6 +140,9 @@ export function adapterProblem(spec: unknown): string | undefined {
     if (typeof adapter[method] !== "function") {
       return `${adapter.name} has no ${method}() function`;
     }
+  }
+  if (adapter.acceptsPhysical !== undefined && typeof adapter.acceptsPhysical !== "function") {
+    return `${adapter.name} has a non-function acceptsPhysical property`;
   }
   let annotation: unknown;
   try {
@@ -288,7 +293,7 @@ export function date<TAs extends DateRepresentation = "date">(
 
 /** Options for {@link decimal}. */
 export interface DecimalOptions {
-  /** Total number of significant digits, 1 to 38. */
+  /** Total significant digits, from 1 through Parquet's signed-i32 maximum. */
   precision: number;
   /** Digits after the point, 0 to `precision`. Defaults to `0`. */
   scale?: number;
@@ -304,19 +309,16 @@ export interface DecimalOptions {
  * it is also strict on the way in: `"12.34"` in a `scale: 4` column, a leading
  * zero, or a `-0.00` are all refused rather than reinterpreted.
  *
- * The physical type follows precision, exactly as DuckDB's writer chooses it:
- * `INT32` up to 9 digits, `INT64` up to 18, and a 16-byte two's complement
- * `FIXED_LEN_BYTE_ARRAY` up to 38.
+ * Writes use `INT32` up to 9 digits, `INT64` up to 18, then the smallest
+ * `FIXED_LEN_BYTE_ARRAY` that can carry the precision. The same adapter reads
+ * every physical layout Parquet permits for the declared precision, including
+ * `BYTE_ARRAY` and wider fixed arrays.
  */
 export function decimal(options: DecimalOptions): LogicalAdapter<string, string> {
   const { precision, scale = 0 } = options;
-  if (
-    !Number.isSafeInteger(precision) ||
-    precision < 1 ||
-    precision > MAX_BUILTIN_DECIMAL_PRECISION
-  ) {
+  if (!Number.isSafeInteger(precision) || precision < 1 || precision > MAX_ANNOTATION_INTEGER) {
     throw invalid(
-      `decimal precision must be an integer from 1 to ${MAX_BUILTIN_DECIMAL_PRECISION}, received ${describe(precision)}`,
+      `decimal precision must be an integer from 1 to ${MAX_ANNOTATION_INTEGER}, received ${describe(precision)}`,
     );
   }
   if (!Number.isSafeInteger(scale) || scale < 0 || scale > precision) {
@@ -326,49 +328,38 @@ export function decimal(options: DecimalOptions): LogicalAdapter<string, string>
   }
 
   const physical: PhysicalKind = precision <= 9 ? "i32" : precision <= 18 ? "i64" : "fixed";
-  const limit = 10n ** BigInt(precision);
-  // No redundant leading zero, and exactly `scale` digits after the point:
-  // one spelling per value, so every accepted string reads back as itself.
-  const pattern = new RegExp(`^-?(0|[1-9]\\d*)${scale === 0 ? "" : `\\.\\d{${scale}}`}$`);
+  const typeLength = physical === "fixed" ? decimalFixedLength(precision) : undefined;
 
   return defineColumnType<string, string>({
     name: `decimal(${precision}, ${scale})`,
     physical,
-    ...(physical === "fixed" ? { typeLength: 16 } : {}),
+    ...(typeLength === undefined ? {} : { typeLength }),
+    acceptsPhysical: (found, foundTypeLength) =>
+      decimalPhysicalCanHold(precision, found, foundTypeLength),
     matches: (annotation) =>
       annotation.kind === "decimal" &&
       annotation.precision === precision &&
       annotation.scale === scale,
     annotate: () => ({ kind: "decimal", precision, scale }),
     read: (raw) => {
+      if (raw instanceof Uint8Array && raw.length === 0) {
+        throw malformed("DECIMAL BYTE_ARRAY values must contain at least one byte");
+      }
       const unscaled =
-        physical === "fixed"
-          ? fromTwosComplement(raw as Uint8Array)
-          : physical === "i64"
-            ? (raw as bigint)
-            : BigInt(raw as number);
-      return toDecimalString(unscaled, scale);
+        typeof raw === "number"
+          ? BigInt(raw)
+          : typeof raw === "bigint"
+            ? raw
+            : fromTwosComplement(raw as Uint8Array);
+      return toDecimalString(unscaled, precision, scale);
     },
     write: (value) => {
       if (typeof value !== "string") {
         reject(`decimal expects a string, received ${describe(value)}`);
       }
-      if (!pattern.test(value)) {
-        reject(
-          `decimal(${precision}, ${scale}) expects a canonical decimal string with exactly ${scale} digit${
-            scale === 1 ? "" : "s"
-          } after the point, received ${describe(value)}`,
-        );
-      }
-      const unscaled = BigInt(value.replace(".", ""));
-      if (unscaled === 0n && value.startsWith("-")) {
-        reject(`decimal has no negative zero, received ${describe(value)}`);
-      }
-      if (unscaled <= -limit || unscaled >= limit) {
-        reject(`decimal(${precision}, ${scale}) cannot hold ${describe(value)}`);
-      }
+      const unscaled = decimalUnscaled(value, precision, scale);
       return physical === "fixed"
-        ? toTwosComplement(unscaled, 16)
+        ? toTwosComplement(unscaled, typeLength as number)
         : physical === "i64"
           ? unscaled
           : Number(unscaled);
@@ -376,10 +367,54 @@ export function decimal(options: DecimalOptions): LogicalAdapter<string, string>
   });
 }
 
-/** Renders an unscaled integer as the canonical decimal string for `scale`. */
-function toDecimalString(unscaled: bigint, scale: number): string {
+/** Parses one canonical decimal only after validating its shape and precision. */
+function decimalUnscaled(value: string, precision: number, scale: number): bigint {
+  const signLength = value.startsWith("-") ? 1 : 0;
+  const point = scale === 0 ? value.length : value.length - scale - 1;
+  const integerDigits = point - signLength;
+  const canonical = (): never =>
+    reject(
+      `decimal(${precision}, ${scale}) expects a canonical decimal string with exactly ${scale} digit${
+        scale === 1 ? "" : "s"
+      } after the point, received ${describe(value)}`,
+    );
+
+  if (
+    integerDigits < 1 ||
+    (scale > 0 && value[point] !== ".") ||
+    (integerDigits > 1 && value[signLength] === "0")
+  ) {
+    canonical();
+  }
+
+  let significantDigits = 0;
+  let nonzero = false;
+  for (let index = signLength; index < value.length; index++) {
+    if (index === point && scale > 0) continue;
+    const digit = value.charCodeAt(index) - 48;
+    if (digit < 0 || digit > 9) canonical();
+    if (digit !== 0) nonzero = true;
+    if (nonzero) significantDigits++;
+  }
+  if (signLength === 1 && !nonzero) {
+    reject(`decimal has no negative zero, received ${describe(value)}`);
+  }
+  if (significantDigits > precision) {
+    reject(`decimal(${precision}, ${scale}) cannot hold ${describe(value)}`);
+  }
+
+  const encoded = scale === 0 ? value : `${value.slice(0, point)}${value.slice(point + 1)}`;
+  return BigInt(encoded);
+}
+
+/** Validates and renders an unscaled integer as the canonical decimal string. */
+function toDecimalString(unscaled: bigint, precision: number, scale: number): string {
   const negative = unscaled < 0n;
-  const digits = (negative ? -unscaled : unscaled).toString().padStart(scale + 1, "0");
+  const magnitude = (negative ? -unscaled : unscaled).toString();
+  if (magnitude.length > precision) {
+    throw malformed(`DECIMAL value exceeds its declared precision ${precision}`);
+  }
+  const digits = magnitude.padStart(scale + 1, "0");
   const point = digits.length - scale;
   return `${negative ? "-" : ""}${digits.slice(0, point)}${
     scale === 0 ? "" : `.${digits.slice(point)}`

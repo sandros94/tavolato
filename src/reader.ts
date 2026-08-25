@@ -242,8 +242,8 @@ function isPlainInteger(annotation: Annotation, bitWidth: 32 | 64): boolean {
 /**
  * Finds the adapter that claims a column, if any.
  *
- * Registration order is the resolution order: the first adapter whose physical
- * type, byte width and `matches` all agree takes the column. A `matches` that
+ * Registration order is the resolution order: the first adapter whose read
+ * layouts and `matches` both accept the column takes it. An adapter hook that
  * throws is the caller's option misbehaving, not the file's fault, and says so.
  */
 function claimedBy(
@@ -254,8 +254,28 @@ function claimedBy(
   types: readonly AnyLogicalAdapter[],
 ): AnyLogicalAdapter | undefined {
   for (const adapter of types) {
-    if (adapter.physical !== physical) continue;
-    if (physical === "fixed" && adapter.typeLength !== typeLength) continue;
+    const exactLayout =
+      adapter.physical === physical && (physical !== "fixed" || adapter.typeLength === typeLength);
+    if (!exactLayout) {
+      if (adapter.acceptsPhysical === undefined) continue;
+      let acceptsAlternative: unknown;
+      try {
+        acceptsAlternative = adapter.acceptsPhysical(physical, typeLength);
+      } catch (cause) {
+        throw badOption(
+          `The column type ${adapter.name} threw from acceptsPhysical() on column "${element.name}"`,
+          element.name,
+          cause,
+        );
+      }
+      if (typeof acceptsAlternative !== "boolean") {
+        throw badOption(
+          `The column type ${adapter.name} returned ${describe(acceptsAlternative)} from acceptsPhysical() on column "${element.name}"`,
+          element.name,
+        );
+      }
+      if (!acceptsAlternative) continue;
+    }
     let claimed: boolean;
     try {
       claimed = adapter.matches(annotation, physical);

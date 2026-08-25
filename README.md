@@ -79,19 +79,19 @@ Parquet stores a column twice over: a **physical type**, which says how the byte
 
 Each in-box factory maps by one rule: the value must survive the round trip unchanged.
 
-| factory                                                | JavaScript  | Parquet                                    |
-| ------------------------------------------------------ | ----------- | ------------------------------------------ |
-| `date()` or `date({ as: "date" })`                     | `Date`      | `INT32` / `DATE`                           |
-| `date({ as: "number" })`                               | `number`    | `INT32` / `DATE`                           |
-| `decimal({ precision, scale })`                        | `string`    | `INT32`, `INT64` or `FLBA(16)` / `DECIMAL` |
-| `uuid()`                                               | `string`    | `FLBA(16)` / `UUID`                        |
-| `time({ unit: "millis", isAdjustedToUTC })`            | `number`    | `INT32` / `TIME(MILLIS, …)`                |
-| `time({ unit: "micros" \| "nanos", isAdjustedToUTC })` | `bigint`    | `INT64` / `TIME(…, …)`                     |
-| `timestamp({ unit, isAdjustedToUTC })`                 | `bigint`    | `INT64` / `TIMESTAMP(…, …)`                |
-| `float16()`                                            | `number`    | `FLBA(2)` / `FLOAT16`                      |
-| `integer({ bitWidth: 8 \| 16 \| 32, signed })`         | `number`    | `INT32` / `INTEGER(…)`                     |
-| `integer({ bitWidth: 64, signed })`                    | `bigint`    | `INT64` / `INTEGER(64, …)`                 |
-| `json({ reviver, replacer })`                          | `JsonValue` | `BYTE_ARRAY` / `JSON`                      |
+| factory                                                | JavaScript  | Parquet                                           |
+| ------------------------------------------------------ | ----------- | ------------------------------------------------- |
+| `date()` or `date({ as: "date" })`                     | `Date`      | `INT32` / `DATE`                                  |
+| `date({ as: "number" })`                               | `number`    | `INT32` / `DATE`                                  |
+| `decimal({ precision, scale })`                        | `string`    | `INT32`, `INT64` or minimal `FLBA(n)` / `DECIMAL` |
+| `uuid()`                                               | `string`    | `FLBA(16)` / `UUID`                               |
+| `time({ unit: "millis", isAdjustedToUTC })`            | `number`    | `INT32` / `TIME(MILLIS, …)`                       |
+| `time({ unit: "micros" \| "nanos", isAdjustedToUTC })` | `bigint`    | `INT64` / `TIME(…, …)`                            |
+| `timestamp({ unit, isAdjustedToUTC })`                 | `bigint`    | `INT64` / `TIMESTAMP(…, …)`                       |
+| `float16()`                                            | `number`    | `FLBA(2)` / `FLOAT16`                             |
+| `integer({ bitWidth: 8 \| 16 \| 32, signed })`         | `number`    | `INT32` / `INTEGER(…)`                            |
+| `integer({ bitWidth: 64, signed })`                    | `bigint`    | `INT64` / `INTEGER(64, …)`                        |
+| `json({ reviver, replacer })`                          | `JsonValue` | `BYTE_ARRAY` / `JSON`                             |
 
 ```ts
 date(); // new Date(Date.UTC(2026, 7, 24)) — exactly UTC midnight, never a truncated instant
@@ -105,6 +105,8 @@ float16(); // 1.5 — rounded to half precision once, on write
 integer({ bitWidth: 8, signed: false }); // 255 — a domain, range-checked on the way in
 json<Payload>(); // your document type, with the reviver and replacer opened up
 ```
+
+`decimal()` covers Parquet's complete positive signed-i32 precision domain. It writes the smallest canonical layout for that precision and, when registered in `ReadOptions.types`, reads the same annotation from every legal `INT32`, `INT64`, `BYTE_ARRAY` or fixed-width layout.
 
 The same object serves both sides: in a schema it decides how a column is written, and in `ReadOptions.types` it claims the columns it recognises.
 
@@ -129,7 +131,7 @@ Two rules decide who claims what, and they do not overlap. **Built-in types own 
 
 ### Writing your own
 
-`defineColumnType` validates the spec — a physical kind that exists (`bool`, `i32`, `i64`, `f32`, `f64`, `bytes`, `fixed`), a `typeLength` exactly where `fixed` needs one, four callable halves, an annotation that can actually be written — and freezes it:
+`defineColumnType` validates the spec — a physical kind that exists (`bool`, `i32`, `i64`, `f32`, `f64`, `bytes`, `fixed`), a `typeLength` exactly where `fixed` needs one, callable hooks, an annotation that can actually be written — and freezes it:
 
 ```ts
 import { defineColumnType } from "tavolato";
@@ -145,9 +147,11 @@ const centi = defineColumnType({
 });
 ```
 
+`physical` and `typeLength` are the layout an adapter writes, and that exact layout is always accepted. Define `acceptsPhysical(physical, typeLength)` only to add other layouts that the same logical representation safely decodes; it must return a boolean, and `matches()` still decides whether the annotation belongs to the adapter.
+
 Both halves are **synchronous** — an adapter is a pure value transform, and the one place tavolato defers is the codec seam. **Nulls never reach one**: an `optional` column is handled by the definition-level machinery on both sides. A `bytes` or `fixed` `write()` must return a **fresh** `Uint8Array` every time, since the writer holds what you hand it by reference until the row group is flushed.
 
-Your functions are held to their word. A `write` that throws, or that hands back something other than the physical value it promised, is `ERR_ROW_VALUE_INVALID` naming the column; a `read` that throws is `ERR_READ_MALFORMED`; a `matches` that throws is your option misbehaving rather than the file, and says so with `ERR_READ_OPTION_INVALID`.
+Your functions are held to their word. A `write` that throws, or that hands back something other than the physical value it promised, is `ERR_ROW_VALUE_INVALID` naming the column; a `read` that throws is `ERR_READ_MALFORMED`; `matches()` or `acceptsPhysical()` throwing, or `acceptsPhysical()` returning a non-boolean, is your option misbehaving rather than the file, and says so with `ERR_READ_OPTION_INVALID`.
 
 This is also the way to read a column the built-ins have no reading for at all — an unannotated `BYTE_ARRAY` or `FIXED_LEN_BYTE_ARRAY`. tavolato will not hand you raw bytes and call it a value; declare what those bytes are, and it will.
 

@@ -285,6 +285,7 @@ timestamp({ unit: "micros" });
 const ratio = defineColumnType({
   name: "ratio",
   physical: "i64",
+  acceptsPhysical: (physical, typeLength) => physical === "i64" && typeLength === undefined,
   matches: (annotation) => annotation.kind === "decimal" && annotation.precision === 18,
   annotate: () => ({ kind: "decimal", precision: 18, scale: 6 }),
   read: (raw) => Number(raw as bigint) / 1e6,

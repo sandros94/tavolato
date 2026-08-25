@@ -170,6 +170,7 @@ describe("defineColumnType", () => {
     ["a missing annotate()", { ...valid, annotate: undefined }],
     ["a missing read()", { ...valid, read: undefined }],
     ["a missing write()", { ...valid, write: undefined }],
+    ["a non-function acceptsPhysical", { ...valid, acceptsPhysical: ["i32"] }],
     [
       "an annotate() that throws",
       {
@@ -221,7 +222,7 @@ describe("defineColumnType", () => {
 
   it("refuses options the in-box types cannot honour", () => {
     expectError("ERR_SCHEMA_COLUMN_INVALID", () => decimal({ precision: 0 }));
-    expectError("ERR_SCHEMA_COLUMN_INVALID", () => decimal({ precision: 39 }));
+    expectError("ERR_SCHEMA_COLUMN_INVALID", () => decimal({ precision: 2 ** 31 }));
     expectError("ERR_SCHEMA_COLUMN_INVALID", () => decimal({ precision: 4, scale: 5 }));
     expectError("ERR_SCHEMA_COLUMN_INVALID", () => decimal({ precision: 4, scale: -1 }));
     expectError("ERR_SCHEMA_COLUMN_INVALID", () =>
@@ -313,6 +314,35 @@ describe("claiming a column", () => {
       readParquet(bytes, { types: [narrow] }),
     );
     expect(error.message).toContain("FIXED_LEN_BYTE_ARRAY(16)");
+  });
+
+  it("keeps exact physical matching unless a type explicitly widens it", () => {
+    const annotation = { kind: "decimal", precision: 9, scale: 0 } as const;
+    const canonical = write(annotatedAs(annotation, "i64"), [7n]);
+    const alternate = write(annotatedAs(annotation, "i32"), [7]);
+    const exact = defineColumnType({
+      name: "exact",
+      physical: "i64",
+      matches: (found) => found.kind === "decimal" && found.precision === 9 && found.scale === 0,
+      annotate: (): Annotation => annotation,
+      read: (raw) => raw,
+      write: (value: bigint) => value,
+    });
+    let widenedCalls = 0;
+    const widened = defineColumnType({
+      ...exact,
+      name: "widened",
+      acceptsPhysical: (physical: PhysicalKind, typeLength: number | undefined) => {
+        widenedCalls++;
+        return physical === "i32" && typeLength === undefined;
+      },
+    });
+
+    expect(readParquet(canonical, { types: [exact] }).schema.columns[0].type).toBe(exact);
+    expectError("ERR_READ_UNSUPPORTED", () => readParquet(alternate, { types: [exact] }));
+    expect(readParquet(canonical, { types: [widened] }).schema.columns[0].type).toBe(widened);
+    expect(readParquet(alternate, { types: [widened] }).schema.columns[0].type).toBe(widened);
+    expect(widenedCalls).toBe(1);
   });
 
   it("carries values over every physical type there is", () => {
@@ -443,6 +473,36 @@ describe("claiming a column", () => {
     expect(error.message).toContain("angry");
     expect(error.column).toBe("v");
     expect((error.cause as Error).message).toBe("no idea");
+  });
+
+  it("holds acceptsPhysical() to a boolean answer and typed failures", () => {
+    const annotation = { kind: "decimal", precision: 9, scale: 0 } as const;
+    const bytes = write(annotatedAs(annotation, "i32"), [7]);
+    const returning = defineColumnType({
+      name: "returning",
+      physical: "i64",
+      acceptsPhysical: () => "yes" as never,
+      matches: () => true,
+      annotate: (): Annotation => annotation,
+      read: (raw) => raw,
+      write: (value: bigint) => value,
+    });
+    const throwing = defineColumnType({
+      ...returning,
+      name: "throwing",
+      acceptsPhysical: () => {
+        throw new Error("no layout");
+      },
+    });
+
+    const returned = expectError("ERR_READ_OPTION_INVALID", () =>
+      readParquet(bytes, { types: [returning] }),
+    );
+    expect(returned.message).toContain('returned "yes" from acceptsPhysical()');
+    const thrown = expectError("ERR_READ_OPTION_INVALID", () =>
+      readParquet(bytes, { types: [throwing] }),
+    );
+    expect((thrown.cause as Error).message).toBe("no layout");
   });
 });
 
@@ -714,6 +774,107 @@ describe("decimal", () => {
       "-99999999999999999999999999999999999999",
       "99999999999999999999999999999999999999",
     ]);
+  });
+
+  it("writes the smallest fixed width that can carry the precision", () => {
+    expect(decimal({ precision: 19 }).typeLength).toBe(9);
+    expect(decimal({ precision: 21 }).typeLength).toBe(9);
+    expect(decimal({ precision: 22 }).typeLength).toBe(10);
+    expect(decimal({ precision: 38 }).typeLength).toBe(16);
+    expect(decimal({ precision: 39 }).typeLength).toBe(17);
+    expect(decimal({ precision: 100 }).typeLength).toBe(42);
+  });
+
+  it("constructs the complete metadata domain without allocating for its values", () => {
+    const widest = decimal({ precision: 2 ** 31 - 1, scale: 2 ** 31 - 1 });
+    expect(widest.typeLength).toBe(891_723_283);
+  });
+
+  it("reads every legal physical layout through one registered type", () => {
+    const annotation = { kind: "decimal", precision: 9, scale: 2 } as const;
+    const rawType = (
+      physical: "i32" | "i64" | "bytes" | "fixed",
+      typeLength?: number,
+    ): LogicalAdapter<unknown, unknown> =>
+      defineColumnType({
+        name: `raw-${physical}`,
+        physical,
+        ...(typeLength === undefined ? {} : { typeLength }),
+        matches: () => false,
+        annotate: (): Annotation => annotation,
+        read: (raw) => raw,
+        write: (value) => value,
+      });
+    const files = [
+      write(rawType("i32"), [125, -125]),
+      write(rawType("i64"), [125n, -125n]),
+      write(rawType("bytes"), [new Uint8Array([0x7d]), new Uint8Array([0x83])]),
+      write(rawType("fixed", 4), [
+        new Uint8Array([0, 0, 0, 0x7d]),
+        new Uint8Array([0xff, 0xff, 0xff, 0x83]),
+      ]),
+    ];
+    const money = decimal({ precision: 9, scale: 2 });
+
+    for (const bytes of files) {
+      expect(readParquet(bytes, { types: [money] }).rows).toEqual([{ v: "1.25" }, { v: "-1.25" }]);
+    }
+  });
+
+  it("rewrites a noncanonical read layout through the adapter's canonical layout", () => {
+    const annotation = { kind: "decimal", precision: 30, scale: 2 } as const;
+    const source = write(annotatedAs(annotation, "fixed", 16), [
+      new Uint8Array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x7d]),
+    ]);
+    const money = decimal({ precision: 30, scale: 2 });
+    const first = readParquet(source, { types: [money] });
+    expect(first.schema.columns[0]).toMatchObject({ type: money, typeLength: 16 });
+    expect(first.rows).toEqual([{ v: "1.25" }]);
+
+    const writer = createWriter(first.schema);
+    writer.append(first.rows[0]);
+    const second = readParquet(sync(writer.finish()), { types: [money] });
+    expect(second.schema.columns[0]).toMatchObject({ type: money, typeLength: 13 });
+    expect(second.rows).toEqual(first.rows);
+  });
+
+  it.each([
+    ["INT32", "i32", undefined, 100],
+    ["INT64", "i64", undefined, 100n],
+    ["BYTE_ARRAY", "bytes", undefined, new Uint8Array([0x64])],
+    ["FIXED_LEN_BYTE_ARRAY", "fixed", 1, new Uint8Array([0x64])],
+  ] as const)(
+    "refuses a %s value larger than the declared precision",
+    (_, physical, typeLength, value) => {
+      const annotation = { kind: "decimal", precision: 2, scale: 0 } as const;
+      const file = write(annotatedAs(annotation, physical, typeLength), [value]);
+      const error = expectError("ERR_READ_MALFORMED", () =>
+        readParquet(file, { types: [decimal({ precision: 2 })] }),
+      );
+      expect(error.column).toBe("v");
+      expect(error.cause).toBeInstanceOf(TavolatoError);
+      expect((error.cause as TavolatoError).message).toContain("declared precision 2");
+    },
+  );
+
+  it("refuses an empty BYTE_ARRAY as a DECIMAL integer", () => {
+    const annotation = { kind: "decimal", precision: 2, scale: 0 } as const;
+    const file = write(annotatedAs(annotation, "bytes"), [new Uint8Array()]);
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readParquet(file, { types: [decimal({ precision: 2 })] }),
+    );
+    expect(error.column).toBe("v");
+    expect(error.cause).toBeInstanceOf(TavolatoError);
+    expect((error.cause as TavolatoError).message).toContain("at least one byte");
+  });
+
+  it("round-trips precision beyond native fixed-width integers", () => {
+    const value = "9".repeat(100);
+    expect(roundtrip(decimal({ precision: 100 }), [value, `-${value}`])).toEqual([
+      value,
+      `-${value}`,
+    ]);
+    expectError("ERR_ROW_VALUE_INVALID", appendOne(decimal({ precision: 100 }), "9".repeat(101)));
   });
 
   it("insists on exactly one spelling per value", () => {

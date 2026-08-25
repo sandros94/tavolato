@@ -49,6 +49,30 @@ function fixedDecimalCanHold(precision: number, typeLength: number): boolean {
   return 10n ** BigInt(precision) < 1n << bits;
 }
 
+/** Whether `precision` is legal on this DECIMAL physical layout. @internal */
+export function decimalPhysicalCanHold(
+  precision: number,
+  physical: PhysicalKind,
+  typeLength: number | undefined,
+): boolean {
+  if (physical === "i32") return precision <= 9;
+  if (physical === "i64") return precision <= 18;
+  if (physical === "bytes") return true;
+  return physical === "fixed" && fixedDecimalCanHold(precision, typeLength ?? 0);
+}
+
+/** Smallest fixed byte width that can carry `precision` decimal digits. @internal */
+export function decimalFixedLength(precision: number): number {
+  let low = 1;
+  let high = precision;
+  while (low < high) {
+    const middle = low + Math.floor((high - low) / 2);
+    if (fixedDecimalCanHold(precision, middle)) high = middle;
+    else low = middle + 1;
+  }
+  return low;
+}
+
 /**
  * Reports a known logical annotation whose physical storage contradicts the
  * Parquet format. `none` has no contract, while `unknown` is deliberately left
@@ -160,7 +184,7 @@ export function logicalTypePhysicalProblem(
       }
       if (physical === "bytes") return undefined;
       if (physical === "fixed") {
-        return fixedDecimalCanHold(annotation.precision, typeLength ?? 0)
+        return decimalPhysicalCanHold(annotation.precision, physical, typeLength)
           ? undefined
           : `annotates FIXED_LEN_BYTE_ARRAY(${typeLength}) as DECIMAL with precision ${annotation.precision}, but that width cannot hold ${annotation.precision} digits`;
       }
