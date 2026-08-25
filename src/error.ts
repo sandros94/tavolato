@@ -1,7 +1,7 @@
 /**
  * All known error codes thrown by tavolato.
  *
- *   ERR_SCHEMA_* — problems with the schema handed to `defineSchema`
+ *   ERR_SCHEMA_* — problems found by `defineSchema`, adapters or `createWriter`
  *   ERR_ROW_*    — problems with a row handed to `append` / `appendAll`
  *   ERR_WRITER_* — problems with how the writer itself is being driven
  *   ERR_READ_*   — problems with the bytes handed to `readParquet` / `readSchema`

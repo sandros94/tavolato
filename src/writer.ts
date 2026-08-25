@@ -13,10 +13,10 @@ import {
   MAGIC,
   MAX_DEFINITION_LEVEL_BIT_WIDTH,
   type RowGroupMeta,
-  snapshotColumn,
 } from "./internal/format.ts";
 import { jsonTextOf } from "./adapters.ts";
 import { describe, TavolatoError } from "./error.ts";
+import { validateParquetSchema } from "./schema.ts";
 import type {
   AnyLogicalAdapter,
   ParquetSchema,
@@ -76,8 +76,7 @@ interface ColumnState {
   byteArraySize: number;
 }
 
-function createColumnState(column: SchemaColumn): ColumnState {
-  const snapshot = snapshotColumn(column);
+function createColumnState(column: SchemaColumn, snapshot: ColumnSnapshot): ColumnState {
   const { physical } = snapshot;
   const values: ColumnValues =
     physical === "fixed"
@@ -387,6 +386,7 @@ export class ParquetWriter<TDefinition extends SchemaDefinition = SchemaDefiniti
   #failure: TavolatoError | undefined;
 
   constructor(schema: ParquetSchema<TDefinition>, options: WriterOptions = {}) {
+    const columns = validateParquetSchema(schema);
     const rowGroupSize = options.rowGroupSize ?? DEFAULT_ROW_GROUP_SIZE;
     if (!Number.isSafeInteger(rowGroupSize) || rowGroupSize < 1) {
       throw new TavolatoError(
@@ -431,9 +431,9 @@ export class ParquetWriter<TDefinition extends SchemaDefinition = SchemaDefiniti
     this.#createdBy = createdBy;
     this.#codec = codec;
     this.#codecId = codecStamp;
-    this.#states = schema.columns.map((column) => createColumnState(column));
-    this.#staged = Array.from<StagedValue>({ length: schema.columns.length }).fill(null);
-    this.#names = new Set(schema.columns.map((column) => column.name));
+    this.#states = columns.map(({ column, snapshot }) => createColumnState(column, snapshot));
+    this.#staged = Array.from<StagedValue>({ length: columns.length }).fill(null);
+    this.#names = new Set(columns.map(({ column }) => column.name));
     this.#out = new ByteWriter(4096);
     this.#out.raw(MAGIC);
   }
@@ -848,6 +848,9 @@ export interface SyncParquetWriter<TDefinition extends SchemaDefinition = Schema
  * // Compressed, with whatever the runtime already has:
  * import { gzipSync } from "node:zlib";
  * const writer = createWriter(schema, { codec: { name: "GZIP", compress: gzipSync } });
+ *
+ * @throws {TavolatoError} `ERR_SCHEMA_EMPTY` or
+ * `ERR_SCHEMA_COLUMN_INVALID` when a structurally supplied schema is malformed.
  */
 export function createWriter<TDefinition extends SchemaDefinition>(
   schema: ParquetSchema<TDefinition>,

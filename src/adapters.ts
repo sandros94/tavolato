@@ -76,42 +76,134 @@ function reject(message: string): never {
 }
 
 /**
- * What is wrong with `annotation`, or `undefined` if nothing is.
+ * Validates `annotation` and copies the exact scalar values inspected.
  *
  * `unknown` is the one member an adapter may not produce: it stands for an
  * annotation *this version has no name for*, and there is no way to write one
  * back out.
  */
-function annotationProblem(annotation: unknown): string | undefined {
+function inspectAnnotation(annotation: unknown): Annotation | string {
   if (typeof annotation !== "object" || annotation === null) {
     return `annotate() must return an annotation, received ${describe(annotation)}`;
   }
-  const value = annotation as Annotation;
-  if (!WRITABLE_ANNOTATIONS.has(value.kind)) {
-    return `annotate() returned the annotation kind ${describe(value.kind)}, which cannot be written`;
+  const value = annotation as { readonly kind?: unknown };
+  const kind = value.kind;
+  if (typeof kind !== "string" || !WRITABLE_ANNOTATIONS.has(kind)) {
+    return `annotate() returned the annotation kind ${describe(kind)}, which cannot be written`;
   }
-  if (value.kind === "decimal") {
-    const { precision, scale } = value;
-    return Number.isSafeInteger(precision) &&
+  if (kind === "decimal") {
+    const decimal = annotation as { readonly precision?: unknown; readonly scale?: unknown };
+    const precision = decimal.precision;
+    const scale = decimal.scale;
+    return typeof precision === "number" &&
+      Number.isSafeInteger(precision) &&
       precision >= 1 &&
       precision <= MAX_ANNOTATION_INTEGER &&
+      typeof scale === "number" &&
       Number.isSafeInteger(scale) &&
       scale >= 0 &&
       scale <= precision
-      ? undefined
+      ? Object.freeze({ kind, precision, scale })
       : `annotate() returned a decimal annotation of precision ${describe(precision)} and scale ${describe(scale)}; precision must be a positive i32 and scale an integer from 0 to the precision`;
   }
-  if (value.kind === "time" || value.kind === "timestamp") {
-    return TIME_UNITS.has(value.unit) && typeof value.isAdjustedToUTC === "boolean"
-      ? undefined
-      : `annotate() returned a ${value.kind} annotation without a unit and a UTC flag`;
+  if (kind === "time" || kind === "timestamp") {
+    const timed = annotation as {
+      readonly unit?: unknown;
+      readonly isAdjustedToUTC?: unknown;
+    };
+    const unit = timed.unit;
+    const isAdjustedToUTC = timed.isAdjustedToUTC;
+    return typeof unit === "string" && TIME_UNITS.has(unit) && typeof isAdjustedToUTC === "boolean"
+      ? Object.freeze({ kind, unit: unit as TimeUnitName, isAdjustedToUTC })
+      : `annotate() returned a ${kind} annotation without a unit and a UTC flag`;
   }
-  if (value.kind === "integer") {
-    return [8, 16, 32, 64].includes(value.bitWidth) && typeof value.isSigned === "boolean"
-      ? undefined
+  if (kind === "integer") {
+    const integer = annotation as { readonly bitWidth?: unknown; readonly isSigned?: unknown };
+    const bitWidth = integer.bitWidth;
+    const isSigned = integer.isSigned;
+    return typeof bitWidth === "number" &&
+      [8, 16, 32, 64].includes(bitWidth) &&
+      typeof isSigned === "boolean"
+      ? Object.freeze({ kind, bitWidth: bitWidth as 8 | 16 | 32 | 64, isSigned })
       : "annotate() returned an integer annotation without a bit width of 8, 16, 32 or 64";
   }
-  return undefined;
+  return Object.freeze({ kind }) as Annotation;
+}
+
+/** Adapter metadata read once and held stable for one validation boundary. */
+export interface AdapterInspection {
+  readonly adapter: LogicalAdapter<unknown, unknown>;
+  readonly name: string;
+  readonly physical: PhysicalKind;
+  readonly typeLength: number | undefined;
+  readonly annotation: Annotation;
+}
+
+/**
+ * Inspects every structural and format-bearing adapter property once.
+ *
+ * The string result is suitable for the accepting boundary's typed error;
+ * otherwise the returned metadata is the exact snapshot that boundary
+ * validated and may safely carry forward.
+ *
+ * @internal
+ */
+export function inspectAdapter(spec: unknown): AdapterInspection | string {
+  if (typeof spec !== "object" || spec === null) {
+    return `expects a column type such as decimal({ precision: 10, scale: 2 }), received ${describe(spec)}`;
+  }
+  const adapter = spec as LogicalAdapter<unknown, unknown>;
+  const name = adapter.name;
+  if (typeof name !== "string" || name === "") {
+    return `has no name; a column type needs one so that errors can say which it is`;
+  }
+  const physical = adapter.physical;
+  if (!PHYSICAL_KINDS.has(physical)) {
+    return `${name} declares the physical type ${describe(physical)}, which is not one of ${[
+      ...PHYSICAL_KINDS,
+    ].join(", ")}`;
+  }
+  const typeLength = adapter.typeLength;
+  if (physical === "fixed") {
+    if (typeof typeLength !== "number" || !Number.isSafeInteger(typeLength) || typeLength < 1) {
+      return `${name} is stored as a FIXED_LEN_BYTE_ARRAY and must declare a positive integer typeLength, received ${describe(typeLength)}`;
+    }
+  } else if (typeLength !== undefined) {
+    return `${name} declares a typeLength but is not stored as a FIXED_LEN_BYTE_ARRAY`;
+  }
+  const matches: unknown = Reflect.get(adapter, "matches");
+  const annotate: unknown = Reflect.get(adapter, "annotate");
+  const read: unknown = Reflect.get(adapter, "read");
+  const write: unknown = Reflect.get(adapter, "write");
+  for (const [method, implementation] of [
+    ["matches", matches],
+    ["annotate", annotate],
+    ["read", read],
+    ["write", write],
+  ] as const) {
+    if (typeof implementation !== "function") return `${name} has no ${method}() function`;
+  }
+  const acceptsPhysical: unknown = Reflect.get(adapter, "acceptsPhysical");
+  if (acceptsPhysical !== undefined && typeof acceptsPhysical !== "function") {
+    return `${name} has a non-function acceptsPhysical property`;
+  }
+  let annotation: unknown;
+  try {
+    annotation = Reflect.apply(annotate as (...args: never[]) => unknown, adapter, []);
+  } catch (cause) {
+    return `${name} threw from annotate(): ${cause instanceof Error ? cause.message : describe(cause)}`;
+  }
+  const inspectedAnnotation = inspectAnnotation(annotation);
+  if (typeof inspectedAnnotation === "string") return `${name} ${inspectedAnnotation}`;
+  const physicalProblem = logicalTypePhysicalProblem(inspectedAnnotation, physical, typeLength);
+  if (physicalProblem !== undefined) return `${name} ${physicalProblem}`;
+  return {
+    adapter,
+    name,
+    physical,
+    typeLength,
+    annotation: inspectedAnnotation,
+  };
 }
 
 /**
@@ -125,46 +217,8 @@ function annotationProblem(annotation: unknown): string | undefined {
  * @internal
  */
 export function adapterProblem(spec: unknown): string | undefined {
-  if (typeof spec !== "object" || spec === null) {
-    return `expects a column type such as decimal({ precision: 10, scale: 2 }), received ${describe(spec)}`;
-  }
-  const adapter = spec as LogicalAdapter<unknown, unknown>;
-  if (typeof adapter.name !== "string" || adapter.name === "") {
-    return `has no name; a column type needs one so that errors can say which it is`;
-  }
-  if (!PHYSICAL_KINDS.has(adapter.physical)) {
-    return `${adapter.name} declares the physical type ${describe(adapter.physical)}, which is not one of ${[...PHYSICAL_KINDS].join(", ")}`;
-  }
-  if (adapter.physical === "fixed") {
-    const width = adapter.typeLength;
-    if (typeof width !== "number" || !Number.isSafeInteger(width) || width < 1) {
-      return `${adapter.name} is stored as a FIXED_LEN_BYTE_ARRAY and must declare a positive integer typeLength, received ${describe(width)}`;
-    }
-  } else if (adapter.typeLength !== undefined) {
-    return `${adapter.name} declares a typeLength but is not stored as a FIXED_LEN_BYTE_ARRAY`;
-  }
-  for (const method of ["matches", "annotate", "read", "write"] as const) {
-    if (typeof adapter[method] !== "function") {
-      return `${adapter.name} has no ${method}() function`;
-    }
-  }
-  if (adapter.acceptsPhysical !== undefined && typeof adapter.acceptsPhysical !== "function") {
-    return `${adapter.name} has a non-function acceptsPhysical property`;
-  }
-  let annotation: unknown;
-  try {
-    annotation = adapter.annotate();
-  } catch (cause) {
-    return `${adapter.name} threw from annotate(): ${cause instanceof Error ? cause.message : describe(cause)}`;
-  }
-  const problem = annotationProblem(annotation);
-  if (problem !== undefined) return `${adapter.name} ${problem}`;
-  const physicalProblem = logicalTypePhysicalProblem(
-    annotation as Annotation,
-    adapter.physical,
-    adapter.typeLength,
-  );
-  return physicalProblem === undefined ? undefined : `${adapter.name} ${physicalProblem}`;
+  const inspected = inspectAdapter(spec);
+  return typeof inspected === "string" ? inspected : undefined;
 }
 
 /**

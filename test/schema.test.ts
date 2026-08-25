@@ -1,12 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
   createWriter,
+  date,
   decimal,
   defineSchema,
   isTavolatoError,
+  readParquet,
+  readSchema,
   TavolatoError,
   uuid,
 } from "../src/index.ts";
+import type { ParquetSchema } from "../src/types.ts";
 import { expectError } from "./_errors.ts";
 
 describe("defineSchema", () => {
@@ -82,6 +86,13 @@ describe("defineSchema", () => {
     expectError("ERR_SCHEMA_EMPTY", () => defineSchema(null));
   });
 
+  it("refuses an array instead of a column map", () => {
+    expectError("ERR_SCHEMA_EMPTY", () =>
+      // @ts-expect-error deliberately wrong input
+      defineSchema([{ type: "i64" }]),
+    );
+  });
+
   it("refuses an unsupported column type", () => {
     const error = expectError(
       "ERR_SCHEMA_COLUMN_INVALID",
@@ -106,6 +117,217 @@ describe("defineSchema", () => {
 
   it("refuses an empty column name", () => {
     expectError("ERR_SCHEMA_COLUMN_INVALID", () => defineSchema({ "": { type: "i64" } }));
+  });
+});
+
+describe("writer schema validation", () => {
+  const forged = (value: unknown): ParquetSchema => value as ParquetSchema;
+  const adapterSchema = (annotate: () => { readonly kind: "date" | "uuid" }): ParquetSchema =>
+    forged({
+      columns: [
+        {
+          name: "n",
+          type: {
+            name: "stateful",
+            physical: "i32",
+            matches: () => false,
+            annotate,
+            read: (raw: unknown) => raw,
+            write: (value: unknown) => value,
+          },
+          optional: false,
+        },
+      ],
+    });
+
+  it("refuses the empty structural schema before it can emit a file", () => {
+    expectError("ERR_SCHEMA_EMPTY", () => createWriter(forged({ columns: [], definition: {} })));
+  });
+
+  it.each([
+    ["a non-object schema", null, "ERR_SCHEMA_EMPTY", undefined],
+    ["missing columns", { definition: {} }, "ERR_SCHEMA_EMPTY", undefined],
+    ["non-array columns", { columns: {}, definition: {} }, "ERR_SCHEMA_COLUMN_INVALID", undefined],
+    [
+      "a malformed column",
+      { columns: [null], definition: {} },
+      "ERR_SCHEMA_COLUMN_INVALID",
+      undefined,
+    ],
+    [
+      "a non-string name",
+      { columns: [{ name: 1, type: "i64", optional: false }], definition: {} },
+      "ERR_SCHEMA_COLUMN_INVALID",
+      undefined,
+    ],
+    [
+      "an empty name",
+      { columns: [{ name: "", type: "i64", optional: false }], definition: {} },
+      "ERR_SCHEMA_COLUMN_INVALID",
+      "",
+    ],
+    [
+      "duplicate names",
+      {
+        columns: [
+          { name: "n", type: "i64", optional: false },
+          { name: "n", type: "i32", optional: false },
+        ],
+        definition: {},
+      },
+      "ERR_SCHEMA_COLUMN_INVALID",
+      "n",
+    ],
+    [
+      "an unsupported built-in",
+      { columns: [{ name: "n", type: "int64", optional: false }], definition: {} },
+      "ERR_SCHEMA_COLUMN_INVALID",
+      "n",
+    ],
+    [
+      "a bigint type",
+      { columns: [{ name: "n", type: 1n, optional: false }], definition: {} },
+      "ERR_SCHEMA_COLUMN_INVALID",
+      "n",
+    ],
+    [
+      "a malformed adapter",
+      {
+        columns: [
+          {
+            name: "n",
+            type: { name: "broken", physical: "i64" },
+            optional: false,
+          },
+        ],
+        definition: {},
+      },
+      "ERR_SCHEMA_COLUMN_INVALID",
+      "n",
+    ],
+    [
+      "a non-boolean normalized optional flag",
+      { columns: [{ name: "n", type: "i64", optional: "yes" }], definition: {} },
+      "ERR_SCHEMA_COLUMN_INVALID",
+      "n",
+    ],
+  ] as const)("refuses %s", (_, schema, code, column) => {
+    const error = expectError(code, () => createWriter(forged(schema)));
+    expect(error.column).toBe(column);
+  });
+
+  it("uses columns only and preserves the schema object", () => {
+    const schema = forged({
+      columns: [
+        { name: "10", type: "i64", optional: false },
+        { name: "2", type: "string", optional: false },
+      ],
+    });
+    const writer = createWriter(schema);
+    expect(writer.schema).toBe(schema);
+    writer.append({ "10": 10n, "2": "two" });
+    expect(readSchema(writer.finish()).columns.map((column) => column.name)).toEqual(["10", "2"]);
+  });
+
+  it("inspects an adapter's annotation exactly once while creating a writer", () => {
+    let calls = 0;
+    const writer = createWriter(
+      adapterSchema(() => {
+        calls++;
+        if (calls > 1) throw new Error("called twice");
+        return { kind: "date" };
+      }),
+    );
+    expect(calls).toBe(1);
+    writer.append({ n: 1 });
+    expect(() => writer.finish()).not.toThrow();
+  });
+
+  it("types an adapter annotation failure at the writer boundary", () => {
+    const error = expectError("ERR_SCHEMA_COLUMN_INVALID", () =>
+      createWriter(
+        adapterSchema(() => {
+          throw new Error("no annotation");
+        }),
+      ),
+    );
+    expect(error.column).toBe("n");
+    expect(error.message).toContain("no annotation");
+  });
+
+  it("writes the same annotation it validated when an adapter alternates answers", () => {
+    let calls = 0;
+    const writer = createWriter(
+      adapterSchema(() => (++calls === 1 ? { kind: "date" } : { kind: "uuid" })),
+    );
+    writer.append({ n: 1 });
+    const days = date({ as: "number" });
+    expect(readParquet(writer.finish(), { types: [days] }).rows).toEqual([{ n: 1 }]);
+    expect(calls).toBe(1);
+  });
+
+  it("reads a structural schema's columns exactly once", () => {
+    let reads = 0;
+    const columns = [{ name: "n", type: "i64", optional: false }] as const;
+    const schema = forged({
+      get columns(): unknown {
+        reads++;
+        return reads === 1 ? columns : null;
+      },
+    });
+    const writer = createWriter(schema);
+    writer.append({ n: 1n });
+    expect(readParquet(writer.finish()).rows).toEqual([{ n: 1n }]);
+    expect(reads).toBe(1);
+  });
+
+  it("owns the normalized column name it validated", () => {
+    let reads = 0;
+    const schema = forged({
+      columns: [
+        {
+          get name(): string {
+            reads++;
+            return reads === 1 ? "n" : "changed";
+          },
+          type: "i64",
+          optional: false,
+        },
+      ],
+    });
+    const writer = createWriter(schema);
+    writer.append({ n: 1n });
+    expect(readParquet(writer.finish()).rows).toEqual([{ n: 1n }]);
+    expect(reads).toBe(1);
+  });
+
+  it("owns the normalized optional flag it validated", () => {
+    let reads = 0;
+    const schema = forged({
+      columns: [
+        {
+          name: "n",
+          type: "i64",
+          get optional(): boolean {
+            reads++;
+            return reads === 1;
+          },
+        },
+      ],
+    });
+    const writer = createWriter(schema);
+    writer.append({ n: null });
+    expect(readParquet(writer.finish()).rows).toEqual([{ n: null }]);
+    expect(reads).toBe(1);
+  });
+
+  it("owns the annotation object returned during validation", () => {
+    const annotation: { kind: "date" | "uuid" } = { kind: "date" };
+    const writer = createWriter(adapterSchema(() => annotation));
+    annotation.kind = "uuid";
+    writer.append({ n: 1 });
+    const days = date({ as: "number" });
+    expect(readParquet(writer.finish(), { types: [days] }).rows).toEqual([{ n: 1 }]);
   });
 });
 

@@ -420,7 +420,7 @@ Every error thrown by the library is a `TavolatoError` carrying a `code` and, wh
 
 | family                    | thrown by                                                                            |
 | ------------------------- | ------------------------------------------------------------------------------------ |
-| `ERR_SCHEMA_*`            | `defineSchema`, `defineColumnType`                                                   |
+| `ERR_SCHEMA_*`            | `defineSchema`, `defineColumnType`, `createWriter`                                   |
 | `ERR_ROW_*`               | `append`, `appendAll`                                                                |
 | `ERR_WRITER_*`            | the writer's lifecycle, its options, its codec                                       |
 | `ERR_READ_MALFORMED`      | bytes that are not a well-formed Parquet file                                        |
