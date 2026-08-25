@@ -153,11 +153,11 @@ const centi = defineColumnType({
 });
 ```
 
-`physical` and `typeLength` are the layout an adapter writes, and that exact layout is always accepted. Define `acceptsPhysical(physical, typeLength)` only to add other layouts that the same logical representation safely decodes; it must return a boolean, and `matches()` still decides whether the annotation belongs to the adapter.
+`physical` and `typeLength` are the layout an adapter writes, and that exact layout is always accepted. Define `acceptsPhysical(physical, typeLength)` only to add other layouts that the same logical representation safely decodes; it and `matches()` must return booleans, and `matches()` decides whether the annotation belongs to the adapter.
 
 Both halves are **synchronous** — an adapter is a pure value transform, and the one place tavolato defers is the codec seam. **Nulls never reach one**: an `optional` column is handled by the definition-level machinery on both sides. A `bytes` or `fixed` `write()` must return a **fresh** `Uint8Array` every time, since the writer holds what you hand it by reference until the row group is flushed.
 
-Your functions are held to their word. A `write` that throws, or that hands back something other than the physical value it promised, is `ERR_ROW_VALUE_INVALID` naming the column; a `read` that throws is `ERR_READ_MALFORMED`; `matches()` or `acceptsPhysical()` throwing, or `acceptsPhysical()` returning a non-boolean, is your option misbehaving rather than the file, and says so with `ERR_READ_OPTION_INVALID`.
+Your functions are held to their word. A `write` that throws, or that hands back something other than the physical value it promised, is `ERR_ROW_VALUE_INVALID` naming the column; a `read` that throws is `ERR_READ_MALFORMED`; `matches()` or `acceptsPhysical()` throwing or returning a non-boolean is your option misbehaving rather than the file, and says so with `ERR_READ_OPTION_INVALID`.
 
 This is also the way to read a column the built-ins have no reading for at all — an unannotated `BYTE_ARRAY` or `FIXED_LEN_BYTE_ARRAY`. tavolato will not hand you raw bytes and call it a value; declare what those bytes are, and it will.
 

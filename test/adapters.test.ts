@@ -556,6 +556,132 @@ describe("claiming a column", () => {
     expect((error.cause as Error).message).toBe("no idea");
   });
 
+  it.each([
+    ["a truthy string", (): unknown => "yes"],
+    ["a falsy string", (): unknown => ""],
+    ["a truthy number", (): unknown => 1],
+    ["a falsy number", (): unknown => 0],
+    ["null", (): unknown => null],
+    ["undefined", (): unknown => undefined],
+    ["a promise", (): unknown => Promise.resolve(true)],
+    [
+      "a thenable",
+      (): unknown => ({
+        // eslint-disable-next-line unicorn/no-thenable -- invalid async matcher result under test
+        then: () => undefined,
+      }),
+    ],
+  ] as const)("holds matches() to a boolean answer when it returns %s", (_, answer) => {
+    const undecided = defineColumnType({
+      name: "undecided",
+      physical: "fixed",
+      typeLength: 16,
+      matches: () => answer() as never,
+      annotate: (): Annotation => ({ kind: "uuid" }),
+      read: (raw) => raw as Uint8Array,
+      write: (value: Uint8Array) => value,
+    });
+    const bytes = write(uuid(), ["b3f2c1a0-1111-4222-8333-444455556666"]);
+    const error = expectError("ERR_READ_OPTION_INVALID", () =>
+      readParquet(bytes, { types: [undecided] }),
+    );
+    expect(error.message).toContain("undecided");
+    expect(error.message).toContain("matches()");
+    expect(error.column).toBe("v");
+  });
+
+  it("continues after false and lets the first true matcher claim the column", () => {
+    const calls: string[] = [];
+    const adapter = (name: string, claimed: boolean) =>
+      defineColumnType({
+        name,
+        physical: "fixed" as const,
+        typeLength: 16,
+        matches: () => {
+          calls.push(name);
+          return claimed;
+        },
+        annotate: (): Annotation => ({ kind: "uuid" }),
+        read: () => name,
+        write: (value: Uint8Array) => value,
+      });
+    const rejecting = adapter("rejecting", false);
+    const claiming = adapter("claiming", true);
+    const ignored = adapter("ignored", true);
+    const bytes = write(uuid(), ["b3f2c1a0-1111-4222-8333-444455556666"]);
+
+    expect(readParquet(bytes, { types: [rejecting, claiming, ignored] }).rows).toEqual([
+      { v: "claiming" },
+    ]);
+    expect(calls).toEqual(["rejecting", "claiming"]);
+  });
+
+  it("calls both decision hooks with the adapter as their receiver", () => {
+    const annotation = { kind: "decimal", precision: 9, scale: 0 } as const;
+    const contextual = defineColumnType({
+      name: "contextual",
+      physical: "i64",
+      acceptsPhysical(this: { readonly name: string }, physical: PhysicalKind) {
+        return this.name === "contextual" && physical === "i32";
+      },
+      matches(this: { readonly name: string }, found: Annotation) {
+        return this.name === "contextual" && found.kind === "decimal";
+      },
+      annotate: (): Annotation => annotation,
+      read: (raw) => raw as number,
+      write: (value: bigint) => value,
+    });
+    const bytes = write(annotatedAs(annotation, "i32"), [7]);
+
+    expect(readParquet(bytes, { types: [contextual] }).rows).toEqual([{ v: 7 }]);
+  });
+
+  it("types hostile non-boolean results from both decision hooks", () => {
+    const hostile = new Proxy(
+      {},
+      {
+        get(target, key, receiver) {
+          if (key === Symbol.toStringTag) throw new Error("no tag");
+          return Reflect.get(target, key, receiver);
+        },
+      },
+    );
+    const uuidBytes = write(uuid(), ["b3f2c1a0-1111-4222-8333-444455556666"]);
+    const matching = defineColumnType({
+      name: "hostile-match",
+      physical: "fixed",
+      typeLength: 16,
+      matches: () => hostile as never,
+      annotate: (): Annotation => ({ kind: "uuid" }),
+      read: (raw) => raw as Uint8Array,
+      write: (value: Uint8Array) => value,
+    });
+    const matchError = expectError("ERR_READ_OPTION_INVALID", () =>
+      readParquet(uuidBytes, { types: [matching] }),
+    );
+
+    const annotation = { kind: "decimal", precision: 9, scale: 0 } as const;
+    const decimalBytes = write(annotatedAs(annotation, "i32"), [7]);
+    const accepting = defineColumnType({
+      name: "hostile-layout",
+      physical: "i64",
+      acceptsPhysical: () => hostile as never,
+      matches: () => true,
+      annotate: (): Annotation => annotation,
+      read: (raw) => raw,
+      write: (value: bigint) => value,
+    });
+    const layoutError = expectError("ERR_READ_OPTION_INVALID", () =>
+      readParquet(decimalBytes, { types: [accepting] }),
+    );
+
+    for (const error of [matchError, layoutError]) {
+      expect(error.column).toBe("v");
+      expect(error.message).toContain("an object");
+      expect(error.cause).toBeUndefined();
+    }
+  });
+
   it("holds acceptsPhysical() to a boolean answer and typed failures", () => {
     const annotation = { kind: "decimal", precision: 9, scale: 0 } as const;
     const bytes = write(annotatedAs(annotation, "i32"), [7]);

@@ -243,6 +243,32 @@ function isPlainInteger(annotation: Annotation, bitWidth: 32 | 64): boolean {
   return annotation.kind === "integer" && annotation.bitWidth === bitWidth && annotation.isSigned;
 }
 
+/** Runs one adapter decision hook and holds its runtime answer to `boolean`. */
+function adapterDecision(
+  adapter: AnyLogicalAdapter,
+  hook: "acceptsPhysical" | "matches",
+  column: string,
+  decide: () => unknown,
+): boolean {
+  let result: unknown;
+  try {
+    result = decide();
+  } catch (cause) {
+    throw badOption(
+      `The column type ${adapter.name} threw from ${hook}() on column "${column}"`,
+      column,
+      cause,
+    );
+  }
+  if (typeof result !== "boolean") {
+    throw badOption(
+      `The column type ${adapter.name} returned ${describe(result)} from ${hook}() on column "${column}"`,
+      column,
+    );
+  }
+  return result;
+}
+
 /**
  * Finds the adapter that claims a column, if any.
  *
@@ -261,35 +287,22 @@ function claimedBy(
     const exactLayout =
       adapter.physical === physical && (physical !== "fixed" || adapter.typeLength === typeLength);
     if (!exactLayout) {
-      if (adapter.acceptsPhysical === undefined) continue;
-      let acceptsAlternative: unknown;
-      try {
-        acceptsAlternative = adapter.acceptsPhysical(physical, typeLength);
-      } catch (cause) {
+      const acceptsPhysical: unknown = Reflect.get(adapter, "acceptsPhysical");
+      if (acceptsPhysical === undefined) continue;
+      if (typeof acceptsPhysical !== "function") {
         throw badOption(
-          `The column type ${adapter.name} threw from acceptsPhysical() on column "${element.name}"`,
-          element.name,
-          cause,
-        );
-      }
-      if (typeof acceptsAlternative !== "boolean") {
-        throw badOption(
-          `The column type ${adapter.name} returned ${describe(acceptsAlternative)} from acceptsPhysical() on column "${element.name}"`,
+          `The column type ${adapter.name} has a non-function acceptsPhysical property on column "${element.name}"`,
           element.name,
         );
       }
+      const acceptsAlternative = adapterDecision(adapter, "acceptsPhysical", element.name, () =>
+        Reflect.apply(acceptsPhysical, adapter, [physical, typeLength]),
+      );
       if (!acceptsAlternative) continue;
     }
-    let claimed: boolean;
-    try {
-      claimed = adapter.matches(annotation, physical);
-    } catch (cause) {
-      throw badOption(
-        `The column type ${adapter.name} threw from matches() on column "${element.name}"`,
-        element.name,
-        cause,
-      );
-    }
+    const claimed = adapterDecision(adapter, "matches", element.name, () =>
+      adapter.matches(annotation, physical),
+    );
     if (claimed) return adapter;
   }
   return undefined;

@@ -90,7 +90,14 @@ export function describe(value: unknown): string {
     }
     default: {
       // object and function
-      return Object.prototype.toString.call(value);
+      try {
+        return Object.prototype.toString.call(value);
+      } catch {
+        // A proxy or Symbol.toStringTag accessor can trap the ordinary tag
+        // lookup. `typeof` performs no property access, so this fallback stays
+        // total even for a hostile value supplied by a callback.
+        return typeof value === "function" ? "a function" : "an object";
+      }
     }
   }
 }

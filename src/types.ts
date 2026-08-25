@@ -156,13 +156,13 @@ export interface LogicalAdapter<TIn, TOut> {
    * writes. When absent, reads require `physical` and `typeLength` to match the
    * write layout exactly. Exact matches are accepted without calling this hook;
    * the file's annotation-to-physical contract is validated before alternatives
-   * reach it.
+   * reach it. The runtime answer must be exactly a boolean.
    */
   acceptsPhysical?(physical: PhysicalKind, typeLength: number | undefined): boolean;
   /**
    * Whether this adapter claims a column carrying `annotation`. The physical
    * layout is accepted before this is called, so it only has the annotation
-   * left to judge.
+   * left to judge. The runtime answer must be exactly a boolean.
    */
   matches(annotation: Annotation, physical: PhysicalKind): boolean;
   /** The annotation to stamp on a column written through this adapter. */
