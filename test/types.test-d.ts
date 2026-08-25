@@ -20,6 +20,8 @@ import type {
   DateOptions,
   DateRepresentation,
   DateValue,
+  Float16Options,
+  Float16Representation,
   JsonDangerousKeys,
   JsonDocument,
   JsonNull,
@@ -283,6 +285,20 @@ dateAsNumber.write(0);
 dateAsNumber.write(new Date(0));
 dateAsEither.write(Math.random() > 0.5 ? new Date(0) : 0);
 void [dateValue];
+
+const float16Representation: Float16Representation = "bits";
+const float16Options: Float16Options = { as: float16Representation };
+const halfBits = float16(float16Options);
+const halfNumber = float16({ as: "number" });
+halfBits.write(0x3e00);
+halfNumber.write(1.5);
+// @ts-expect-error Float16 options are immutable contracts
+float16Options.as = "number";
+// @ts-expect-error representations are a closed explicit choice
+float16({ as: "raw" });
+// @ts-expect-error options must be an object when supplied
+float16(null);
+void [float16Representation, halfBits, halfNumber];
 // @ts-expect-error TIME requires the upstream UTC-adjustment parameter
 time({ unit: "millis" });
 // @ts-expect-error TIMESTAMP requires the upstream UTC-adjustment parameter

@@ -21,6 +21,8 @@ export type {
   DateRepresentation,
   DateValue,
   DecimalOptions,
+  Float16Options,
+  Float16Representation,
   IntegerOptions,
   IntegerValue,
   IntegerWidth,

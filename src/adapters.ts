@@ -623,34 +623,73 @@ export function timestamp(options: TimeOptions): LogicalAdapter<bigint, bigint> 
   });
 }
 
+/** JavaScript representation used by {@link float16}. */
+export type Float16Representation = "number" | "bits";
+
+/** Options for {@link float16}. */
+export interface Float16Options {
+  /** Rounded numeric value, or the exact unsigned 16-bit encoding. Defaults to `"number"`. */
+  readonly as?: Float16Representation;
+}
+
 /**
- * `FLOAT16` ⇄ `number`, IEEE 754 half precision in a 2-byte
+ * `FLOAT16` ⇄ its numeric value or exact bit pattern, stored in a 2-byte
  * `FIXED_LEN_BYTE_ARRAY`.
  *
- * Writing rounds to half precision once — the one place a value changes on the
- * way in, and it has to, because half precision is what the column *is*.
- * Everything after that is exact: what is read back is the stored value, and
- * writing that value again produces the same two bytes.
+ * The default `"number"` representation rounds to half precision on write and
+ * reads the stored numeric value. `"bits"` instead accepts and returns an
+ * unsigned integer from 0 through 65,535, preserving every encoding exactly —
+ * including NaN payloads and signs and both zero encodings.
  */
-export function float16(): LogicalAdapter<number, number> {
-  return defineColumnType<number, number>({
+export function float16(options: Float16Options = {}): LogicalAdapter<number, number> {
+  if (typeof options !== "object" || options === null) {
+    throw invalid(`float16 options must be an object, received ${describe(options)}`);
+  }
+  const { as = "number" } = options;
+  if (as !== "number" && as !== "bits") {
+    throw invalid(`float16 as must be "number" or "bits", received ${describe(as)}`);
+  }
+
+  const common = {
     name: "float16",
     physical: "fixed",
     typeLength: 2,
-    matches: (annotation) => annotation.kind === "float16",
-    annotate: () => ({ kind: "float16" }),
-    read: (raw) => {
-      const bytes = raw as Uint8Array;
-      return numberFromHalf(bytes[0] | (bytes[1] << 8));
-    },
-    write: (value) => {
-      if (typeof value !== "number") {
-        reject(`float16 expects a number, received ${describe(value)}`);
-      }
-      const bits = halfFromNumber(value);
-      return new Uint8Array([bits & 0xff, bits >>> 8]);
-    },
-  });
+    matches: (annotation: Annotation) => annotation.kind === "float16",
+    annotate: (): Annotation => ({ kind: "float16" }),
+  } as const;
+  return as === "bits"
+    ? defineColumnType<number, number>({
+        ...common,
+        read: (raw) => halfBitsFromBytes(raw as Uint8Array),
+        write: (value) => {
+          if (!Number.isSafeInteger(value) || value < 0 || value > 0xffff) {
+            reject(
+              `float16 as bits expects an unsigned 16-bit integer from 0 to 65535, received ${describe(value)}`,
+            );
+          }
+          return halfBytesFromBits(value);
+        },
+      })
+    : defineColumnType<number, number>({
+        ...common,
+        read: (raw) => numberFromHalf(halfBitsFromBytes(raw as Uint8Array)),
+        write: (value) => {
+          if (typeof value !== "number") {
+            reject(`float16 expects a number, received ${describe(value)}`);
+          }
+          return halfBytesFromBits(halfFromNumber(value));
+        },
+      });
+}
+
+/** Reads Parquet's little-endian binary16 bytes as their unsigned bit pattern. */
+function halfBitsFromBytes(bytes: Uint8Array): number {
+  return bytes[0] | (bytes[1] << 8);
+}
+
+/** Writes an unsigned binary16 bit pattern in Parquet's little-endian order. */
+function halfBytesFromBits(bits: number): Uint8Array {
+  return new Uint8Array([bits & 0xff, bits >>> 8]);
 }
 
 /** Scratch view used to read a double's exponent field without a `Math.log2` round trip. */

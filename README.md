@@ -88,7 +88,8 @@ Each in-box factory maps by one rule: the value must survive the round trip unch
 | `time({ unit: "millis", isAdjustedToUTC })`                           | `number`       | `INT32` / `TIME(MILLIS, …)`                       |
 | `time({ unit: "micros" \| "nanos", isAdjustedToUTC })`                | `bigint`       | `INT64` / `TIME(…, …)`                            |
 | `timestamp({ unit, isAdjustedToUTC })`                                | `bigint`       | `INT64` / `TIMESTAMP(…, …)`                       |
-| `float16()`                                                           | `number`       | `FLBA(2)` / `FLOAT16`                             |
+| `float16()` or `float16({ as: "number" })`                            | `number`       | `FLBA(2)` / `FLOAT16`                             |
+| `float16({ as: "bits" })`                                             | `number`       | `FLBA(2)` / `FLOAT16`                             |
 | `integer({ bitWidth: 8 \| 16 \| 32, signed })`                        | `number`       | `INT32` / `INTEGER(…)`                            |
 | `integer({ bitWidth: 64, signed })`                                   | `bigint`       | `INT64` / `INTEGER(64, …)`                        |
 | `json()` or `json({ as: "value", dangerousKeys, reviver, replacer })` | `JsonDocument` | `BYTE_ARRAY` / `JSON`                             |
@@ -103,6 +104,7 @@ uuid(); // crypto.randomUUID() — canonical lowercase 8-4-4-4-12, and only that
 time({ unit: "millis", isAdjustedToUTC: false }); // 43_200_000 — local time since midnight
 timestamp({ unit: "micros", isAdjustedToUTC: true }); // 1_756_000_000_000_000n — an instant
 float16(); // 1.5 — rounded to half precision once, on write
+float16({ as: "bits" }); // 0x3e00 — exact unsigned binary16 encoding of 1.5
 integer({ bitWidth: 8, signed: false }); // 255 — a domain, range-checked on the way in
 json({ as: "text" }); // '{ "exact": true }\n' — validated JSON source, preserved exactly
 json<Payload>(); // your document type, with the reviver and replacer opened up
@@ -115,6 +117,8 @@ The same object serves both sides: in a schema it decides how a column is writte
 Parquet `DATE` reaches far beyond JavaScript's ±100,000,000-day `Date` range. The default adapter refuses those otherwise-valid values with `ERR_READ_UNSUPPORTED`; use `date({ as: "number" })` for a lossless signed day count across the complete Parquet `INT32` domain. The representation is stable per adapter—never selected from the value's magnitude.
 
 `TIME` and `TIMESTAMP` carry `unit` and `isAdjustedToUTC` as separate required Parquet parameters. Adapters match and re-emit both exactly. The built-in `timestamp` type maps only `TIMESTAMP(MILLIS, true)` to `Date`; use `timestamp({ unit: "millis", isAdjustedToUTC: false })` to preserve a local timestamp as its raw `bigint` count.
+
+`float16()` uses JavaScript numeric values and therefore canonicalizes NaN while rounding writes to binary16. Use `float16({ as: "bits" })` for the unsigned integer bit pattern from `0x0000` through `0xffff`; it preserves every binary16 encoding, including NaN payload and sign, infinities, subnormals, and both zero encodings. Both representations use Parquet's little-endian two-byte `FLOAT16` layout.
 
 ```ts
 import { createWriter, decimal, defineSchema, readParquet, uuid } from "tavolato";

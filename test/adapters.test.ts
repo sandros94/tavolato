@@ -1152,6 +1152,65 @@ describe("float16", () => {
     expect(read).toEqual([0, -0]);
     expect(Object.is(read[1], -0)).toBe(true);
   });
+
+  it("maps 1.5 between its numeric value and exact bit pattern", () => {
+    const number = float16();
+    const bits = float16({ as: "bits" });
+    expect(bits.read(number.write(1.5))).toBe(0x3e00);
+    expect(number.read(bits.write(0x3e00))).toBe(1.5);
+    expect(bits.write(0x3e00)).toEqual(new Uint8Array([0x00, 0x3e]));
+  });
+
+  it("round-trips all 65,536 binary16 encodings by identity", () => {
+    const bits = float16({ as: "bits" });
+    let checked = 0;
+    for (let expected = 0; expected <= 0xffff; expected++) {
+      const bytes = bits.write(expected) as Uint8Array;
+      if (bytes[0] !== (expected & 0xff) || bytes[1] !== expected >>> 8) {
+        throw new Error(`float16 bits ${expected} wrote the wrong bytes`);
+      }
+      if (bits.read(bytes) !== expected) {
+        throw new Error(`float16 bits ${expected} did not round-trip`);
+      }
+      checked++;
+    }
+    expect(checked).toBe(65_536);
+  });
+
+  it("preserves NaN payloads, signs, infinities, subnormals and both zero encodings", () => {
+    const bits = float16({ as: "bits" });
+    const encodings = [
+      0x0000, 0x8000, 0x0001, 0x03ff, 0x7c00, 0xfc00, 0x7c01, 0x7e00, 0x7fff, 0xfc01, 0xfe00,
+      0xffff,
+    ];
+    expect(roundtrip(bits, encodings)).toEqual(encodings);
+    expect(Object.is(float16().read(bits.write(0x8000)), -0)).toBe(true);
+  });
+
+  it("keeps the default and explicit numeric representations compatible", () => {
+    const values = [1.5, -0, 65_504, Number.NaN];
+    const implicit = float16();
+    const empty = float16({});
+    const explicit = float16({ as: "number" });
+    for (const value of values) {
+      expect(empty.write(value)).toEqual(implicit.write(value));
+      expect(explicit.write(value)).toEqual(implicit.write(value));
+    }
+  });
+
+  it("validates exact bit-pattern inputs", () => {
+    const bits = float16({ as: "bits" });
+    for (const value of [-1, 65_536, 0.5, Number.NaN, Infinity, "1", 1n]) {
+      const error = expectError("ERR_ROW_VALUE_INVALID", appendOne(bits, value));
+      expect(error.message).toContain("unsigned 16-bit integer");
+    }
+  });
+
+  it("validates its options and representation", () => {
+    expectError("ERR_SCHEMA_COLUMN_INVALID", () => float16(null as never));
+    expectError("ERR_SCHEMA_COLUMN_INVALID", () => float16(1 as never));
+    expectError("ERR_SCHEMA_COLUMN_INVALID", () => float16({ as: "raw" as never }));
+  });
 });
 
 describe("integer", () => {
