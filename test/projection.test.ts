@@ -14,9 +14,11 @@ import {
   CODEC_IDS,
   CompressionCodec,
   encodeFileMetadata,
+  PhysicalType,
   type RowGroupMeta,
   snapshotColumn,
 } from "../src/internal/format.ts";
+import { CompactWriter, ThriftType } from "../src/internal/thrift.ts";
 import { sealFile, startFile, withPhysicalType, writeDataPage } from "./_build.ts";
 import { expectError } from "./_errors.ts";
 import { sync } from "./_sync.ts";
@@ -309,6 +311,16 @@ describe("refusals a projection lifts", () => {
     );
     expect(projected.message).toContain("flat, forever");
   });
+
+  it("does not lift a FIXED_LEN_BYTE_ARRAY leaf whose type_length is missing", () => {
+    const bytes = withPhysicalType(sample(3), 7);
+    expectError("ERR_READ_MALFORMED", () => readParquet(bytes, { types: TYPES }));
+    const projected = expectError("ERR_READ_MALFORMED", () =>
+      readParquet(bytes, { columns: ["n"] }),
+    );
+    expect(projected.column).toBe("i");
+    expect(projected.message).toContain("type_length");
+  });
 });
 
 describe("projection and codecs", () => {
@@ -481,16 +493,32 @@ function mixedCodecs(
  * flat level is what tavolato reads, and this is what it is not.
  */
 function nestedFile(): Uint8Array {
-  return twoColumnsOneChunk(withNumChildren);
+  const metadata = new CompactWriter();
+  metadata.structBegin();
+  metadata.fieldI32(1, 1);
+  metadata.fieldListBegin(2, ThriftType.STRUCT, 3);
+  metadata.structBegin(); // root
+  metadata.fieldString(4, "schema");
+  metadata.fieldI32(5, 1);
+  metadata.structEnd();
+  metadata.structBegin(); // group
+  metadata.fieldI32(3, 0);
+  metadata.fieldString(4, "group");
+  metadata.fieldI32(5, 1);
+  metadata.structEnd();
+  metadata.structBegin(); // nested leaf
+  metadata.fieldI32(1, PhysicalType.INT64);
+  metadata.fieldI32(3, 0);
+  metadata.fieldString(4, "n");
+  metadata.structEnd();
+  metadata.fieldI64(3, 0n);
+  metadata.fieldListBegin(4, ThriftType.STRUCT, 0);
+  metadata.structEnd();
+  return sealFile(startFile(), metadata.toBytes());
 }
 
-/**
- * Two columns declared and one chunk in the row group — a footer contradicting
- * itself, and the ground {@link nestedFile} is built on.
- */
-function twoColumnsOneChunk(
-  patch: (footer: Uint8Array) => Uint8Array = (footer) => footer,
-): Uint8Array {
+/** Two columns declared and one chunk in the row group — a footer contradicting itself. */
+function twoColumnsOneChunk(): Uint8Array {
   const out = startFile();
   const at = out.length;
   const page = writeDataPage(out, [1n, 2n]);
@@ -524,31 +552,5 @@ function twoColumnsOneChunk(
     2,
     "probe",
   );
-  return sealFile(out, patch(footer));
-}
-
-/**
- * Turns the footer's **second** leaf into a group of two children, by finding
- * its `SchemaElement` and giving it a `num_children`.
- *
- * A leaf is written as `15 04 25 00 18 …`; the `num_children` field is id 5,
- * which follows the name. Rather than splice bytes into a compact struct, the
- * element is rewritten in place: the trailing name is short enough that the two
- * extra bytes fit where the next element's header begins, so the whole thing is
- * built by hand instead.
- */
-function withNumChildren(footer: Uint8Array): Uint8Array {
-  // `18 05 67 72 6f 75 70` is `name = "group"`; `15 04` after it is num_children
-  // = 2 (zigzag), which is what turns the leaf into a group.
-  const name = [0x18, 0x05, 0x67, 0x72, 0x6f, 0x75, 0x70];
-  for (let offset = 0; offset + name.length <= footer.length; offset++) {
-    if (!name.every((byte, index) => footer[offset + index] === byte)) continue;
-    const at = offset + name.length;
-    const patched = new Uint8Array(footer.length + 2);
-    patched.set(footer.subarray(0, at));
-    patched.set([0x15, 0x04], at); // field 5 (delta 1 from 4), i32, zigzag(2) = 4
-    patched.set(footer.subarray(at), at + 2);
-    return patched;
-  }
-  throw new Error('no schema element named "group" found');
+  return sealFile(out, footer);
 }

@@ -1124,12 +1124,24 @@ function decodeLogicalType(reader: CompactReader): Annotation {
  * which the checks downstream already refuse, by name and with the column.
  */
 
-function decodeSchemaElement(reader: CompactReader): SchemaElement {
+function isRepetitionType(value: number | undefined): boolean {
+  return (
+    value === FieldRepetitionType.REQUIRED ||
+    value === FieldRepetitionType.OPTIONAL ||
+    value === FieldRepetitionType.REPEATED
+  );
+}
+
+function decodeSchemaElement(reader: CompactReader, root: boolean): SchemaElement {
   let name: string | undefined;
   let physical: number | undefined;
+  let physicalPresent = false;
   let typeLength: number | undefined;
+  let typeLengthPresent = false;
   let repetition: number | undefined;
-  let numChildren = 0;
+  let repetitionPresent = false;
+  let numChildren: number | undefined;
+  let numChildrenPresent = false;
   let convertedType: number | undefined;
   let scale: number | undefined;
   let precision: number | undefined;
@@ -1137,16 +1149,19 @@ function decodeSchemaElement(reader: CompactReader): SchemaElement {
   eachField(reader, (field) => {
     switch (field.id) {
       case 1: {
+        physicalPresent = true;
         if (field.type !== ThriftType.I32) return false;
         physical = reader.i32();
         return true;
       }
       case 2: {
+        typeLengthPresent = true;
         if (field.type !== ThriftType.I32) return false;
         typeLength = reader.i32();
         return true;
       }
       case 3: {
+        repetitionPresent = true;
         if (field.type !== ThriftType.I32) return false;
         repetition = reader.i32();
         return true;
@@ -1157,6 +1172,7 @@ function decodeSchemaElement(reader: CompactReader): SchemaElement {
         return true;
       }
       case 5: {
+        numChildrenPresent = true;
         if (field.type !== ThriftType.I32) return false;
         numChildren = reader.i32();
         return true;
@@ -1186,12 +1202,98 @@ function decodeSchemaElement(reader: CompactReader): SchemaElement {
       }
     }
   });
+
+  const requiredName = requiredField(name, "SchemaElement.name");
+  if (root) {
+    if (physicalPresent) {
+      throw malformed("The schema root must be a group and must not declare a physical type");
+    }
+    if (typeLengthPresent) {
+      throw malformed("The schema root must not declare type_length");
+    }
+    if (repetitionPresent && !isRepetitionType(repetition)) {
+      throw malformed(`The schema root declares an unusable repetition_type ${String(repetition)}`);
+    }
+    const children = requiredField(numChildren, "SchemaElement.num_children");
+    if (children < 0) {
+      throw malformed(`The schema root declares a negative num_children ${children}`);
+    }
+    return {
+      name: requiredName,
+      numChildren: children,
+      convertedType,
+      scale,
+      precision,
+      logical,
+    };
+  }
+
+  if (!repetitionPresent || repetition === undefined) {
+    throw malformed(`Column "${requiredName}" is missing a usable repetition_type`, requiredName);
+  }
+  if (!isRepetitionType(repetition)) {
+    throw malformed(
+      `Column "${requiredName}" declares repetition_type ${repetition}, which Parquet does not define`,
+      requiredName,
+    );
+  }
+  if (physicalPresent && physical === undefined) {
+    throw malformed(`Column "${requiredName}" has an unusable physical type`, requiredName);
+  }
+  if (physicalPresent) {
+    if (numChildrenPresent) {
+      throw malformed(
+        `Primitive column "${requiredName}" must not declare num_children`,
+        requiredName,
+      );
+    }
+    if (typeLengthPresent && typeLength === undefined) {
+      throw malformed(`Column "${requiredName}" has an unusable type_length`, requiredName);
+    }
+    if (physical === PhysicalType.FIXED_LEN_BYTE_ARRAY) {
+      if (
+        !typeLengthPresent ||
+        typeLength === undefined ||
+        !Number.isSafeInteger(typeLength) ||
+        typeLength < 1
+      ) {
+        throw malformed(
+          `Column "${requiredName}" is a FIXED_LEN_BYTE_ARRAY whose type_length is ${String(typeLength)}`,
+          requiredName,
+        );
+      }
+    }
+    return {
+      name: requiredName,
+      physical,
+      typeLength,
+      repetition,
+      numChildren: 0,
+      convertedType,
+      scale,
+      precision,
+      logical,
+    };
+  }
+
+  if (typeLengthPresent) {
+    throw malformed(`Group "${requiredName}" must not declare type_length`, requiredName);
+  }
+  const children = requiredField(
+    numChildrenPresent ? numChildren : undefined,
+    "SchemaElement.num_children",
+    requiredName,
+  );
+  if (children < 0) {
+    throw malformed(
+      `Group "${requiredName}" declares a negative num_children ${children}`,
+      requiredName,
+    );
+  }
   return {
-    name: requiredField(name, "SchemaElement.name"),
-    physical,
-    typeLength,
+    name: requiredName,
     repetition,
-    numChildren,
+    numChildren: children,
     convertedType,
     scale,
     precision,
@@ -1435,7 +1537,9 @@ export function decodeFileMetadata(bytes: Uint8Array): FileMetadata {
           return true;
         }
         const found: SchemaElement[] = [];
-        for (let index = 0; index < size; index++) found.push(decodeSchemaElement(reader));
+        for (let index = 0; index < size; index++) {
+          found.push(decodeSchemaElement(reader, index === 0));
+        }
         schema = found;
         return true;
       }

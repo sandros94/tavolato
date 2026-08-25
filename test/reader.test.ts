@@ -497,6 +497,192 @@ describe("truncation", () => {
   });
 });
 
+type SchemaI32 = number | "wrong" | undefined;
+
+interface SchemaElementProbe {
+  readonly name: string;
+  readonly physical?: SchemaI32;
+  readonly typeLength?: SchemaI32;
+  readonly repetition?: SchemaI32;
+  readonly numChildren?: SchemaI32;
+}
+
+function schemaProbe(elements: readonly SchemaElementProbe[]): Uint8Array {
+  const fieldI32 = (writer: CompactWriter, id: number, value: SchemaI32): void => {
+    if (value === undefined) return;
+    if (value === "wrong") writer.fieldString(id, "wrong");
+    else writer.fieldI32(id, value);
+  };
+  const metadata = new CompactWriter();
+  metadata.structBegin();
+  metadata.fieldI32(1, 1);
+  metadata.fieldListBegin(2, ThriftType.STRUCT, elements.length);
+  for (const element of elements) {
+    metadata.structBegin();
+    fieldI32(metadata, 1, element.physical);
+    fieldI32(metadata, 2, element.typeLength);
+    fieldI32(metadata, 3, element.repetition);
+    metadata.fieldString(4, element.name);
+    fieldI32(metadata, 5, element.numChildren);
+    metadata.structEnd();
+  }
+  metadata.fieldI64(3, 0n);
+  metadata.fieldListBegin(4, ThriftType.STRUCT, 0);
+  metadata.structEnd();
+  return sealFile(startFile(), metadata.toBytes());
+}
+
+describe("SchemaElement root and leaf invariants", () => {
+  const root: SchemaElementProbe = { name: "schema", numChildren: 1 };
+  const leaf: SchemaElementProbe = {
+    name: "n",
+    physical: PhysicalType.INT64,
+    repetition: 0,
+  };
+
+  it.each([0, 1])("accepts a primitive leaf with repetition_type %i", (repetition) => {
+    expect(readSchema(schemaProbe([root, { ...leaf, repetition }])).columns[0]).toMatchObject({
+      name: "n",
+      optional: repetition === 1,
+    });
+  });
+
+  it("keeps a valid REPEATED leaf well-formed but unsupported", () => {
+    const error = expectError("ERR_READ_UNSUPPORTED", () =>
+      readSchema(schemaProbe([root, { ...leaf, repetition: 2 }])),
+    );
+    expect(error.column).toBe("n");
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["negative", -1],
+    ["larger than the enum", 3],
+    ["the wrong wire type", "wrong"],
+  ] as const)("refuses %s leaf repetition_type", (_, repetition) => {
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readSchema(schemaProbe([root, { ...leaf, repetition }])),
+    );
+    expect(error.column).toBe("n");
+  });
+
+  it.each([
+    ["physical type", { physical: PhysicalType.INT64 }],
+    ["wrong-typed physical type", { physical: "wrong" }],
+    ["type_length", { typeLength: 4 }],
+    ["wrong-typed type_length", { typeLength: "wrong" }],
+  ] as const)("refuses a root carrying %s", (_, fields) => {
+    expectError("ERR_READ_MALFORMED", () =>
+      readSchema(schemaProbe([{ ...root, ...fields }, leaf])),
+    );
+  });
+
+  it.each([0, 1, 2])("accepts and ignores root repetition_type %i", (repetition) => {
+    expect(readSchema(schemaProbe([{ ...root, repetition }, leaf])).columns[0].name).toBe("n");
+  });
+
+  it.each([
+    ["negative", -1],
+    ["larger than the enum", 3],
+    ["wrong-typed", "wrong"],
+  ] as const)("refuses a root with %s repetition_type", (_, repetition) => {
+    expectError("ERR_READ_MALFORMED", () =>
+      readSchema(schemaProbe([{ ...root, repetition }, leaf])),
+    );
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["wrong-typed", "wrong"],
+    ["negative", -1],
+    ["too small", 0],
+    ["too large", 2],
+  ] as const)("refuses a root with %s num_children", (_, numChildren) => {
+    expectError("ERR_READ_MALFORMED", () =>
+      readSchema(schemaProbe([{ ...root, numChildren }, leaf])),
+    );
+  });
+
+  it("reports a flat root child-count mismatch before REPEATED subset policy", () => {
+    expectError("ERR_READ_MALFORMED", () =>
+      readSchema(
+        schemaProbe([
+          { ...root, numChildren: 2 },
+          { ...leaf, repetition: 2 },
+        ]),
+      ),
+    );
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["wrong-typed", "wrong"],
+  ] as const)("refuses a primitive leaf with %s physical type", (_, physical) => {
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readSchema(schemaProbe([root, { ...leaf, physical }])),
+    );
+    expect(error.column).toBe("n");
+  });
+
+  it.each([
+    ["zero", 0],
+    ["positive", 1],
+    ["wrong-typed", "wrong"],
+  ] as const)("refuses a primitive leaf carrying %s num_children", (_, numChildren) => {
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readSchema(schemaProbe([root, { ...leaf, numChildren }])),
+    );
+    expect(error.column).toBe("n");
+  });
+
+  it.each([
+    ["zero", 0],
+    ["positive", 8],
+  ] as const)("accepts or ignores a non-fixed leaf carrying %s type_length", (_, typeLength) => {
+    expect(readSchema(schemaProbe([root, { ...leaf, typeLength }])).columns[0].name).toBe("n");
+  });
+
+  it("refuses a non-fixed leaf carrying a wrong-typed type_length", () => {
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readSchema(schemaProbe([root, { ...leaf, typeLength: "wrong" }])),
+    );
+    expect(error.column).toBe("n");
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["zero", 0],
+    ["negative", -1],
+    ["wrong-typed", "wrong"],
+  ] as const)("refuses a fixed leaf with %s type_length", (_, typeLength) => {
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readSchema(
+        schemaProbe([root, { ...leaf, physical: PhysicalType.FIXED_LEN_BYTE_ARRAY, typeLength }]),
+      ),
+    );
+    expect(error.column).toBe("n");
+  });
+
+  it.each([[4], ["wrong"]] as const)("refuses a group carrying type_length %o", (typeLength) => {
+    const group: SchemaElementProbe = { name: "g", repetition: 0, numChildren: 1, typeLength };
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readSchema(schemaProbe([root, group, leaf])),
+    );
+    expect(error.column).toBe("g");
+  });
+
+  it("keeps a valid nested group well-formed but unsupported", () => {
+    const group: SchemaElementProbe = { name: "g", repetition: 0, numChildren: 1 };
+    expectError("ERR_READ_UNSUPPORTED", () => readSchema(schemaProbe([root, group, leaf])));
+  });
+
+  it("keeps a valid empty root well-formed but unsupported", () => {
+    expectError("ERR_READ_UNSUPPORTED", () =>
+      readSchema(schemaProbe([{ name: "schema", numChildren: 0 }])),
+    );
+  });
+});
+
 /**
  * A footer whose fields are not the Thrift types `parquet.thrift` declares.
  *

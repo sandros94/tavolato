@@ -385,24 +385,26 @@ function toSchema(
 ): FileSchema {
   const root = elements[0];
   if (root === undefined) throw malformed("The footer carries no schema");
-  if (root.numChildren === 0) throw unsupported("a file whose schema declares no columns");
 
   const leaves = elements.slice(1);
   for (const element of leaves) {
-    if (element.numChildren > 0) {
+    if (element.physical === undefined) {
       throw unsupported(
         `column "${element.name}", a group of ${element.numChildren} nested fields — tavolato is flat, forever`,
         element.name,
       );
-    }
-    if (element.repetition === FieldRepetitionType.REPEATED) {
-      throw unsupported(`column "${element.name}", a REPEATED field`, element.name);
     }
   }
   if (leaves.length !== root.numChildren) {
     throw malformed(
       `The schema root declares ${root.numChildren} children but ${leaves.length} elements follow it`,
     );
+  }
+  if (root.numChildren === 0) throw unsupported("a file whose schema declares no columns");
+  for (const element of leaves) {
+    if (element.repetition === FieldRepetitionType.REPEATED) {
+      throw unsupported(`column "${element.name}", a REPEATED field`, element.name);
+    }
   }
 
   // Every name, before any column is resolved: a projection is checked against
