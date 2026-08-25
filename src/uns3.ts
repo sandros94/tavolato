@@ -6,7 +6,14 @@ import type {
   ListObjectsV2Response,
   PutObjectParams,
 } from "uns3";
-import { badOption, describe, malformed, TavolatoError } from "./error.ts";
+import {
+  assertOptionalOptionsObject,
+  assertOptionsObject,
+  badOption,
+  describe,
+  malformed,
+  TavolatoError,
+} from "./error.ts";
 import { ByteReader } from "./internal/bytes.ts";
 import { type ColumnChunkInfo, MAGIC, type RowGroupInfo } from "./internal/format.ts";
 import {
@@ -81,6 +88,7 @@ export async function putParquet(
   params: PutParquetParams,
   source: Uint8Array | ParquetSource,
 ): Promise<Response> {
+  assertOptionsObject(params, "putParquet params", "ERR_STORE_INPUT_INVALID");
   const body = source instanceof Uint8Array ? source : await source.finish();
   return await client.put({
     contentType: PARQUET_CONTENT_TYPE,
@@ -386,6 +394,7 @@ export function createParquetStore(
   client: ParquetStoreClient,
   defaults: StoreDefaults = {},
 ): ParquetStore {
+  assertOptionsObject(defaults, "StoreDefaults", "ERR_READ_OPTION_INVALID");
   const tailBytes = defaults.tailBytes ?? DEFAULT_TAIL_BYTES;
   if (!Number.isSafeInteger(tailBytes) || tailBytes < FOOTER_SUFFIX) {
     throw badOption(
@@ -577,8 +586,9 @@ export function createParquetStore(
       data: PutInput<TDefinition>,
       params: PutParams = {},
     ): Promise<Response> {
+      assertOptionsObject(params, "store.put params", "ERR_STORE_INPUT_INVALID");
       const { writer: writerOptions, ...rest } = params;
-      const body = await finished(data, { ...defaults.writer, ...writerOptions });
+      const body = await finished(data, defaults.writer, writerOptions);
       return await client.put({
         contentType: PARQUET_CONTENT_TYPE,
         ...addressed(rest),
@@ -588,6 +598,7 @@ export function createParquetStore(
     },
 
     async get(key: string, options: GetOptions = {}): Promise<ParquetFile> {
+      assertOptionsObject(options, "GetOptions", "ERR_READ_OPTION_INVALID");
       const { columns, groups, codecs, types, ...params } = options;
       const read: ReadOptions = {
         codecs: codecs ?? defaults.codecs,
@@ -647,6 +658,7 @@ export function createParquetStore(
     },
 
     async head(key: string, options: HeadOptions = {}): Promise<ParquetHead> {
+      assertOptionsObject(options, "HeadOptions", "ERR_READ_OPTION_INVALID");
       const { types, ...params } = options;
       const { footer, size, etag } = await open(key, params, { types: types ?? defaults.types });
       return Object.freeze({
@@ -675,7 +687,11 @@ export function createParquetStore(
  * bytes are bytes, anything that can `finish()` is a writer, and what is left
  * has to be a schema and rows or it is not something this can upload at all.
  */
-async function finished(data: unknown, writer: WriterOptions): Promise<Uint8Array> {
+async function finished(
+  data: unknown,
+  defaultWriter: WriterOptions | undefined,
+  callWriter: WriterOptions | undefined,
+): Promise<Uint8Array> {
   if (data instanceof Uint8Array) return data;
   if (typeof (data as Partial<ParquetSource> | null | undefined)?.finish === "function") {
     return await (data as ParquetSource).finish();
@@ -692,6 +708,9 @@ async function finished(data: unknown, writer: WriterOptions): Promise<Uint8Arra
       "ERR_STORE_INPUT_INVALID",
     );
   }
+  assertOptionalOptionsObject(defaultWriter, "StoreDefaults.writer", "ERR_WRITER_OPTION_INVALID");
+  assertOptionalOptionsObject(callWriter, "PutParams.writer", "ERR_WRITER_OPTION_INVALID");
+  const writer = { ...defaultWriter, ...callWriter };
   const parquet = createWriter(rows.schema, writer);
   await parquet.appendAll(rows.rows as Iterable<Row<SchemaDefinition>>);
   return await parquet.finish();

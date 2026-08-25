@@ -175,6 +175,20 @@ describe("what a projected read hands back", () => {
 });
 
 describe("what a projection refuses", () => {
+  it("refuses every non-object ReadOptions value before reading bytes", () => {
+    const readers = [readParquet, readRowGroups, readSchema] as const;
+    for (const read of readers) {
+      for (const options of [null, false, 0, 1n, "options", Symbol("options"), () => undefined]) {
+        expectError("ERR_READ_OPTION_INVALID", () =>
+          (read as (bytes: Uint8Array, options: never) => unknown)(
+            new Uint8Array(),
+            options as never,
+          ),
+        );
+      }
+    }
+  });
+
   it("names a column the file does not declare, and what it does", () => {
     const error = expectError("ERR_READ_OPTION_INVALID", () =>
       readParquet(sample(2), { columns: ["i", "nope"] }),

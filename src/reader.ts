@@ -29,6 +29,7 @@ import {
 import { adapterProblem, jsonValueOf } from "./adapters.ts";
 import {
   adapterUnsupportedDetails,
+  assertOptionalOptionsObject,
   badOption,
   describe,
   malformed,
@@ -1035,6 +1036,7 @@ export function readParquet(
   bytes: Uint8Array,
   options?: ReadOptions,
 ): ParquetFile | Promise<ParquetFile> {
+  assertOptionalOptionsObject(options, "ReadOptions", "ERR_READ_OPTION_INVALID");
   const file = readFooter(bytes, options);
   const { rowGroups } = file;
   const input = new ByteReader(bytes.subarray(0, file.pageBytesEnd), 0, undefined, MAGIC.length);
@@ -1116,6 +1118,7 @@ export function readRowGroups(
 ): SyncParquetRowGroups;
 export function readRowGroups(bytes: Uint8Array, options: ReadOptions): ParquetRowGroups;
 export function readRowGroups(bytes: Uint8Array, options?: ReadOptions): ParquetRowGroups {
+  assertOptionalOptionsObject(options, "ReadOptions", "ERR_READ_OPTION_INVALID");
   const file = readFooter(bytes, options);
   const { rowGroups, rowCount } = file;
   const codecs = options?.codecs;
@@ -1201,6 +1204,7 @@ export function readRowGroups(bytes: Uint8Array, options?: ReadOptions): Parquet
  * `ERR_READ_OPTION_INVALID`.
  */
 export function readSchema(bytes: Uint8Array, options?: ReadOptions): ParquetSchema {
+  assertOptionalOptionsObject(options, "ReadOptions", "ERR_READ_OPTION_INVALID");
   const types = registeredTypes(options);
   return toSchema(decodeFileMetadata(locateFooter(bytes).bytes).schema, types, undefined).schema;
 }

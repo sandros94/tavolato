@@ -7,6 +7,7 @@ import {
   defineSchema,
   float16,
   integer,
+  json,
   readParquet,
   TavolatoError,
   time,
@@ -22,6 +23,41 @@ import type {
 } from "../src/index.ts";
 import { expectError } from "./_errors.ts";
 import { sync } from "./_sync.ts";
+
+const NON_OBJECT_OPTIONS: readonly unknown[] = [
+  null,
+  false,
+  0,
+  1n,
+  "options",
+  Symbol("options"),
+  () => undefined,
+];
+
+describe("adapter option bags", () => {
+  it.each([
+    ["date", (options: unknown) => date(options as never)],
+    ["decimal", (options: unknown) => decimal(options as never)],
+    ["time", (options: unknown) => time(options as never)],
+    ["timestamp", (options: unknown) => timestamp(options as never)],
+    ["float16", (options: unknown) => float16(options as never)],
+    ["integer", (options: unknown) => integer(options as never)],
+    ["json", (options: unknown) => json(options as never)],
+  ])("refuses every non-object passed to %s", (_, factory) => {
+    for (const options of NON_OBJECT_OPTIONS) {
+      expectError("ERR_SCHEMA_COLUMN_INVALID", () => factory(options));
+    }
+  });
+
+  it.each([
+    ["decimal", () => decimal(undefined as never)],
+    ["time", () => time(undefined as never)],
+    ["timestamp", () => timestamp(undefined as never)],
+    ["integer", () => integer(undefined as never)],
+  ])("refuses omitted required %s options", (_, factory) => {
+    expectError("ERR_SCHEMA_COLUMN_INVALID", factory);
+  });
+});
 
 /**
  * Logical column types: the seam where tavolato hands a decision back rather

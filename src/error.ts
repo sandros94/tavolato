@@ -95,6 +95,26 @@ export function describe(value: unknown): string {
   }
 }
 
+/** Validates a required public options bag at its API boundary. @internal */
+export function assertOptionsObject(
+  value: unknown,
+  label: string,
+  code: TavolatoErrorCode,
+): asserts value is object {
+  if (typeof value !== "object" || value === null) {
+    throw new TavolatoError(`${label} must be an object, received ${describe(value)}`, code);
+  }
+}
+
+/** Validates an optional public options bag while preserving omission. @internal */
+export function assertOptionalOptionsObject(
+  value: unknown,
+  label: string,
+  code: TavolatoErrorCode,
+): asserts value is object | undefined {
+  if (value !== undefined) assertOptionsObject(value, label, code);
+}
+
 /**
  * The bytes are not a well-formed Parquet file: wrong magic, a truncated
  * stream, a length that does not fit, a structure that contradicts itself.

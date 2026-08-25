@@ -459,6 +459,12 @@ describe("row validation", () => {
 describe("writer options", () => {
   const schema = defineSchema({ n: { type: "i64" } });
 
+  it("refuses every non-object options value", () => {
+    for (const options of [null, false, 0, 1n, "options", Symbol("options"), () => undefined]) {
+      expectError("ERR_WRITER_OPTION_INVALID", () => createWriter(schema, options as never));
+    }
+  });
+
   it.each([0, -1, 1.5, Number.NaN])("rejects rowGroupSize %o", (rowGroupSize) => {
     expectError("ERR_WRITER_OPTION_INVALID", () => createWriter(schema, { rowGroupSize }));
   });

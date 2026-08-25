@@ -1221,6 +1221,60 @@ describe("createParquetStore: del and list", () => {
 });
 
 describe("createParquetStore: options and errors", () => {
+  const nonObjects = [null, false, 0, 1n, "options", Symbol("options"), () => undefined] as const;
+
+  it("refuses every non-object StoreDefaults value", () => {
+    for (const defaults of nonObjects) {
+      expectError("ERR_READ_OPTION_INVALID", () =>
+        createParquetStore(new FakeS3(), defaults as never),
+      );
+    }
+  });
+
+  it("refuses non-object nested WriterOptions when rows consume them", async () => {
+    const rows = { schema: defineSchema({ n: { type: "i64" } }), rows: [{ n: 1n }] };
+    for (const writer of nonObjects) {
+      const factoryS3 = new FakeS3();
+      const fromFactory = createParquetStore(factoryS3, { writer: writer as never });
+      await expectRejection("ERR_WRITER_OPTION_INVALID", fromFactory.put("out.parquet", rows));
+      expect(factoryS3.requestCount).toBe(0);
+
+      const { s3, store } = storeOf();
+      await expectRejection(
+        "ERR_WRITER_OPTION_INVALID",
+        store.put("out.parquet", rows, { writer: writer as never }),
+      );
+      expect(s3.requestCount).toBe(0);
+    }
+  });
+
+  it("ignores nested WriterOptions for bytes and ParquetSource inputs", async () => {
+    const s3 = new FakeS3();
+    const store = createParquetStore(s3, { bucket: "b", writer: null as never });
+    await store.put("bytes.parquet", single, { writer: null as never });
+
+    const writer = createWriter(defineSchema({ n: { type: "i64" } }));
+    writer.append({ n: 1n });
+    await store.put("source.parquet", writer, { writer: null as never });
+
+    expect(s3.stored("bytes.parquet")).toBe(single);
+    expect(s3.stored("source.parquet")).toBeInstanceOf(Uint8Array);
+  });
+
+  it("refuses non-object options on library-owned store methods before a request", async () => {
+    for (const options of nonObjects) {
+      const { s3, store } = storeOf();
+      s3.seed("cat.parquet", plain);
+      await expectRejection(
+        "ERR_STORE_INPUT_INVALID",
+        store.put("out.parquet", single, options as never),
+      );
+      await expectRejection("ERR_READ_OPTION_INVALID", store.get("cat.parquet", options as never));
+      await expectRejection("ERR_READ_OPTION_INVALID", store.head("cat.parquet", options as never));
+      expect(s3.requestCount).toBe(0);
+    }
+  });
+
   it("refuses a group selection that cannot be one", async () => {
     const { s3, store } = storeOf();
     s3.seed("cat.parquet", plain);

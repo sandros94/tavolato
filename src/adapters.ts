@@ -4,7 +4,13 @@ import {
   decimalPhysicalCanHold,
   logicalTypePhysicalProblem,
 } from "./internal/logical.ts";
-import { adapterUnsupported, describe, malformed, TavolatoError } from "./error.ts";
+import {
+  adapterUnsupported,
+  assertOptionsObject,
+  describe,
+  malformed,
+  TavolatoError,
+} from "./error.ts";
 import { JSON_NULL } from "./json-null.ts";
 import type {
   Annotation,
@@ -296,9 +302,7 @@ export type DateValue<TAs extends DateRepresentation> = TAs extends "number" ? n
 export function date<TAs extends DateRepresentation = "date">(
   options: DateOptions<TAs> = {},
 ): LogicalAdapter<DateValue<TAs>, DateValue<TAs>> {
-  if (typeof options !== "object" || options === null) {
-    throw invalid(`date options must be an object, received ${describe(options)}`);
-  }
+  assertOptionsObject(options, "date options", "ERR_SCHEMA_COLUMN_INVALID");
   const { as = "date" } = options;
   if (as !== "date" && as !== "number") {
     throw invalid(`date as must be "date" or "number", received ${describe(as)}`);
@@ -376,6 +380,7 @@ export interface DecimalOptions {
  * `BYTE_ARRAY` and wider fixed arrays.
  */
 export function decimal(options: DecimalOptions): LogicalAdapter<string, string> {
+  assertOptionsObject(options, "decimal options", "ERR_SCHEMA_COLUMN_INVALID");
   const { precision, scale = 0 } = options;
   if (!Number.isSafeInteger(precision) || precision < 1 || precision > MAX_ANNOTATION_INTEGER) {
     throw invalid(
@@ -590,6 +595,7 @@ function assertUTCFlag(isAdjustedToUTC: boolean, what: string): void {
 export function time<TUnit extends TimeUnitName>(
   options: TimeOptions<TUnit>,
 ): LogicalAdapter<TimeValue<TUnit>, TimeValue<TUnit>> {
+  assertOptionsObject(options, "time options", "ERR_SCHEMA_COLUMN_INVALID");
   const { unit, isAdjustedToUTC } = options;
   assertUnit(unit, "time");
   assertUTCFlag(isAdjustedToUTC, "time");
@@ -654,6 +660,7 @@ const INT64_MAX = 2n ** 63n - 1n;
  * it declares.
  */
 export function timestamp(options: TimeOptions): LogicalAdapter<bigint, bigint> {
+  assertOptionsObject(options, "timestamp options", "ERR_SCHEMA_COLUMN_INVALID");
   const { unit, isAdjustedToUTC } = options;
   assertUnit(unit, "timestamp");
   assertUTCFlag(isAdjustedToUTC, "timestamp");
@@ -696,9 +703,7 @@ export interface Float16Options {
  * including NaN payloads and signs and both zero encodings.
  */
 export function float16(options: Float16Options = {}): LogicalAdapter<number, number> {
-  if (typeof options !== "object" || options === null) {
-    throw invalid(`float16 options must be an object, received ${describe(options)}`);
-  }
+  assertOptionsObject(options, "float16 options", "ERR_SCHEMA_COLUMN_INVALID");
   const { as = "number" } = options;
   if (as !== "number" && as !== "bits") {
     throw invalid(`float16 as must be "number" or "bits", received ${describe(as)}`);
@@ -830,6 +835,7 @@ export type IntegerValue<TWidth extends IntegerWidth> = TWidth extends 64 ? bigi
 export function integer<TWidth extends IntegerWidth>(
   options: IntegerOptions<TWidth>,
 ): LogicalAdapter<IntegerValue<TWidth>, IntegerValue<TWidth>> {
+  assertOptionsObject(options, "integer options", "ERR_SCHEMA_COLUMN_INVALID");
   const { bitWidth, signed = true } = options;
   if (![8, 16, 32, 64].includes(bitWidth)) {
     throw invalid(`integer bitWidth must be 8, 16, 32 or 64, received ${describe(bitWidth)}`);
@@ -1216,9 +1222,7 @@ export function json(
 export function json<TValue>(
   options: JsonOptions = {},
 ): LogicalAdapter<TValue, TValue> | LogicalAdapter<string, string> {
-  if (typeof options !== "object" || options === null) {
-    throw invalid(`json options must be an object, received ${describe(options)}`);
-  }
+  assertOptionsObject(options, "json options", "ERR_SCHEMA_COLUMN_INVALID");
   const { as = "value" } = options;
   if (as !== "value" && as !== "text") {
     throw invalid(`json as must be "value" or "text", received ${describe(as)}`);

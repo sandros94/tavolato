@@ -15,7 +15,7 @@ import {
   type RowGroupMeta,
 } from "./internal/format.ts";
 import { jsonTextOf } from "./adapters.ts";
-import { describe, TavolatoError } from "./error.ts";
+import { assertOptionsObject, describe, TavolatoError } from "./error.ts";
 import { validateParquetSchema } from "./schema.ts";
 import type {
   AnyLogicalAdapter,
@@ -387,6 +387,7 @@ export class ParquetWriter<TDefinition extends SchemaDefinition = SchemaDefiniti
 
   constructor(schema: ParquetSchema<TDefinition>, options: WriterOptions = {}) {
     const columns = validateParquetSchema(schema);
+    assertOptionsObject(options, "WriterOptions", "ERR_WRITER_OPTION_INVALID");
     const rowGroupSize = options.rowGroupSize ?? DEFAULT_ROW_GROUP_SIZE;
     if (!Number.isSafeInteger(rowGroupSize) || rowGroupSize < 1) {
       throw new TavolatoError(
