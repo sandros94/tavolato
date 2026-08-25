@@ -770,7 +770,7 @@ function resolveGroups(groups: readonly number[], count: number): readonly numbe
  */
 function chunkSpan(chunk: ColumnChunkInfo, column: string, footerStart: number): Span {
   const size = chunk.totalCompressedSize;
-  if (size === undefined || size === 0) {
+  if (size === 0) {
     throw malformed(
       `Column "${column}" states no usable total_compressed_size, so a read that fetches its bytes cannot tell where the chunk ends`,
       column,
@@ -845,7 +845,11 @@ function windowOf(
   }
   return {
     input: new ByteReader(window),
-    group: { columns, numRows: plan.group.numRows },
+    group: {
+      columns,
+      totalByteSize: plan.group.totalByteSize,
+      numRows: plan.group.numRows,
+    },
   };
 }
 

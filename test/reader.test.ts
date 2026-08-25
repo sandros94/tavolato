@@ -15,7 +15,7 @@ import type { ReadRow } from "../src/index.ts";
 import type { ByteWriter } from "../src/internal/bytes.ts";
 import { Encoding, PageType, PhysicalType } from "../src/internal/format.ts";
 import { CompactWriter, ThriftType } from "../src/internal/thrift.ts";
-import { plainBody, sealFile, startFile, withPhysicalType, writeDataPage } from "./_build.ts";
+import { plainBody, sealFile, startFile, withPhysicalType } from "./_build.ts";
 import { expectError } from "./_errors.ts";
 import { sync } from "./_sync.ts";
 
@@ -401,6 +401,33 @@ describe("truncation", () => {
  * missing value, with the column named.
  */
 describe("a footer whose fields are the wrong Thrift type", () => {
+  type RequiredField =
+    | "FileMetaData.version"
+    | "FileMetaData.schema"
+    | "FileMetaData.num_rows"
+    | "FileMetaData.row_groups"
+    | "SchemaElement.name"
+    | "RowGroup.columns"
+    | "RowGroup.total_byte_size"
+    | "RowGroup.num_rows"
+    | "ColumnChunk.file_offset"
+    | "ColumnMetaData.type"
+    | "ColumnMetaData.encodings"
+    | "ColumnMetaData.path_in_schema"
+    | "ColumnMetaData.codec"
+    | "ColumnMetaData.num_values"
+    | "ColumnMetaData.total_uncompressed_size"
+    | "ColumnMetaData.total_compressed_size"
+    | "ColumnMetaData.data_page_offset"
+    | "PageHeader.type"
+    | "PageHeader.uncompressed_page_size"
+    | "PageHeader.compressed_page_size"
+    | "PageHeader.data_page_header"
+    | "DataPageHeader.num_values"
+    | "DataPageHeader.encoding"
+    | "DataPageHeader.definition_level_encoding"
+    | "DataPageHeader.repetition_level_encoding";
+
   /** Writes one `7n` page whose header is spelled out by `header`, wrong types and all. */
   function writeDoctoredPage(
     out: ByteWriter,
@@ -439,66 +466,372 @@ describe("a footer whose fields are the wrong Thrift type", () => {
       path?: (writer: CompactWriter) => void;
       codec?: (writer: CompactWriter) => void;
       numValues?: (writer: CompactWriter) => void;
+      fileOffset?: bigint;
+      fileOffsetAfterMetadata?: boolean;
+      pathAfterCounts?: boolean;
       pageHeader?: (writer: CompactWriter) => void;
+      required?: { readonly field: RequiredField; readonly mode: "missing" | "wrong" };
+      wrongListElement?:
+        | "FileMetaData.schema"
+        | "FileMetaData.row_groups"
+        | "RowGroup.columns"
+        | "ColumnMetaData.encodings";
+      version?: number;
+      inlineMetadata?: boolean;
+      encryptedMetadata?: boolean;
+      cryptoMetadata?: boolean;
+      offsetIndexOffset?: boolean;
+      createdBy?: boolean;
+      unknownOptional?: boolean;
     } = {},
   ): Uint8Array {
+    const required = (
+      writer: CompactWriter,
+      field: RequiredField,
+      id: number,
+      expected: number,
+      valid: () => void,
+    ): void => {
+      if (doctored.required?.field !== field) {
+        valid();
+        return;
+      }
+      if (doctored.required.mode === "missing") return;
+      if (expected === ThriftType.BINARY) writer.fieldI32(id, 0);
+      else writer.fieldString(id, "wrong");
+    };
+
     const out = startFile();
     const dataPageOffset = out.length;
     const page =
       doctored.pageHeader === undefined
-        ? writeDataPage(out, [7n])
+        ? writeDoctoredPage(out, (writer) => {
+            required(writer, "PageHeader.type", 1, ThriftType.I32, () =>
+              writer.fieldI32(1, PageType.DATA_PAGE),
+            );
+            required(writer, "PageHeader.uncompressed_page_size", 2, ThriftType.I32, () =>
+              writer.fieldI32(2, 8),
+            );
+            required(writer, "PageHeader.compressed_page_size", 3, ThriftType.I32, () =>
+              writer.fieldI32(3, 8),
+            );
+            required(writer, "PageHeader.data_page_header", 5, ThriftType.STRUCT, () => {
+              writer.fieldStructBegin(5);
+              required(writer, "DataPageHeader.num_values", 1, ThriftType.I32, () =>
+                writer.fieldI32(1, 1),
+              );
+              required(writer, "DataPageHeader.encoding", 2, ThriftType.I32, () =>
+                writer.fieldI32(2, Encoding.PLAIN),
+              );
+              required(writer, "DataPageHeader.definition_level_encoding", 3, ThriftType.I32, () =>
+                writer.fieldI32(3, Encoding.RLE),
+              );
+              required(writer, "DataPageHeader.repetition_level_encoding", 4, ThriftType.I32, () =>
+                writer.fieldI32(4, Encoding.RLE),
+              );
+              if (doctored.unknownOptional) writer.fieldString(99, "future");
+              writer.structEnd();
+            });
+            if (doctored.unknownOptional) writer.fieldString(99, "future");
+          })
         : writeDoctoredPage(out, doctored.pageHeader);
 
     const writer = new CompactWriter();
     writer.structBegin(); // FileMetaData
-    writer.fieldI32(1, 1); // version
-    writer.fieldListBegin(2, ThriftType.STRUCT, 2);
-    writer.structBegin(); // the root group
-    writer.fieldString(4, "schema");
-    writer.fieldI32(5, 1);
-    writer.structEnd();
-    writer.structBegin(); // the one leaf
-    writer.fieldI32(1, doctored.physical ?? PhysicalType.INT64);
-    doctored.typeLength?.(writer);
-    writer.fieldI32(3, 0); // REQUIRED
-    writer.fieldString(4, "n");
-    writer.structEnd();
-    writer.fieldI64(3, 1n); // num_rows
-    writer.fieldListBegin(4, ThriftType.STRUCT, 1);
-    writer.structBegin(); // the one row group
-    writer.fieldListBegin(1, ThriftType.STRUCT, 1);
-    writer.structBegin(); // the one column chunk
-    writer.fieldI64(2, 0n); // file_offset
-    writer.fieldStructBegin(3); // meta_data
-    writer.fieldI32(1, PhysicalType.INT64);
-    writer.fieldListBegin(2, ThriftType.I32, 1); // encodings
-    writer.elementI32(0); // PLAIN
-    if (doctored.path === undefined) {
-      writer.fieldListBegin(3, ThriftType.BINARY, 1); // path_in_schema
-      writer.elementString("n");
-    } else {
-      doctored.path(writer);
-    }
-    if (doctored.codec === undefined)
-      writer.fieldI32(4, 0); // UNCOMPRESSED
-    else doctored.codec(writer);
-    if (doctored.numValues === undefined) writer.fieldI64(5, 1n);
-    else doctored.numValues(writer);
-    writer.fieldI64(6, BigInt(page.uncompressedSize));
-    writer.fieldI64(7, BigInt(page.compressedSize));
-    writer.fieldI64(9, BigInt(dataPageOffset));
-    writer.structEnd();
-    writer.structEnd();
-    writer.fieldI64(2, BigInt(page.uncompressedSize)); // total_byte_size
-    writer.fieldI64(3, 1n); // num_rows
-    writer.structEnd();
-    writer.fieldString(6, "probe");
+    required(writer, "FileMetaData.version", 1, ThriftType.I32, () =>
+      writer.fieldI32(1, doctored.version ?? 1),
+    );
+    required(writer, "FileMetaData.schema", 2, ThriftType.LIST, () => {
+      if (doctored.wrongListElement === "FileMetaData.schema") {
+        writer.fieldListBegin(2, ThriftType.I32, 1);
+        writer.elementI32(0);
+        return;
+      }
+      writer.fieldListBegin(2, ThriftType.STRUCT, 2);
+      writer.structBegin(); // the root group
+      writer.fieldString(4, "schema");
+      writer.fieldI32(5, 1);
+      if (doctored.unknownOptional) writer.fieldString(99, "future");
+      writer.structEnd();
+      writer.structBegin(); // the one leaf
+      writer.fieldI32(1, doctored.physical ?? PhysicalType.INT64);
+      doctored.typeLength?.(writer);
+      writer.fieldI32(3, 0); // REQUIRED
+      required(writer, "SchemaElement.name", 4, ThriftType.BINARY, () =>
+        writer.fieldString(4, "n"),
+      );
+      if (doctored.unknownOptional) writer.fieldString(99, "future");
+      writer.structEnd();
+    });
+    required(writer, "FileMetaData.num_rows", 3, ThriftType.I64, () => writer.fieldI64(3, 1n));
+    required(writer, "FileMetaData.row_groups", 4, ThriftType.LIST, () => {
+      if (doctored.wrongListElement === "FileMetaData.row_groups") {
+        writer.fieldListBegin(4, ThriftType.I32, 1);
+        writer.elementI32(0);
+        return;
+      }
+      writer.fieldListBegin(4, ThriftType.STRUCT, 1);
+      writer.structBegin(); // the one row group
+      required(writer, "RowGroup.columns", 1, ThriftType.LIST, () => {
+        if (doctored.wrongListElement === "RowGroup.columns") {
+          writer.fieldListBegin(1, ThriftType.I32, 1);
+          writer.elementI32(0);
+          return;
+        }
+        writer.fieldListBegin(1, ThriftType.STRUCT, 1);
+        writer.structBegin(); // the one column chunk
+        const writeFileOffset = (): void =>
+          required(writer, "ColumnChunk.file_offset", 2, ThriftType.I64, () =>
+            writer.fieldI64(2, doctored.fileOffset ?? 0n),
+          );
+        if (!doctored.fileOffsetAfterMetadata) writeFileOffset();
+        if (doctored.inlineMetadata !== false) {
+          writer.fieldStructBegin(3); // meta_data
+          required(writer, "ColumnMetaData.type", 1, ThriftType.I32, () =>
+            writer.fieldI32(1, PhysicalType.INT64),
+          );
+          required(writer, "ColumnMetaData.encodings", 2, ThriftType.LIST, () => {
+            if (doctored.wrongListElement === "ColumnMetaData.encodings") {
+              writer.fieldListBegin(2, ThriftType.BINARY, 1);
+              writer.elementString("plain");
+              return;
+            }
+            writer.fieldListBegin(2, ThriftType.I32, 1);
+            writer.elementI32(Encoding.PLAIN);
+          });
+          const writePath = (): void => {
+            if (doctored.path === undefined) {
+              required(writer, "ColumnMetaData.path_in_schema", 3, ThriftType.LIST, () => {
+                writer.fieldListBegin(3, ThriftType.BINARY, 1);
+                writer.elementString("n");
+              });
+            } else {
+              doctored.path(writer);
+            }
+          };
+          if (!doctored.pathAfterCounts) writePath();
+          if (doctored.codec === undefined) {
+            required(writer, "ColumnMetaData.codec", 4, ThriftType.I32, () =>
+              writer.fieldI32(4, 0),
+            );
+          } else doctored.codec(writer);
+          if (doctored.numValues === undefined) {
+            required(writer, "ColumnMetaData.num_values", 5, ThriftType.I64, () =>
+              writer.fieldI64(5, 1n),
+            );
+          } else doctored.numValues(writer);
+          required(writer, "ColumnMetaData.total_uncompressed_size", 6, ThriftType.I64, () =>
+            writer.fieldI64(6, BigInt(page.uncompressedSize)),
+          );
+          required(writer, "ColumnMetaData.total_compressed_size", 7, ThriftType.I64, () =>
+            writer.fieldI64(7, BigInt(page.compressedSize)),
+          );
+          required(writer, "ColumnMetaData.data_page_offset", 9, ThriftType.I64, () =>
+            writer.fieldI64(9, BigInt(dataPageOffset)),
+          );
+          if (doctored.pathAfterCounts) writePath();
+          if (doctored.unknownOptional) writer.fieldString(99, "future");
+          writer.structEnd();
+        }
+        if (doctored.fileOffsetAfterMetadata) writeFileOffset();
+        if (doctored.encryptedMetadata) {
+          writer.fieldBinary(9, new Uint8Array([1, 2, 3]));
+        }
+        if (doctored.cryptoMetadata) {
+          writer.fieldStructBegin(8); // crypto_metadata
+          writer.fieldStructBegin(1); // ENCRYPTION_WITH_FOOTER_KEY
+          writer.structEnd();
+          writer.structEnd();
+        }
+        if (doctored.offsetIndexOffset) writer.fieldI64(4, 123n);
+        if (doctored.unknownOptional) writer.fieldString(99, "future");
+        writer.structEnd();
+      });
+      required(writer, "RowGroup.total_byte_size", 2, ThriftType.I64, () =>
+        writer.fieldI64(2, BigInt(page.uncompressedSize)),
+      );
+      required(writer, "RowGroup.num_rows", 3, ThriftType.I64, () => writer.fieldI64(3, 1n));
+      if (doctored.unknownOptional) writer.fieldString(99, "future");
+      writer.structEnd();
+    });
+    if (doctored.createdBy !== false) writer.fieldString(6, "probe");
+    if (doctored.unknownOptional) writer.fieldString(99, "future");
     writer.structEnd();
     return sealFile(out, writer.toBytes());
   }
 
-  it("reads the undoctored file, so the shape itself is sound", () => {
+  const REQUIRED_FIELDS: readonly RequiredField[] = [
+    "FileMetaData.version",
+    "FileMetaData.schema",
+    "FileMetaData.num_rows",
+    "FileMetaData.row_groups",
+    "SchemaElement.name",
+    "RowGroup.columns",
+    "RowGroup.total_byte_size",
+    "RowGroup.num_rows",
+    "ColumnChunk.file_offset",
+    "ColumnMetaData.type",
+    "ColumnMetaData.encodings",
+    "ColumnMetaData.path_in_schema",
+    "ColumnMetaData.codec",
+    "ColumnMetaData.num_values",
+    "ColumnMetaData.total_uncompressed_size",
+    "ColumnMetaData.total_compressed_size",
+    "ColumnMetaData.data_page_offset",
+    "PageHeader.type",
+    "PageHeader.uncompressed_page_size",
+    "PageHeader.compressed_page_size",
+    "PageHeader.data_page_header",
+    "DataPageHeader.num_values",
+    "DataPageHeader.encoding",
+    "DataPageHeader.definition_level_encoding",
+    "DataPageHeader.repetition_level_encoding",
+  ];
+
+  function requiredFieldColumn(field: RequiredField): string | undefined {
+    return field.startsWith("Page") ||
+      field.startsWith("DataPage") ||
+      field === "ColumnChunk.file_offset" ||
+      (field.startsWith("ColumnMetaData.") && field !== "ColumnMetaData.path_in_schema")
+      ? "n"
+      : undefined;
+  }
+
+  it("reads the undoctored file, including required fields whose value is zero", () => {
     expect(readParquet(handBuilt()).rows).toEqual([{ n: 7n }]);
+  });
+
+  it.each(REQUIRED_FIELDS)("refuses a missing required %s", (field) => {
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readParquet(
+        handBuilt({
+          required: { field, mode: "missing" },
+          fileOffsetAfterMetadata: field === "ColumnChunk.file_offset",
+          pathAfterCounts: field.startsWith("ColumnMetaData."),
+        }),
+      ),
+    );
+    expect(error.message).toContain(field);
+    expect(error.column).toBe(requiredFieldColumn(field));
+  });
+
+  it.each(REQUIRED_FIELDS)("skips and refuses a wrong-type required %s", (field) => {
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readParquet(
+        handBuilt({
+          required: { field, mode: "wrong" },
+          fileOffsetAfterMetadata: field === "ColumnChunk.file_offset",
+          pathAfterCounts: field.startsWith("ColumnMetaData."),
+        }),
+      ),
+    );
+    expect(error.message).toContain(field);
+    expect(error.column).toBe(requiredFieldColumn(field));
+  });
+
+  it("attributes an out-of-order unusable file_offset to its decoded column", () => {
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readParquet(
+        handBuilt({
+          fileOffset: BigInt(Number.MAX_SAFE_INTEGER) + 1n,
+          fileOffsetAfterMetadata: true,
+        }),
+      ),
+    );
+    expect(error.message).toContain("ColumnChunk.file_offset");
+    expect(error.column).toBe("n");
+  });
+
+  it("attributes an unusable count decoded before path_in_schema", () => {
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readParquet(
+        handBuilt({
+          numValues: (writer) => writer.fieldI64(5, BigInt(Number.MAX_SAFE_INTEGER) + 1n),
+          pathAfterCounts: true,
+        }),
+      ),
+    );
+    expect(error.message).toContain("ColumnMetaData.num_values");
+    expect(error.column).toBe("n");
+  });
+
+  it.each([
+    "FileMetaData.schema",
+    "FileMetaData.row_groups",
+    "RowGroup.columns",
+    "ColumnMetaData.encodings",
+  ] as const)("consumes and refuses wrong-element lists for %s", (field) => {
+    const error = expectError("ERR_READ_MALFORMED", () =>
+      readParquet(handBuilt({ wrongListElement: field })),
+    );
+    expect(error.message).toContain(field);
+  });
+
+  it("accepts both supported footer versions", () => {
+    expect(readParquet(handBuilt({ version: 1 })).rows).toEqual([{ n: 7n }]);
+    expect(readParquet(handBuilt({ version: 2 })).rows).toEqual([{ n: 7n }]);
+  });
+
+  it("refuses a reserved footer version as unsupported", () => {
+    const error = expectError("ERR_READ_UNSUPPORTED", () => readParquet(handBuilt({ version: 3 })));
+    expect(error.message).toContain("version 3");
+  });
+
+  it("skips unknown optional fields at every supported struct level", () => {
+    expect(readParquet(handBuilt({ unknownOptional: true })).rows).toEqual([{ n: 7n }]);
+  });
+
+  it("keeps official optional footer fields optional", () => {
+    expect(readParquet(handBuilt({ createdBy: false })).rows).toEqual([{ n: 7n }]);
+  });
+
+  it("does not require a DATA_PAGE header for another valid page type", () => {
+    const error = expectError("ERR_READ_UNSUPPORTED", () =>
+      readParquet(
+        handBuilt({
+          pageHeader: (writer) => {
+            writer.fieldI32(1, 1); // INDEX_PAGE, with no unrelated union member
+            writer.fieldI32(2, 8);
+            writer.fieldI32(3, 8);
+          },
+        }),
+      ),
+    );
+    expect(error.column).toBe("n");
+    expect(error.message).toContain("INDEX_PAGE");
+    expect(error.message).not.toContain("data_page_header");
+  });
+
+  it("refuses absent inline column metadata without calling it a required Thrift field", () => {
+    const error = expectError("ERR_READ_UNSUPPORTED", () =>
+      readParquet(handBuilt({ inlineMetadata: false })),
+    );
+    expect(error.message).toContain("inline metadata");
+    expect(error.message).not.toContain("required");
+  });
+
+  it("refuses encrypted external column metadata honestly", () => {
+    const error = expectError("ERR_READ_UNSUPPORTED", () =>
+      readParquet(handBuilt({ inlineMetadata: false, encryptedMetadata: true })),
+    );
+    expect(error.message).toContain("encrypted metadata");
+  });
+
+  it.each([
+    ["crypto_metadata", { cryptoMetadata: true }],
+    ["encrypted_column_metadata", { encryptedMetadata: true }],
+  ] as const)("refuses inline metadata accompanied by %s", (_name, marker) => {
+    const error = expectError("ERR_READ_UNSUPPORTED", () => readParquet(handBuilt(marker)));
+    expect(error.message).toContain("encrypted metadata");
+    expect(error.column).toBe("n");
+  });
+
+  it("does not mistake offset_index_offset for encrypted metadata", () => {
+    const error = expectError("ERR_READ_UNSUPPORTED", () =>
+      readParquet(handBuilt({ inlineMetadata: false, offsetIndexOffset: true })),
+    );
+    expect(error.message).toContain("without inline metadata");
+    expect(error.message).not.toContain("encrypted metadata");
   });
 
   it("refuses a type_length that is not an i32", () => {
@@ -514,8 +847,8 @@ describe("a footer whose fields are the wrong Thrift type", () => {
   it("refuses a path_in_schema that is not a list", () => {
     const bytes = handBuilt({ path: (writer) => writer.fieldString(3, "n") });
     const error = expectError("ERR_READ_MALFORMED", () => readParquet(bytes));
-    expect(error.column).toBe("n");
-    expect(error.message).toContain('the schema declares "n"');
+    expect(error.column).toBeUndefined();
+    expect(error.message).toContain("ColumnMetaData.path_in_schema");
   });
 
   it("refuses a path_in_schema that is a list of the wrong thing", () => {
@@ -530,21 +863,18 @@ describe("a footer whose fields are the wrong Thrift type", () => {
       },
     });
     const error = expectError("ERR_READ_MALFORMED", () => readParquet(bytes));
-    expect(error.column).toBe("n");
-    expect(error.message).toContain('the schema declares "n"');
+    expect(error.column).toBeUndefined();
+    expect(error.message).toContain("ColumnMetaData.path_in_schema");
   });
 
   it("refuses a num_values that is not an i64", () => {
     const bytes = handBuilt({ numValues: (writer) => writer.fieldString(5, "one") });
     const error = expectError("ERR_READ_MALFORMED", () => readParquet(bytes));
     expect(error.column).toBe("n");
-    expect(error.message).toContain("declares 0 values");
+    expect(error.message).toContain("ColumnMetaData.num_values");
   });
 
-  it("does not read past a page type that is not an i32", () => {
-    // The page header is the last decoder that was outside the rule. Skipping
-    // the field it cannot trust leaves every size and every count after it
-    // where it belongs — and the page really is a data page, so it reads.
+  it("skips and refuses a page type that is not an i32", () => {
     const bytes = handBuilt({
       pageHeader: (writer) => {
         writer.fieldString(1, "data"); // type, which is an i32
@@ -553,7 +883,9 @@ describe("a footer whose fields are the wrong Thrift type", () => {
         dataPageHeader(writer, (inner) => inner.fieldI32(1, 1));
       },
     });
-    expect(readParquet(bytes).rows).toEqual([{ n: 7n }]);
+    const error = expectError("ERR_READ_MALFORMED", () => readParquet(bytes));
+    expect(error.column).toBe("n");
+    expect(error.message).toContain("PageHeader.type");
   });
 
   it("refuses a page's num_values that is not an i32", () => {
@@ -567,19 +899,19 @@ describe("a footer whose fields are the wrong Thrift type", () => {
     });
     const error = expectError("ERR_READ_MALFORMED", () => readParquet(bytes));
     expect(error.column).toBe("n");
-    expect(error.message).toContain("declares 0 values");
+    expect(error.message).toContain("DataPageHeader.num_values");
   });
 
-  it("does not read past a codec id that is not an i32", () => {
-    // Skipped rather than parsed, so the page — which really is uncompressed —
-    // is still there to be read, at the offset the rest of the footer gives.
+  it("skips and refuses a codec id that is not an i32", () => {
     const bytes = handBuilt({
       codec: (writer) => {
         writer.fieldStructBegin(4);
         writer.structEnd();
       },
     });
-    expect(readParquet(bytes).rows).toEqual([{ n: 7n }]);
+    const error = expectError("ERR_READ_MALFORMED", () => readParquet(bytes));
+    expect(error.column).toBe("n");
+    expect(error.message).toContain("ColumnMetaData.codec");
   });
 });
 

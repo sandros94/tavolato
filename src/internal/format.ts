@@ -1,6 +1,6 @@
 import { ByteReader } from "./bytes.ts";
 import { CompactReader, CompactWriter, type ThriftField, ThriftType } from "./thrift.ts";
-import { malformed } from "../error.ts";
+import { malformed, unsupported } from "../error.ts";
 import type {
   Annotation,
   AnyLogicalAdapter,
@@ -856,35 +856,38 @@ function convertedAnnotation(element: SchemaElement): Annotation {
 
 /** One `ColumnChunk` plus its inlined `ColumnMetaData`. */
 export interface ColumnChunkInfo {
+  readonly fileOffset: number;
   readonly path: readonly string[];
-  readonly physical?: number;
+  readonly physical: number;
+  readonly encodings: readonly number[];
   readonly codec: number;
   readonly numValues: number;
+  readonly totalUncompressedSize: number;
+  readonly totalCompressedSize: number;
   readonly dataPageOffset: number;
   readonly dictionaryPageOffset?: number;
-  /**
-   * Bytes the chunk occupies in the file, page headers included — which is to
-   * say where it *ends*: the one thing a reader holding nothing but the footer
-   * cannot work out for itself.
-   *
-   * Only a read that fetches a chunk without the rest of the file around it has
-   * any use for that, so this is decoded leniently and is `undefined` wherever
-   * the file leaves it out or states something no byte count could be. A local
-   * read never looks at it, and a file is never refused over it.
-   */
-  readonly totalCompressedSize?: number;
 }
 
 export interface RowGroupInfo {
   readonly columns: readonly ColumnChunkInfo[];
+  readonly totalByteSize: number;
   readonly numRows: number;
 }
 
 export interface FileMetadata {
+  readonly version: 1 | 2;
   readonly schema: readonly SchemaElement[];
   readonly numRows: number;
   readonly rowGroups: readonly RowGroupInfo[];
   readonly createdBy?: string;
+}
+
+/** The semantically required union member of a v1 `DATA_PAGE` header. */
+export interface DataPageHeaderInfo {
+  readonly numValues: number;
+  readonly encoding: number;
+  readonly definitionLevelEncoding: number;
+  readonly repetitionLevelEncoding: number;
 }
 
 /** A v1 `PageHeader`, reduced to what the reader checks and needs. */
@@ -894,17 +897,24 @@ export interface PageHeaderInfo {
   readonly compressedSize: number;
   /** Bytes the body must decompress back to; equal to `compressedSize` when it was never compressed. */
   readonly uncompressedSize: number;
-  readonly numValues: number;
-  readonly encoding: number;
-  readonly definitionLevelEncoding: number;
+  /** Present and fully validated exactly when `pageType` is `DATA_PAGE`. */
+  readonly dataPageHeader?: DataPageHeaderInfo;
 }
 
 /** Narrows a 64-bit file field to a usable offset or count. */
-function toCount(value: bigint, what: string): number {
+function toCount(value: bigint, what: string, column?: string): number {
   if (value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) {
-    throw malformed(`${what} is ${value}, which cannot be a valid file position or count`);
+    throw malformed(`${what} is ${value}, which cannot be a valid file position or count`, column);
   }
   return Number(value);
+}
+
+/** A required field is usable only when it was present with its declared Thrift type. */
+function requiredField<T>(value: T | undefined, qualifiedName: string, column?: string): T {
+  if (value === undefined) {
+    throw malformed(`Missing or unusable required Thrift field ${qualifiedName}`, column);
+  }
+  return value;
 }
 
 /**
@@ -1115,7 +1125,7 @@ function decodeLogicalType(reader: CompactReader): Annotation {
  */
 
 function decodeSchemaElement(reader: CompactReader): SchemaElement {
-  let name = "";
+  let name: string | undefined;
   let physical: number | undefined;
   let typeLength: number | undefined;
   let repetition: number | undefined;
@@ -1177,7 +1187,7 @@ function decodeSchemaElement(reader: CompactReader): SchemaElement {
     }
   });
   return {
-    name,
+    name: requiredField(name, "SchemaElement.name"),
     physical,
     typeLength,
     repetition,
@@ -1189,12 +1199,33 @@ function decodeSchemaElement(reader: CompactReader): SchemaElement {
   };
 }
 
-function decodeColumnMetaData(reader: CompactReader, chunk: MutableChunk): void {
+function decodeColumnMetaData(reader: CompactReader): Omit<ColumnChunkInfo, "fileOffset"> {
+  let physical: number | undefined;
+  let encodings: number[] | undefined;
+  let path: string[] | undefined;
+  let codec: number | undefined;
+  let rawNumValues: bigint | undefined;
+  let rawTotalUncompressedSize: bigint | undefined;
+  let rawTotalCompressedSize: bigint | undefined;
+  let rawDataPageOffset: bigint | undefined;
+  let rawDictionaryPageOffset: bigint | undefined;
   eachField(reader, (field) => {
     switch (field.id) {
       case 1: {
         if (field.type !== ThriftType.I32) return false;
-        chunk.physical = reader.i32();
+        physical = reader.i32();
+        return true;
+      }
+      case 2: {
+        if (field.type !== ThriftType.LIST) return false;
+        const { elementType, size } = reader.listBegin();
+        if (elementType !== ThriftType.I32) {
+          reader.skipElements(elementType, size);
+          return true;
+        }
+        const found: number[] = [];
+        for (let index = 0; index < size; index++) found.push(reader.i32());
+        encodings = found;
         return true;
       }
       case 3: {
@@ -1206,43 +1237,39 @@ function decodeColumnMetaData(reader: CompactReader, chunk: MutableChunk): void 
           reader.skipElements(elementType, size);
           return true;
         }
-        const path: string[] = [];
-        for (let index = 0; index < size; index++) path.push(reader.string());
-        chunk.path = path;
+        const found: string[] = [];
+        for (let index = 0; index < size; index++) found.push(reader.string());
+        path = found;
         return true;
       }
       case 4: {
         if (field.type !== ThriftType.I32) return false;
-        chunk.codec = reader.i32();
+        codec = reader.i32();
         return true;
       }
       case 5: {
         if (field.type !== ThriftType.I64) return false;
-        chunk.numValues = toCount(reader.i64(), "A column chunk's num_values");
+        rawNumValues = reader.i64();
+        return true;
+      }
+      case 6: {
+        if (field.type !== ThriftType.I64) return false;
+        rawTotalUncompressedSize = reader.i64();
         return true;
       }
       case 7: {
         if (field.type !== ThriftType.I64) return false;
-        // Read, but never enforced: see `ColumnChunkInfo.totalCompressedSize`.
-        // A value that is not a byte count makes the chunk unfetchable on its
-        // own, which is a remote read's problem to raise where it needs one —
-        // and no reason at all to refuse a file whose pages are right there.
-        const size = reader.i64();
-        chunk.totalCompressedSize =
-          size >= 0n && size <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(size) : undefined;
+        rawTotalCompressedSize = reader.i64();
         return true;
       }
       case 9: {
         if (field.type !== ThriftType.I64) return false;
-        chunk.dataPageOffset = toCount(reader.i64(), "A column chunk's data_page_offset");
+        rawDataPageOffset = reader.i64();
         return true;
       }
       case 11: {
         if (field.type !== ThriftType.I64) return false;
-        chunk.dictionaryPageOffset = toCount(
-          reader.i64(),
-          "A column chunk's dictionary_page_offset",
-        );
+        rawDictionaryPageOffset = reader.i64();
         return true;
       }
       default: {
@@ -1250,36 +1277,94 @@ function decodeColumnMetaData(reader: CompactReader, chunk: MutableChunk): void 
       }
     }
   });
-}
-
-interface MutableChunk {
-  path: string[];
-  physical?: number;
-  codec: number;
-  numValues: number;
-  dataPageOffset: number;
-  dictionaryPageOffset?: number;
-  totalCompressedSize?: number;
+  const requiredPath = requiredField(path, "ColumnMetaData.path_in_schema");
+  const column = requiredPath.length === 1 ? requiredPath[0] : undefined;
+  const numValues = toCount(
+    requiredField(rawNumValues, "ColumnMetaData.num_values", column),
+    "ColumnMetaData.num_values",
+    column,
+  );
+  const totalUncompressedSize = toCount(
+    requiredField(rawTotalUncompressedSize, "ColumnMetaData.total_uncompressed_size", column),
+    "ColumnMetaData.total_uncompressed_size",
+    column,
+  );
+  const totalCompressedSize = toCount(
+    requiredField(rawTotalCompressedSize, "ColumnMetaData.total_compressed_size", column),
+    "ColumnMetaData.total_compressed_size",
+    column,
+  );
+  const dataPageOffset = toCount(
+    requiredField(rawDataPageOffset, "ColumnMetaData.data_page_offset", column),
+    "ColumnMetaData.data_page_offset",
+    column,
+  );
+  return {
+    path: requiredPath,
+    physical: requiredField(physical, "ColumnMetaData.type", column),
+    encodings: requiredField(encodings, "ColumnMetaData.encodings", column),
+    codec: requiredField(codec, "ColumnMetaData.codec", column),
+    numValues,
+    totalUncompressedSize,
+    totalCompressedSize,
+    dataPageOffset,
+    dictionaryPageOffset:
+      rawDictionaryPageOffset === undefined
+        ? undefined
+        : toCount(rawDictionaryPageOffset, "ColumnMetaData.dictionary_page_offset", column),
+  };
 }
 
 function decodeColumnChunk(reader: CompactReader): ColumnChunkInfo {
-  const chunk: MutableChunk = {
-    path: [],
-    codec: CompressionCodec.UNCOMPRESSED,
-    numValues: 0,
-    dataPageOffset: 0,
-  };
+  let rawFileOffset: bigint | undefined;
+  let metadata: Omit<ColumnChunkInfo, "fileOffset"> | undefined;
+  let encryptedMetadata = false;
   eachField(reader, (field) => {
-    if (field.id !== 3 || field.type !== ThriftType.STRUCT) return false;
-    decodeColumnMetaData(reader, chunk);
-    return true;
+    switch (field.id) {
+      case 2: {
+        if (field.type !== ThriftType.I64) return false;
+        rawFileOffset = reader.i64();
+        return true;
+      }
+      case 3: {
+        if (field.type !== ThriftType.STRUCT) return false;
+        metadata = decodeColumnMetaData(reader);
+        return true;
+      }
+      case 8: {
+        if (field.type !== ThriftType.STRUCT) return false;
+        encryptedMetadata = true;
+        return false;
+      }
+      case 9: {
+        if (field.type !== ThriftType.BINARY) return false;
+        encryptedMetadata = true;
+        return false;
+      }
+      default: {
+        return false;
+      }
+    }
   });
-  return chunk;
+  const column = metadata?.path.length === 1 ? metadata.path[0] : undefined;
+  const fileOffset = toCount(
+    requiredField(rawFileOffset, "ColumnChunk.file_offset", column),
+    "ColumnChunk.file_offset",
+    column,
+  );
+  if (encryptedMetadata) {
+    throw unsupported("a column chunk with encrypted metadata", column);
+  }
+  if (metadata === undefined) {
+    throw unsupported("a column chunk without inline metadata");
+  }
+  return { fileOffset, ...metadata };
 }
 
 function decodeRowGroup(reader: CompactReader): RowGroupInfo {
-  const columns: ColumnChunkInfo[] = [];
-  let numRows = 0;
+  let columns: ColumnChunkInfo[] | undefined;
+  let totalByteSize: number | undefined;
+  let numRows: number | undefined;
   eachField(reader, (field) => {
     switch (field.id) {
       case 1: {
@@ -1289,12 +1374,19 @@ function decodeRowGroup(reader: CompactReader): RowGroupInfo {
           reader.skipElements(elementType, size);
           return true;
         }
-        for (let index = 0; index < size; index++) columns.push(decodeColumnChunk(reader));
+        const found: ColumnChunkInfo[] = [];
+        for (let index = 0; index < size; index++) found.push(decodeColumnChunk(reader));
+        columns = found;
+        return true;
+      }
+      case 2: {
+        if (field.type !== ThriftType.I64) return false;
+        totalByteSize = toCount(reader.i64(), "RowGroup.total_byte_size");
         return true;
       }
       case 3: {
         if (field.type !== ThriftType.I64) return false;
-        numRows = toCount(reader.i64(), "A row group's num_rows");
+        numRows = toCount(reader.i64(), "RowGroup.num_rows");
         return true;
       }
       default: {
@@ -1302,19 +1394,29 @@ function decodeRowGroup(reader: CompactReader): RowGroupInfo {
       }
     }
   });
-  return { columns, numRows };
+  return {
+    columns: requiredField(columns, "RowGroup.columns"),
+    totalByteSize: requiredField(totalByteSize, "RowGroup.total_byte_size"),
+    numRows: requiredField(numRows, "RowGroup.num_rows"),
+  };
 }
 
 /** Parses the `FileMetaData` footer struct. */
 export function decodeFileMetadata(bytes: Uint8Array): FileMetadata {
   const reader = new CompactReader(new ByteReader(bytes));
-  const schema: SchemaElement[] = [];
-  const rowGroups: RowGroupInfo[] = [];
-  let numRows = 0;
+  let version: number | undefined;
+  let schema: SchemaElement[] | undefined;
+  let numRows: number | undefined;
+  let rowGroups: RowGroupInfo[] | undefined;
   let createdBy: string | undefined;
 
   eachField(reader, (field) => {
     switch (field.id) {
+      case 1: {
+        if (field.type !== ThriftType.I32) return false;
+        version = reader.i32();
+        return true;
+      }
       case 2: {
         if (field.type !== ThriftType.LIST) return false;
         const { elementType, size } = reader.listBegin();
@@ -1322,12 +1424,14 @@ export function decodeFileMetadata(bytes: Uint8Array): FileMetadata {
           reader.skipElements(elementType, size);
           return true;
         }
-        for (let index = 0; index < size; index++) schema.push(decodeSchemaElement(reader));
+        const found: SchemaElement[] = [];
+        for (let index = 0; index < size; index++) found.push(decodeSchemaElement(reader));
+        schema = found;
         return true;
       }
       case 3: {
         if (field.type !== ThriftType.I64) return false;
-        numRows = toCount(reader.i64(), "The footer's num_rows");
+        numRows = toCount(reader.i64(), "FileMetaData.num_rows");
         return true;
       }
       case 4: {
@@ -1337,7 +1441,9 @@ export function decodeFileMetadata(bytes: Uint8Array): FileMetadata {
           reader.skipElements(elementType, size);
           return true;
         }
-        for (let index = 0; index < size; index++) rowGroups.push(decodeRowGroup(reader));
+        const found: RowGroupInfo[] = [];
+        for (let index = 0; index < size; index++) found.push(decodeRowGroup(reader));
+        rowGroups = found;
         return true;
       }
       case 6: {
@@ -1351,21 +1457,33 @@ export function decodeFileMetadata(bytes: Uint8Array): FileMetadata {
     }
   });
 
-  return { schema, numRows, rowGroups, createdBy };
+  const requiredVersion = requiredField(version, "FileMetaData.version");
+  if (requiredVersion !== 1 && requiredVersion !== 2) {
+    throw unsupported(`a FileMetaData version ${requiredVersion}`);
+  }
+  return {
+    version: requiredVersion,
+    schema: requiredField(schema, "FileMetaData.schema"),
+    numRows: requiredField(numRows, "FileMetaData.num_rows"),
+    rowGroups: requiredField(rowGroups, "FileMetaData.row_groups"),
+    createdBy,
+  };
 }
 
 /**
  * Parses a `PageHeader` in place, leaving the reader positioned on the first
  * byte of the page body.
  */
-export function decodePageHeader(input: ByteReader): PageHeaderInfo {
+export function decodePageHeader(input: ByteReader, column?: string): PageHeaderInfo {
   const reader = new CompactReader(input);
-  let pageType: number = PageType.DATA_PAGE;
-  let uncompressedSize = -1;
-  let compressedSize = -1;
-  let numValues = 0;
-  let encoding: number = Encoding.PLAIN;
-  let definitionLevelEncoding: number = Encoding.RLE;
+  let pageType: number | undefined;
+  let uncompressedSize: number | undefined;
+  let compressedSize: number | undefined;
+  let dataPageHeaderPresent = false;
+  let numValues: number | undefined;
+  let encoding: number | undefined;
+  let definitionLevelEncoding: number | undefined;
+  let repetitionLevelEncoding: number | undefined;
 
   // Under the same rule as the footer: a field is read only as the type it is
   // declared to be, so a header that gets one wrong describes a page with a
@@ -1391,6 +1509,7 @@ export function decodePageHeader(input: ByteReader): PageHeaderInfo {
       }
       case 5: {
         if (field.type !== ThriftType.STRUCT) return false;
+        dataPageHeaderPresent = true;
         eachField(reader, (inner) => {
           switch (inner.id) {
             case 1: {
@@ -1408,6 +1527,11 @@ export function decodePageHeader(input: ByteReader): PageHeaderInfo {
               definitionLevelEncoding = reader.i32();
               return true;
             }
+            case 4: {
+              if (inner.type !== ThriftType.I32) return false;
+              repetitionLevelEncoding = reader.i32();
+              return true;
+            }
             default: {
               return false;
             }
@@ -1421,18 +1545,51 @@ export function decodePageHeader(input: ByteReader): PageHeaderInfo {
     }
   });
 
-  // Both sizes are mandatory in the format, and a compressed page is unreadable
-  // without the second one: refuse a header that leaves either out rather than
-  // guess a length.
-  if (compressedSize < 0 || uncompressedSize < 0) {
-    throw malformed(`A page header at offset ${input.offset} declares no page size`);
+  const requiredPageType = requiredField(pageType, "PageHeader.type", column);
+  const requiredUncompressedSize = requiredField(
+    uncompressedSize,
+    "PageHeader.uncompressed_page_size",
+    column,
+  );
+  const requiredCompressedSize = requiredField(
+    compressedSize,
+    "PageHeader.compressed_page_size",
+    column,
+  );
+  if (requiredCompressedSize < 0 || requiredUncompressedSize < 0) {
+    throw malformed(
+      `A page header at offset ${input.offset} declares a negative page size`,
+      column,
+    );
+  }
+  if (requiredPageType !== PageType.DATA_PAGE) {
+    return {
+      pageType: requiredPageType,
+      compressedSize: requiredCompressedSize,
+      uncompressedSize: requiredUncompressedSize,
+    };
   }
   return {
-    pageType,
-    compressedSize,
-    uncompressedSize,
-    numValues,
-    encoding,
-    definitionLevelEncoding,
+    pageType: requiredPageType,
+    compressedSize: requiredCompressedSize,
+    uncompressedSize: requiredUncompressedSize,
+    dataPageHeader: {
+      numValues: requiredField(
+        dataPageHeaderPresent ? numValues : undefined,
+        dataPageHeaderPresent ? "DataPageHeader.num_values" : "PageHeader.data_page_header",
+        column,
+      ),
+      encoding: requiredField(encoding, "DataPageHeader.encoding", column),
+      definitionLevelEncoding: requiredField(
+        definitionLevelEncoding,
+        "DataPageHeader.definition_level_encoding",
+        column,
+      ),
+      repetitionLevelEncoding: requiredField(
+        repetitionLevelEncoding,
+        "DataPageHeader.repetition_level_encoding",
+        column,
+      ),
+    },
   };
 }

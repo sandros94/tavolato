@@ -7,6 +7,7 @@ import {
   annotationOf,
   codecName,
   type ColumnChunkInfo,
+  type DataPageHeaderInfo,
   CompressionCodec,
   decodeFileMetadata,
   decodePageHeader,
@@ -15,7 +16,6 @@ import {
   FieldRepetitionType,
   MAGIC,
   MAX_DEFINITION_LEVEL_BIT_WIDTH,
-  type PageHeaderInfo,
   PageType,
   pageTypeName,
   physicalKindOf,
@@ -642,7 +642,7 @@ function pageDecompressor(
 function readPageBody(
   body: ByteReader,
   column: ReadColumn,
-  page: PageHeaderInfo,
+  page: DataPageHeaderInfo,
   out: ReadValue[],
 ): void {
   let levels: readonly number[] | undefined;
@@ -695,22 +695,26 @@ function readDataPage(
   remaining: number,
   decompress: PageDecompressor,
 ): void | Promise<void> {
-  const page = decodePageHeader(input);
+  const page = decodePageHeader(input, column.name);
   if (page.pageType !== PageType.DATA_PAGE) {
     throw unsupported(
       `column "${column.name}", stored in a ${pageTypeName(page.pageType)}`,
       column.name,
     );
   }
-  if (page.encoding !== Encoding.PLAIN) {
+  const dataPage = page.dataPageHeader;
+  if (dataPage === undefined) {
+    throw malformed(`A DATA_PAGE for column "${column.name}" has no data page header`, column.name);
+  }
+  if (dataPage.encoding !== Encoding.PLAIN) {
     throw unsupported(
-      `column "${column.name}", ${encodingName(page.encoding)} encoded`,
+      `column "${column.name}", ${encodingName(dataPage.encoding)} encoded`,
       column.name,
     );
   }
-  if (page.numValues <= 0 || page.numValues > remaining) {
+  if (dataPage.numValues <= 0 || dataPage.numValues > remaining) {
     throw malformed(
-      `A data page for column "${column.name}" declares ${page.numValues} values with ${remaining} rows left in the row group`,
+      `A data page for column "${column.name}" declares ${dataPage.numValues} values with ${remaining} rows left in the row group`,
       column.name,
     );
   }
@@ -720,7 +724,7 @@ function readDataPage(
   // does not decode itself.
   const raw = input.raw(page.compressedSize);
   return chain(decompress(raw, page.uncompressedSize), (body) => {
-    readPageBody(new ByteReader(body), column, page, out);
+    readPageBody(new ByteReader(body), column, dataPage, out);
   });
 }
 
@@ -745,7 +749,7 @@ function prepareColumnChunk(
     );
   }
   const expected = physicalTypeId(column.physical);
-  if (chunk.physical !== undefined && chunk.physical !== expected) {
+  if (chunk.physical !== expected) {
     throw malformed(
       `Column "${column.name}" is a ${physicalTypeName(expected)} in the schema but a ${physicalTypeName(chunk.physical)} in a row group`,
       column.name,

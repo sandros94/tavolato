@@ -19,7 +19,7 @@ import {
 } from "../src/internal/format.ts";
 import { createParquetStore, PARQUET_CONTENT_TYPE, type ParquetStore } from "../src/uns3.ts";
 import { sealFile, startFile, writeDataPage } from "./_build.ts";
-import { expectRejection } from "./_errors.ts";
+import { expectError, expectRejection } from "./_errors.ts";
 import { FakeS3, FakeS3Error, racing, wrap } from "./_store.ts";
 import { sync } from "./_sync.ts";
 
@@ -768,12 +768,12 @@ describe("createParquetStore: files a ranged read cannot take apart", () => {
     expect(file.rows).toEqual([{ n: 1n }, { n: 2n }, { n: 3n }]);
   });
 
-  it("refuses a chunk that states no byte count, where a local read does not", async () => {
+  it("refuses a negative required total_compressed_size in every read path", async () => {
     const s3 = new FakeS3();
-    // A negative count is not a byte count, so the footer decoder drops it —
-    // and a local read, which never needed it, is unaffected.
     const bytes = handBuilt({ totalCompressedSize: -1 });
-    expect(sync(readParquet(bytes)).rows).toEqual([{ n: 1n }, { n: 2n }, { n: 3n }]);
+    const local = expectError("ERR_READ_MALFORMED", () => readParquet(bytes));
+    expect(local.message).toContain("total_compressed_size");
+    expect(local.column).toBe("n");
 
     s3.seed("hand.parquet", bytes);
     const error = await expectRejection(
