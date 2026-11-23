@@ -46,14 +46,14 @@ export function writeDataPage(
 }
 
 /** The PLAIN bytes of required `INT64` values: what a data page body holds. */
-export function plainBody(values: readonly bigint[]): Uint8Array {
+export function plainBody(values: readonly bigint[]): Uint8Array<ArrayBuffer> {
   const body = new ByteWriter(64);
   writePlain(body, { kind: "i64", items: [...values] });
   return body.toBytes();
 }
 
 /** Closes a hand-built file: the footer, its length, and the trailing magic. */
-export function sealFile(out: ByteWriter, footer: Uint8Array): Uint8Array {
+export function sealFile(out: ByteWriter, footer: Uint8Array): Uint8Array<ArrayBuffer> {
   out.raw(footer);
   out.u32(footer.length);
   out.raw(MAGIC);

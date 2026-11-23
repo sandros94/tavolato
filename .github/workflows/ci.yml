@@ -45,6 +45,11 @@ jobs:
       - name: Check DuckDB
         run: duckdb --version
 
+      # The integration tests start a real S3 store (SeaweedFS) with
+      # testcontainers, which needs the runner's Docker daemon.
+      - name: Check Docker
+        run: docker version
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 

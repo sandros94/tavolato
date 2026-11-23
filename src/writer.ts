@@ -646,7 +646,7 @@ export class ParquetWriter<TDefinition extends SchemaDefinition = SchemaDefiniti
    * @throws {TavolatoError} `ERR_WRITER_FINISHED` when called twice,
    * `ERR_WRITER_BUSY` while an earlier call is still in flight.
    */
-  finish(): Uint8Array | Promise<Uint8Array> {
+  finish(): Uint8Array<ArrayBuffer> | Promise<Uint8Array<ArrayBuffer>> {
     // The footer is written inside the guard, not after it: a writer that has
     // flushed its last page but not yet stamped `num_rows` is still torn, and
     // `#complete` must be unable to run twice.
@@ -705,7 +705,7 @@ export class ParquetWriter<TDefinition extends SchemaDefinition = SchemaDefiniti
   }
 
   /** Writes the footer and hands over the file. */
-  #complete(): Uint8Array {
+  #complete(): Uint8Array<ArrayBuffer> {
     const footer = encodeFileMetadata(
       this.#states.map((state) => state.snapshot),
       this.#rowGroups,
@@ -881,7 +881,7 @@ export interface SyncParquetWriter<TDefinition extends SchemaDefinition = Schema
   /** See {@link ParquetWriter.appendAll}. */
   appendAll(rows: Iterable<Row<TDefinition>>): void;
   /** See {@link ParquetWriter.finish}. */
-  finish(): Uint8Array;
+  finish(): Uint8Array<ArrayBuffer>;
 }
 
 /**

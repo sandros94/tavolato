@@ -46,7 +46,7 @@ export const PARQUET_CONTENT_TYPE = "application/vnd.apache.parquet";
  * which is what a `ParquetWriter` with an asynchronous codec does.
  */
 export interface ParquetSource {
-  finish(): Uint8Array | Promise<Uint8Array>;
+  finish(): Uint8Array<ArrayBuffer> | Promise<Uint8Array<ArrayBuffer>>;
 }
 
 /**
@@ -62,8 +62,8 @@ export type PutParquetParams = Omit<PutObjectParams, "body">;
  * `ParquetWriter` can be handed over directly, in which case it is finished
  * here and becomes unusable afterwards.
  *
- * `contentType` defaults to {@link PARQUET_CONTENT_TYPE}; pass your own value
- * (or `false` to let `uns3` resolve it from the key) to override.
+ * `contentType` defaults to {@link PARQUET_CONTENT_TYPE}. Pass your own value to
+ * override it, or `false` to send none.
  *
  * `uns3` is an optional peer dependency and is only used for its types: this
  * helper never imports it at runtime, it just calls `client.put`.
@@ -86,10 +86,13 @@ export type PutParquetParams = Omit<PutObjectParams, "body">;
 export async function putParquet(
   client: Pick<ParquetStoreClient, "put">,
   params: PutParquetParams,
-  source: Uint8Array | ParquetSource,
+  source: Uint8Array<ArrayBuffer> | ParquetSource,
 ): Promise<Response> {
   assertOptionsObject(params, "putParquet params", "ERR_STORE_INPUT_INVALID");
-  const body = source instanceof Uint8Array ? source : await source.finish();
+  const body =
+    source instanceof Uint8Array
+      ? sendable(source, "putParquet bytes")
+      : sendable(await source.finish(), "ParquetSource.finish()");
   return await client.put({
     contentType: PARQUET_CONTENT_TYPE,
     ...params,
@@ -144,7 +147,7 @@ export interface ParquetRows<TDefinition extends SchemaDefinition = SchemaDefini
 
 /** What `put` accepts: a finished file, something that will finish one, or rows. */
 export type PutInput<TDefinition extends SchemaDefinition = SchemaDefinition> =
-  | Uint8Array
+  | Uint8Array<ArrayBuffer>
   | ParquetSource
   | ParquetRows<TDefinition>;
 
@@ -182,6 +185,10 @@ export interface StoreDefaults {
  * Per-call parameters for `store.put`: `uns3`'s put parameters minus the two
  * the store supplies itself, plus the writer options a `{ schema, rows }`
  * upload is built with.
+ *
+ * Everything else passes through, `expectedStatus` included. A store owns a
+ * request option only where it reads the answer, and the answer to a write is
+ * handed back unread.
  */
 export interface PutParams extends Omit<PutObjectParams, "body" | "key"> {
   /** Writer options for a `put` handed {@link ParquetRows}; ignored for bytes. */
@@ -189,14 +196,29 @@ export interface PutParams extends Omit<PutObjectParams, "body" | "key"> {
 }
 
 /**
+ * The request options a store owns on the reads it makes, and refuses from a
+ * caller.
+ *
+ * `expectedStatus` is how the store tells a ranged answer from a failure, so
+ * it cannot be the caller's. `ifNoneMatch` and `ifModifiedSince` ask for a
+ * `304 Not Modified`, which is no Parquet file: a read hands back rows or
+ * fails. `ifMatch` and `ifUnmodifiedSince` stay, since they hold a read to one
+ * version of the object, and a failed one is `ERR_STORE_OBJECT_CHANGED`.
+ */
+type StoreOwnedReadOptions = "expectedStatus" | "ifNoneMatch" | "ifModifiedSince";
+
+/**
  * Options for `store.get`: how to read the file, and how to ask for it.
  *
  * The read half is {@link ReadOptions} — `columns` narrows the columns exactly
  * as it does locally — plus `groups`, which narrows the *rows* to whole row
- * groups. The request half is `uns3`'s get parameters, minus the two the store
- * owns: `key` is the first argument, and `range` is what the store computes.
+ * groups. The request half is `uns3`'s get parameters, minus the ones the store
+ * owns: `key` is the first argument, `range` is what the store computes, and
+ * `expectedStatus`, `ifNoneMatch` and `ifModifiedSince` are refused with
+ * `ERR_READ_OPTION_INVALID`.
  */
-export interface GetOptions extends Omit<GetObjectParams, "key" | "range">, ReadOptions {
+export interface GetOptions
+  extends Omit<GetObjectParams, "key" | "range" | StoreOwnedReadOptions>, ReadOptions {
   /**
    * Row group indices to read, in the file's numbering. Every other group is
    * skipped: its bytes are neither fetched nor decoded.
@@ -212,8 +234,15 @@ export interface GetOptions extends Omit<GetObjectParams, "key" | "range">, Read
   groups?: readonly number[];
 }
 
-/** Options for `store.head`: `uns3`'s head parameters, plus the column types. */
-export interface HeadOptions extends Omit<HeadObjectParams, "key" | "range"> {
+/**
+ * Options for `store.head`: `uns3`'s head parameters, plus the column types.
+ * The store owns the same request options as for `get`, and refuses them the
+ * same way.
+ */
+export interface HeadOptions extends Omit<
+  HeadObjectParams,
+  "key" | "range" | StoreOwnedReadOptions
+> {
   /**
    * Logical column types, as `ReadOptions.types`. A schema is resolved here
    * exactly as `readSchema` resolves one, so an annotated column needs its
@@ -222,10 +251,16 @@ export interface HeadOptions extends Omit<HeadObjectParams, "key" | "range"> {
   types?: ReadOptions["types"];
 }
 
-/** Parameters for `store.del`: `uns3`'s delete parameters, minus the key. */
+/**
+ * Parameters for `store.del`: `uns3`'s delete parameters, minus the key. They
+ * pass through as {@link PutParams} do, `expectedStatus` included.
+ */
 export type DelParams = Omit<DeleteObjectParams, "key">;
 
-/** Parameters for `store.list`: `uns3`'s list parameters, unchanged. */
+/**
+ * Parameters for `store.list`: `uns3`'s list parameters, unchanged. They pass
+ * through as {@link PutParams} do, `expectedStatus` included.
+ */
 export type ListParams = ListObjectsV2Params;
 
 /**
@@ -271,20 +306,32 @@ export interface ParquetStore {
    * groups asked for.
    *
    * @throws {TavolatoError} `ERR_READ_*` as a local read would, plus
-   * `ERR_STORE_OBJECT_CHANGED` and `ERR_STORE_RANGE_UNSATISFIED`.
+   * `ERR_STORE_OBJECT_CHANGED`, `ERR_STORE_RANGE_UNSATISFIED` and
+   * `ERR_STORE_STATUS_UNEXPECTED`.
    */
   get(key: string, options?: GetOptions): Promise<ParquetFile>;
   /**
    * Reads what an object *is* — size, etag, schema, row and group counts —
    * without downloading a single page.
    *
-   * @throws {TavolatoError} `ERR_READ_MALFORMED`, `ERR_READ_UNSUPPORTED` or
-   * `ERR_STORE_RANGE_UNSATISFIED`.
+   * @throws {TavolatoError} `ERR_READ_OPTION_INVALID`, `ERR_READ_MALFORMED`,
+   * `ERR_READ_UNSUPPORTED`, `ERR_STORE_OBJECT_CHANGED`,
+   * `ERR_STORE_RANGE_UNSATISFIED` or `ERR_STORE_STATUS_UNEXPECTED`.
    */
   head(key: string, options?: HeadOptions): Promise<ParquetHead>;
-  /** Deletes an object. A straight pass through to `client.del`. */
+  /**
+   * Deletes an object. A straight pass through to `client.del`.
+   *
+   * @throws {TavolatoError} `ERR_STORE_INPUT_INVALID` for params that are not
+   * an object.
+   */
   del(key: string, params?: DelParams): Promise<Response>;
-  /** Lists objects. A straight pass through to `client.list`. */
+  /**
+   * Lists objects. A straight pass through to `client.list`.
+   *
+   * @throws {TavolatoError} `ERR_STORE_INPUT_INVALID` for params that are not
+   * an object.
+   */
   list(params?: ListParams): Promise<ListObjectsV2Response>;
 }
 
@@ -302,6 +349,12 @@ const FOOTER_SUFFIX = 4 + MAGIC.length;
  * `206` is the point rather than a surprise.
  */
 const RANGED_STATUS: number[] = [200, 206];
+
+/** What a read of the whole object, or a `HEAD`, accepts: the object, and nothing else. */
+const WHOLE_STATUS: number[] = [200];
+
+/** The request half of a read: what a caller may say about how the object is asked for. */
+type ReadRequest = Omit<GetObjectParams, "key" | "range" | StoreOwnedReadOptions>;
 
 /** A half-open byte span of the object: `start` included, `end` not. */
 interface Span {
@@ -353,11 +406,18 @@ interface RemoteFooter {
  * in this module imports it at runtime, it only calls the five methods of the
  * client you pass in.
  *
- * One thing is asked of that client, and only by the ranged path: its `get` has
- * to hand back a `206 Partial Content` rather than treat it as a failure, since
- * that is the correct answer to the `Range` header the store just sent — `uns3`
- * within the declared peer range does. A client that refuses one throws its own
- * error, untouched, out of `get` and `head`.
+ * On every read the store tells the client which statuses it accepts, through
+ * `expectedStatus`, and the client has to honour that list: the ranged path
+ * depends on a `206 Partial Content` coming back rather than being treated as a
+ * failure. `uns3` within the declared peer range does. A status outside the
+ * list may be thrown, as `uns3` throws it, or returned. A thrown error leaves
+ * `get` and `head` as it was thrown, and a returned one becomes
+ * `ERR_STORE_STATUS_UNEXPECTED`. A `412` or `416` becomes the typed error it
+ * stands for either way.
+ *
+ * Writes are the caller's: `put`, `del` and `list` pass their parameters
+ * through, `expectedStatus` included, and hand the client's answer back
+ * unread.
  *
  * @example
  * import { S3Client } from "uns3";
@@ -411,35 +471,58 @@ export function createParquetStore(
   });
 
   /**
-   * Runs one request, turning the two ways a store can answer "the object
-   * changed under you" into the one typed error.
+   * Runs one read request and holds its answer to the statuses the store
+   * accepts.
+   *
+   * `run` is handed those statuses to pass on as `expectedStatus`, so the list
+   * the client checks and the list checked here are one list. A client may
+   * throw for a status outside it, as `uns3` does, or return it. Either way a
+   * `412` is `ERR_STORE_OBJECT_CHANGED` and a `416` is what `unsatisfiable`
+   * makes of it. Any other status a client returns is
+   * `ERR_STORE_STATUS_UNEXPECTED`, and any other error a client throws is left
+   * exactly as it was thrown.
    */
-  const request = async (run: () => Promise<Response>): Promise<Response> => {
+  const request = async (
+    what: string,
+    accepted: readonly number[],
+    run: (expectedStatus: number[]) => Promise<Response>,
+    unsatisfiable: (cause: unknown) => TavolatoError = rangeRefused,
+  ): Promise<Response> => {
     let response: Response;
     try {
-      response = await run();
+      response = await run([...accepted]);
     } catch (cause) {
-      // Everything else is the client's error, in the client's own type, and
-      // is left exactly as it was thrown.
-      if (statusOf(cause) === 412) throw objectChanged(cause);
+      const status = statusOf(cause);
+      if (status === 412) throw objectChanged(cause);
+      if (status === 416) throw unsatisfiable(cause);
       throw cause;
     }
     if (response.status === 412) throw objectChanged(undefined);
+    if (response.status === 416) throw unsatisfiable(undefined);
+    if (!accepted.includes(response.status)) {
+      await response.body?.cancel();
+      throw new TavolatoError(
+        `The store answered ${what} with ${response.status}, where only ${accepted.join(" or ")} can be read`,
+        "ERR_STORE_STATUS_UNEXPECTED",
+      );
+    }
     return response;
   };
 
   /** One ranged GET, pinned to `etag` where the object had one to pin to. */
   const ranged = async (
     key: string,
-    params: Omit<GetObjectParams, "key" | "range">,
+    params: ReadRequest,
     range: Span,
     etag: string | undefined,
   ): Promise<Response> =>
     await request(
-      async () =>
+      `a ranged GET of "${key}"`,
+      RANGED_STATUS,
+      async (expectedStatus) =>
         await client.get({
-          expectedStatus: RANGED_STATUS,
           ...addressed(params),
+          expectedStatus,
           ...(etag === undefined ? {} : { ifMatch: etag }),
           key,
           // `uns3` takes an inclusive end, as the `Range` header does.
@@ -463,13 +546,16 @@ export function createParquetStore(
   /** Resolves the object's size when a valid `Content-Range` leaves its total unknown. */
   const sizeFromHead = async (
     key: string,
-    params: Omit<HeadObjectParams, "key" | "range">,
+    params: ReadRequest,
     etag: string | undefined,
   ): Promise<number> => {
     const response = await request(
-      async () =>
+      `a HEAD of "${key}"`,
+      WHOLE_STATUS,
+      async (expectedStatus) =>
         await client.head({
           ...addressed(params),
+          expectedStatus,
           ...(etag === undefined ? {} : { ifMatch: etag }),
           key,
         }),
@@ -496,19 +582,29 @@ export function createParquetStore(
    */
   const open = async (
     key: string,
-    params: Omit<GetObjectParams, "key" | "range">,
+    params: ReadRequest,
     options: ReadOptions,
   ): Promise<RemoteFooter> => {
     const first = await request(
-      async () =>
+      `the tail read of "${key}"`,
+      RANGED_STATUS,
+      async (expectedStatus) =>
         await client.get({
-          expectedStatus: RANGED_STATUS,
           ...addressed(params),
+          expectedStatus,
           key,
-          // No start: `bytes=-n` is the last `n` bytes, or the whole object
-          // when it is shorter than that.
-          range: { end: tailBytes },
+          // `bytes=-n`: the last `n` bytes, or the whole object when it is
+          // shorter than that.
+          range: { suffix: tailBytes },
         }),
+      // A suffix range is unsatisfiable only on an empty object (RFC 9110
+      // §14.1.1), and an empty object is no Parquet file.
+      (cause) =>
+        malformed(
+          `The object is empty, and a Parquet file is at least ${FOOTER_SUFFIX + MAGIC.length + 1} bytes`,
+          undefined,
+          cause,
+        ),
     );
     const etag = etagOf(first);
     const body = await bytesOf(first);
@@ -599,6 +695,7 @@ export function createParquetStore(
 
     async get(key: string, options: GetOptions = {}): Promise<ParquetFile> {
       assertOptionsObject(options, "GetOptions", "ERR_READ_OPTION_INVALID");
+      refuseStoreOwned(options, "GetOptions");
       const { columns, groups, codecs, types, ...params } = options;
       const read: ReadOptions = {
         codecs: codecs ?? defaults.codecs,
@@ -612,7 +709,11 @@ export function createParquetStore(
       if (wanted === undefined && columns === undefined) {
         // Nothing was narrowed, so there is nothing to be clever about: the
         // whole object is wanted, and one GET is the cheapest way to have it.
-        const response = await request(async () => await client.get({ ...addressed(params), key }));
+        const response = await request(
+          `a GET of "${key}"`,
+          WHOLE_STATUS,
+          async (expectedStatus) => await client.get({ ...addressed(params), expectedStatus, key }),
+        );
         return await readParquet(await bytesOf(response), read);
       }
 
@@ -659,6 +760,7 @@ export function createParquetStore(
 
     async head(key: string, options: HeadOptions = {}): Promise<ParquetHead> {
       assertOptionsObject(options, "HeadOptions", "ERR_READ_OPTION_INVALID");
+      refuseStoreOwned(options, "HeadOptions");
       const { types, ...params } = options;
       const { footer, size, etag } = await open(key, params, { types: types ?? defaults.types });
       return Object.freeze({
@@ -671,10 +773,12 @@ export function createParquetStore(
     },
 
     async del(key: string, params: DelParams = {}): Promise<Response> {
+      assertOptionsObject(params, "store.del params", "ERR_STORE_INPUT_INVALID");
       return await client.del({ ...addressed(params), key });
     },
 
     async list(params: ListParams = {}): Promise<ListObjectsV2Response> {
+      assertOptionsObject(params, "store.list params", "ERR_STORE_INPUT_INVALID");
       return await client.list(addressed(params));
     },
   });
@@ -691,10 +795,10 @@ async function finished(
   data: unknown,
   defaultWriter: WriterOptions | undefined,
   callWriter: WriterOptions | undefined,
-): Promise<Uint8Array> {
-  if (data instanceof Uint8Array) return data;
+): Promise<Uint8Array<ArrayBuffer>> {
+  if (data instanceof Uint8Array) return sendable(data, "store.put bytes");
   if (typeof (data as Partial<ParquetSource> | null | undefined)?.finish === "function") {
-    return await (data as ParquetSource).finish();
+    return sendable(await (data as ParquetSource).finish(), "ParquetSource.finish()");
   }
   const rows = data as Partial<ParquetRows> | null | undefined;
   if (
@@ -714,6 +818,58 @@ async function finished(
   const parquet = createWriter(rows.schema, writer);
   await parquet.appendAll(rows.rows as Iterable<Row<SchemaDefinition>>);
   return await parquet.finish();
+}
+
+/**
+ * Holds an upload body to what `fetch` can send: a `Uint8Array` over a plain
+ * `ArrayBuffer`. Checked at runtime as well as in the types, since a caller
+ * outside TypeScript, or a cast, can hand over anything.
+ *
+ * @throws {TavolatoError} `ERR_STORE_INPUT_INVALID` for anything else, a view
+ * over a `SharedArrayBuffer` included.
+ */
+function sendable(bytes: unknown, what: string): Uint8Array<ArrayBuffer> {
+  if (!(bytes instanceof Uint8Array)) {
+    throw new TavolatoError(
+      `${what} must be a Uint8Array, received ${describe(bytes)}`,
+      "ERR_STORE_INPUT_INVALID",
+    );
+  }
+  if (!(bytes.buffer instanceof ArrayBuffer)) {
+    throw new TavolatoError(
+      `${what} is a Uint8Array over a SharedArrayBuffer, which fetch cannot send as a body`,
+      "ERR_STORE_INPUT_INVALID",
+    );
+  }
+  return bytes as Uint8Array<ArrayBuffer>;
+}
+
+/**
+ * Refuses the request options a store owns on its reads, before a request goes
+ * out. Checked at runtime as well as in the types, since a caller outside
+ * TypeScript can pass them anyway.
+ */
+function refuseStoreOwned(options: object, what: "GetOptions" | "HeadOptions"): void {
+  const given = options as Partial<Record<StoreOwnedReadOptions | "key" | "range", unknown>>;
+  if (given.key !== undefined) {
+    throw badOption(`${what}.key is not an option: the key is the first argument`);
+  }
+  if (given.range !== undefined) {
+    throw badOption(
+      `${what}.range is the store's to compute, from the columns and row groups a read selects`,
+    );
+  }
+  if (given.expectedStatus !== undefined) {
+    throw badOption(
+      `${what}.expectedStatus is the store's to set: it is how a ranged answer is told from a failure`,
+    );
+  }
+  for (const name of ["ifNoneMatch", "ifModifiedSince"] as const) {
+    if (given[name] === undefined) continue;
+    throw badOption(
+      `${what}.${name} asks for a 304 Not Modified, which is no Parquet file to read; compare the etag store.head answers instead`,
+    );
+  }
 }
 
 /** Every row group index of a file, for a read that narrowed only its columns. */
@@ -918,10 +1074,14 @@ function expectSpan(
   expectRangeTotal(range, size, what);
 }
 
-/** The object moved under a read that had already started. */
+/**
+ * A read's precondition failed: the object is no longer the version the read
+ * was held to, whether by the caller's own `ifMatch` or `ifUnmodifiedSince`
+ * or by the etag the store pinned the rest of a read to.
+ */
 function objectChanged(cause: unknown): TavolatoError {
   return new TavolatoError(
-    "The object changed between two requests of the same read, so the footer no longer describes the bytes being fetched",
+    "The object is no longer the version this read was held to: the store answered 412 Precondition Failed",
     "ERR_STORE_OBJECT_CHANGED",
     undefined,
     cause,
@@ -1005,6 +1165,16 @@ function expectSuffix(range: ContentRange, wanted: number, size: number): void {
   if (range.start === start && range.end === end) return;
   throw rangeUnsatisfied(
     `A ranged read of the file's tail asked for its last ${wanted} bytes and received bytes ${range.start}-${range.end} of ${size}`,
+  );
+}
+
+/** A range the store answered `416 Range Not Satisfiable` to. */
+function rangeRefused(cause: unknown): TavolatoError {
+  return new TavolatoError(
+    "The store answered 416 Range Not Satisfiable to a range the file's footer placed inside the object",
+    "ERR_STORE_RANGE_UNSATISFIED",
+    undefined,
+    cause,
   );
 }
 

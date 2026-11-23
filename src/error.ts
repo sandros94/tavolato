@@ -26,9 +26,10 @@ export type TavolatoErrorCode =
   | "ERR_READ_MALFORMED" // the bytes are not a well-formed Parquet file
   | "ERR_READ_UNSUPPORTED" // well-formed Parquet, but outside the subset tavolato writes
   // Object storage, through `tavolato/uns3`
-  | "ERR_STORE_INPUT_INVALID" // `store.put` was handed something it cannot upload
-  | "ERR_STORE_OBJECT_CHANGED" // the object was replaced between two of a read's requests
+  | "ERR_STORE_INPUT_INVALID" // a store's `put`, `del` or `list`, or `putParquet`, was handed something it cannot use
+  | "ERR_STORE_OBJECT_CHANGED" // the object is no longer the version a read was held to
   | "ERR_STORE_RANGE_UNSATISFIED" // a ranged read came back with bytes other than the ones asked for
+  | "ERR_STORE_STATUS_UNEXPECTED" // the client returned a status a read cannot use
   | (string & {}); // forward-compatible escape hatch
 
 const SAFE_CODE_CHARACTER = /^[A-Za-z0-9_.:-]$/;

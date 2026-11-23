@@ -97,10 +97,10 @@ describe("synchronous codecs", () => {
     } as const;
 
     expectTypeOf<ReturnType<typeof plainWriter.append>>().toEqualTypeOf<void>();
-    expectTypeOf<ReturnType<typeof plainWriter.finish>>().toEqualTypeOf<Uint8Array>();
+    expectTypeOf<ReturnType<typeof plainWriter.finish>>().toEqualTypeOf<Uint8Array<ArrayBuffer>>();
     expectTypeOf<ReturnType<typeof writer.append>>().toEqualTypeOf<void | Promise<void>>();
     expectTypeOf<ReturnType<typeof writer.finish>>().toEqualTypeOf<
-      Uint8Array | Promise<Uint8Array>
+      Uint8Array<ArrayBuffer> | Promise<Uint8Array<ArrayBuffer>>
     >();
     expectTypeOf<ReturnType<typeof plainRead>>().toEqualTypeOf<ParquetFile>();
     expectTypeOf<ReturnType<typeof typedRead>>().toEqualTypeOf<ParquetFile>();

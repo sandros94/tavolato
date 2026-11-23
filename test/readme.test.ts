@@ -2,10 +2,8 @@ import { describe, expect, expectTypeOf, it } from "vitest";
 import { roundTripInvoice } from "../playgrounds/adapters.ts";
 import { roundTripCompressed } from "../playgrounds/compression.ts";
 import { roundTripAmount } from "../playgrounds/custom-column.ts";
-import { storeEvents } from "../playgrounds/object-store.ts";
 import { roundTripEvents } from "../playgrounds/quick-start.ts";
 import { sumOneGroupAtATime } from "../playgrounds/row-groups.ts";
-import { FakeS3 } from "./_store.ts";
 
 describe("README playgrounds", () => {
   it("round-trips the quick start", () => {
@@ -36,12 +34,5 @@ describe("README playgrounds", () => {
 
   it("reads one row group at a time", () => {
     expect(sumOneGroupAtATime()).toBe(6n);
-  });
-
-  it("writes and selectively reads an object", async () => {
-    const result = await storeEvents(new FakeS3());
-
-    expect(result.head).toMatchObject({ rowCount: 1, groupCount: 1 });
-    expect(result.rows).toEqual([{ count: 1n }]);
   });
 });

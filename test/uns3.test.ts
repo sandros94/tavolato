@@ -44,6 +44,23 @@ describe("putParquet", () => {
     }
   });
 
+  it("refuses a body fetch cannot send before calling the client", async () => {
+    const shared = new Uint8Array(new SharedArrayBuffer(8)) as unknown as Uint8Array<ArrayBuffer>;
+    for (const source of [
+      shared,
+      { finish: () => shared },
+      { finish: async () => await Promise.resolve(shared) },
+      { finish: () => "bytes" as never },
+    ]) {
+      const { client, calls } = stubClient();
+      await expectRejection(
+        "ERR_STORE_INPUT_INVALID",
+        putParquet(client, { bucket: "b", key: "a.parquet" }, source),
+      );
+      expect(calls).toHaveLength(0);
+    }
+  });
+
   it("uploads raw bytes with the Parquet media type", async () => {
     const { client, calls } = stubClient();
     const writer = createWriter(schema);

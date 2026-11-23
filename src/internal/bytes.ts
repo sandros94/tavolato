@@ -128,7 +128,7 @@ export class ByteWriter {
   }
 
   /** Returns a copy of everything written so far. */
-  toBytes(): Uint8Array {
+  toBytes(): Uint8Array<ArrayBuffer> {
     return this.#bytes.slice(0, this.#length);
   }
 }

@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`src/` contains the runtime-agnostic TypeScript library. Public exports are assembled in `src/index.ts`; the optional object-store integration is exported from `src/uns3.ts`. Parquet byte, encoding, Thrift, and format primitives live in `src/internal/` and are not public API. Tests are colocated by concern in `test/*.test.ts`; shared fixtures and harness helpers use leading underscores, such as `test/_build.ts`. Generated packages go to `dist/`, and coverage output goes to `coverage/`; do not edit either.
+`src/` contains the runtime-agnostic TypeScript library. Public exports are assembled in `src/index.ts`; the optional object-store integration is exported from `src/uns3.ts`. Parquet byte, encoding, Thrift, and format primitives live in `src/internal/` and are not public API. Tests are colocated by concern in `test/*.test.ts`, and tests that need a real S3 store live in `test/integration/`. Shared fixtures and harness helpers use leading underscores, such as `test/_build.ts`. Generated packages go to `dist/`, and coverage output goes to `coverage/`; do not edit either.
 
 ## Build, Test, and Development Commands
 
@@ -14,10 +14,12 @@ Use Node `>=24.17.0` and pnpm `12.21.0`.
 - `pnpm lint`: run Oxlint and verify Oxfmt formatting.
 - `pnpm fmt`: update generated Markdown, apply lint fixes, and format files.
 - `pnpm typecheck`: run strict TypeScript checks without emitting files.
-- `pnpm test`: run the Vitest suite once.
+- `pnpm test`: run the unit and integration Vitest projects once.
+- `pnpm test:unit`: run only the unit project.
+- `pnpm test:integration`: run only the integration project.
 - `pnpm test:coverage`: produce V8 coverage; no minimum threshold is configured.
 
-The interoperability tests require a `duckdb` executable on `PATH` (CI uses DuckDB 1.5.5).
+The interoperability tests require a `duckdb` executable on `PATH` (CI uses DuckDB 1.5.5). The integration tests start SeaweedFS with testcontainers, so they need a running Docker-compatible container runtime, and they fail rather than skip without one. Store tests run against that real store. Misbehaving stores are simulated with the response faults in `test/integration/_wire.ts`, never with an in-memory fake.
 
 ## Coding Style & Naming Conventions
 
