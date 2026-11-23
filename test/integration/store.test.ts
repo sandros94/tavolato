@@ -1452,11 +1452,11 @@ describe.each(inject("stores"))("$name", (backend: StartedStore) => {
       const missing = wire.objects.at("missing.parquet");
 
       for (const read of [
-        store.get(missing),
-        store.get(missing, { columns: ["n"] }),
-        store.head(missing),
+        () => store.get(missing),
+        () => store.get(missing, { columns: ["n"] }),
+        () => store.head(missing),
       ]) {
-        const error = await expectRejection("ERR_STORE_STATUS_UNEXPECTED", read);
+        const error = await expectRejection("ERR_STORE_STATUS_UNEXPECTED", read());
         expect(error.message).toContain("404");
       }
       // A 304 asked for through raw headers is no file either.
@@ -1475,12 +1475,12 @@ describe.each(inject("stores"))("$name", (backend: StartedStore) => {
       });
 
       for (const read of [
-        store.get(at("empty.parquet")),
-        store.get(at("empty.parquet"), { columns: ["n"] }),
-        store.head(at("empty.parquet")),
-        returningStore.head(at("empty.parquet")),
+        () => store.get(at("empty.parquet")),
+        () => store.get(at("empty.parquet"), { columns: ["n"] }),
+        () => store.head(at("empty.parquet")),
+        () => returningStore.head(at("empty.parquet")),
       ]) {
-        await expectRejection("ERR_READ_MALFORMED", read);
+        await expectRejection("ERR_READ_MALFORMED", read());
       }
     });
 
