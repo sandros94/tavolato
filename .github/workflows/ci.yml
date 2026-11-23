@@ -28,7 +28,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v7
         with:
-          node-version: 24.17.0
+          node-version: 24.22.3
           cache: "pnpm"
 
       # The test suite reads every emitted file back with DuckDB, which acts as

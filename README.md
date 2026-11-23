@@ -328,7 +328,7 @@ Files written by Tavolato are cross-read by DuckDB in the test suite. Use DuckDB
 
 ## Development
 
-Requires Node `>=24.17.0`, pnpm `11.17.0`, and DuckDB on `PATH` for interoperability tests.
+Requires Node `>=24.17.0`, pnpm `12.21.0`, and DuckDB on `PATH` for interoperability tests.
 
 - `pnpm dev:prepare` — build development stubs and install hooks
 - `pnpm fmt` — regenerate Markdown and format the repository

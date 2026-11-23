@@ -6,7 +6,7 @@
 
 ## Build, Test, and Development Commands
 
-Use Node `>=24.17.0` and pnpm `11.17.0`.
+Use Node `>=24.17.0` and pnpm `12.21.0`.
 
 - `pnpm install --frozen-lockfile`: install the exact locked dependency graph.
 - `pnpm dev:prepare`: create development stubs and install Git hooks.

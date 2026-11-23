@@ -53,16 +53,16 @@
   },
   "devDependencies": {
     "@types/node": "^24",
-    "@vitest/coverage-v8": "^4.1.10",
+    "@vitest/coverage-v8": "^5.1.1",
     "automd": "^0.4.3",
-    "obuild": "^0.4.38",
-    "oxfmt": "^0.60.0",
-    "oxlint": "^1.75.0",
-    "oxlint-tsgolint": "^7.0.2001",
-    "simple-git-hooks": "^2.13.1",
+    "obuild": "^0.4.45",
+    "oxfmt": "^0.79.0",
+    "oxlint": "^1.94.0",
+    "oxlint-tsgolint": "^7.0.2008",
+    "simple-git-hooks": "^2.14.0",
     "typescript": "^7.0.2",
     "uns3": "^0.0.8",
-    "vitest": "^4.1.10"
+    "vitest": "^5.1.1"
   },
   "peerDependencies": {
     "uns3": "^0.0.8"
@@ -81,7 +81,7 @@
   "devEngines": {
     "packageManager": {
       "name": "pnpm",
-      "version": "11.17.0",
+      "version": "12.21.0",
       "onFail": "download"
     },
     "runtime": {
@@ -90,5 +90,5 @@
       "onFail": "error"
     }
   },
-  "packageManager": "pnpm@11.17.0"
+  "packageManager": "pnpm@12.21.0"
 }

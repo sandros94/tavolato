@@ -309,13 +309,16 @@ describe("top-level JSON null", () => {
 
   it("preserves JSON.stringify's replacer holder binding", () => {
     const document = { factor: 2, n: 3 };
+    const holders: unknown[] = [];
     const value = json({
       replacer: function (key, found) {
-        if (key === "n") expect(this).toBe(document);
+        if (key === "n") holders.push(this);
         return found;
       },
     });
     const bytes = write(defineSchema({ doc: { type: value } }), [{ doc: document }]);
+    expect(holders).toHaveLength(1);
+    expect(holders[0]).toBe(document);
     expect(readParquet(bytes).rows[0].doc).toEqual(document);
   });
 });
@@ -687,13 +690,15 @@ describe("the json column type", () => {
 
   it("preserves JSON.parse's reviver holder binding", () => {
     const bytes = write(defineSchema({ doc: { type: "json" } }), [{ doc: { n: 1 } }]);
+    const holders: unknown[] = [];
     const value = json({
       reviver: function (key, found) {
-        if (key === "n") expect(this).toEqual({ n: 1 });
+        if (key === "n") holders.push(this);
         return found;
       },
     });
     expect(readParquet(bytes, { types: [value] }).rows).toEqual([{ doc: { n: 1 } }]);
+    expect(holders).toEqual([{ n: 1 }]);
   });
 
   it("turns a parse failure into the same malformed error the built-in raises", () => {
